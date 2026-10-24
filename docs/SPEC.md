@@ -236,7 +236,8 @@ output (float64 throughout, fixed operation order).
 
 * `frames`: `uint8[T, H, W, 3]` sRGB (R, G, B order), T ≥ 2.
 * `fps`: frames per second of *animation time* (default 60). Frame `i` is at `t_i = i / fps` seconds.
-* `viewport`: `(W_css, H_css)`; `frames` are at device scale factor 1 so `W == W_css`.
+* `viewport`: `(W_css, H_css)`; `frames` are at device scale factor 1 so `W == W_css`. A frame width that differs
+  from the viewport width is rejected with `ValueError` (the window size is derived from the viewport width).
 * `red_rule`: `"wcag22"` (default) or `"wcag21-legacy"` (comparison only).
 
 ### 5.2 Cells
@@ -249,22 +250,26 @@ the **mean linear RGB** of its 16 pixels (averaging in linear light; ADR-002). 1
 
 * `L[t, y, x]` — relative luminance of the cell's mean linear RGB (T1).
 * `ratio[t, y, x] = R8/(R8+G8+B8)` — redness ratio on 0–255 **sRGB-encoded** components of the cell colour
-  (the cell's mean linear RGB re-encoded to sRGB), as the brief specifies; `0` when `R8+G8+B8 = 0` (ADR-003).
-  `saturated_red = ratio ≥ 0.8`.
+  (the cell's mean linear RGB re-encoded to sRGB and **rounded to whole 0–255 values**, so a colour whose ratio is
+  exactly 0.8 measures exactly 0.8), as the brief specifies (ADR-003, ADR-020). The ratio is `0` when
+  `R8+G8+B8 = 0` and when `R8 < 16`: a red that dark has no visible hue (ADR-020). `saturated_red = ratio ≥ 0.8`.
 * `uv[t, y, x]` — CIE 1976 UCS chromaticity (u′, v′) of the cell: linear RGB → XYZ with the IEC 61966-2-1
   sRGB/D65 matrix (rows: X = 0.4124 R + 0.3576 G + 0.1805 B; Y = 0.2126 R + 0.7152 G + 0.0722 B;
   Z = 0.0193 R + 0.1192 G + 0.9505 B; the Y row is identical to T1), then
   `u′ = 4X/(X+15Y+3Z)`, `v′ = 9Y/(X+15Y+3Z)`. When `X+15Y+3Z = 0` (pure black) the chromaticity is
-  undefined; FlashTrace uses the D65 white point `(u′, v′) = (0.1978, 0.4683)` so that black counts as
-  achromatic (ADR-011).
+  undefined; FlashTrace uses the chromaticity of white computed with the same matrix (≈ `(0.1978, 0.4683)`, the
+  D65 white point) so that black counts as achromatic (ADR-011).
 * Legacy mode only: `RV[t, y, x] = max(0, (R−G−B)) × 320` on 0–1 sRGB-encoded components.
 
 ### 5.4 Transitions (per cell, per signal)
 
 Following Note 2 ("the change … between adjacent peaks and valleys in a plot … against time"), a cell's
-signal `s[t]` is split into **monotone runs**: a run starts at an extremum and ends at the next extremum
-(the frame before the signal first moves in the opposite direction; plateaus do not end a run). A run that is
-still open at the last frame ends at the last frame (ADR-004). A run from state A (frame `a`) to state B
+signal `s[t]` is split into **monotone runs**: a run starts at an extremum and ends at the next extremum.
+Plateaus do not end a run, and neither does a reversal smaller than the signal's *reversal tolerance*
+(0.005 for L and for the redness ratio, 1.0 for the legacy red value; one twentieth of the threshold, so such a
+wobble could never be a transition itself) (ADR-018). The run's end frame is the **first frame at which the
+extremum value is reached** (for a square wave: the first frame showing the new state). A run that is still open
+at the last frame is evaluated there and stamped at its extremum frame in the same way (ADR-004, ADR-018). A run from state A (frame `a`) to state B
 (frame `b`) is a **transition timestamped at frame `b`** when:
 
 * general: signal is `L`; `|L_B − L_A| ≥ 0.10` and `min(L_A, L_B) < 0.80` (T2);
@@ -276,8 +281,9 @@ their end extremum). Transition sign is the run direction.
 
 ### 5.5 Flashes (per cell, per type)
 
-Consecutive transitions of a cell alternate in direction by construction. They are paired
-**non-overlapping, in order** (1st+2nd, 3rd+4th, …). Each pair is one **flash, timestamped at the frame of
+A cell's transitions are paired **non-overlapping, in order** (1st+2nd, 3rd+4th, …), and only opposing
+transitions pair. Two same-direction transitions in a row are possible when a run below the threshold sits
+between them (e.g. rise, small dip, rise); the newer one then replaces the pending one (ADR-018). Each pair is one **flash, timestamped at the frame of
 its second (completing) transition** (ADR-005). A 4 Hz square wave therefore yields 8 transitions and 4
 flashes per second, which is the counting convention of PEAT/IRIS ("more than 6 transitions in 1 s" ⇔ "more
 than 3 flashes").
@@ -286,19 +292,25 @@ than 3 flashes").
 
 For each type separately, `M[t]` is the boolean cell mask "completes a flash at frame t".
 
-1. **1-frame tolerance:** `E[t] = M[t] ∪ M[t+1]` (cells whose completions are within one frame of each other
-   belong to the same event; `M[T] = ∅`).
+1. **1-frame tolerance:** `E[t] = M[t−1] ∪ M[t]` (cells whose completions are within one frame of each other
+   belong to the same event; `M[−1] = ∅`). Looking backwards keeps the event on the frame where the flash
+   completes (ADR-019).
 2. **Window scoring:** with a 2-D integral image of `E[t]`, the count of flashing cells inside every
    `(wy × wx)`-cell window position is computed; `area_max[t]` is the maximum fraction
-   `count / (wy·wx)` and `window_argmax[t]` its top-left cell (ties → smallest y, then smallest x). This is
-   O(cells) per frame and makes the result independent of where the region sits (translation invariance).
+   `count / window_cells` and `window_argmax[t]` its top-left cell (ties → smallest y, then smallest x), where
+   `window_cells` is the size of the **full** window (85 × 64 = 5 440 cells at 1024 px wide) even when a short
+   viewport forces the scanned window to be clipped to the grid: 25% is an absolute area, 21 824 px (ADR-019).
+   This is O(cells) per frame and makes the result independent of where the region sits (translation
+   invariance).
 3. **Qualifying:** `Q_raw[t] = area_max[t] > 0.25` (T4).
-4. **Leading edge (count once):** `Q[t] = Q_raw[t] ∧ ¬Q_raw[t−1]`. Each qualifying event is counted at the
-   first frame at which it qualifies. Two unrelated regions that qualify on consecutive frames are, by
-   design, counted once (16 ms apart is one flash perceptually). (ADR-006)
+4. **Counting events:** one event spans at most two frames (its completing frame and the next one, the
+   1-frame tolerance). So a maximal run of `n` consecutive `Q_raw` frames starting at frame `s` contains
+   `ceil(n/2)` events, counted at frames `s, s+2, s+4, …`. A single flash gives a run of 2 frames and is
+   counted once, at its completing frame; a 30 Hz strobe at 60 fps keeps `Q_raw` true on every frame and is
+   counted 30 times per second. (ADR-019, which replaces the leading-edge rule of ADR-006.)
 
-The window in cells is `wx = round(341·s/4)`, `wy = round(256·s/4)` with `s = W_css/1024` (ADR-007), clamped
-to the cell grid.
+The window in cells is `wx = round(341·s/4)`, `wy = round(256·s/4)` with `s = W_css/1024` (ADR-007), rounding
+halves up; the scanned window is clamped to the cell grid, the area denominator is not (step 2).
 
 ### 5.7 Rate and verdict
 
@@ -321,8 +333,9 @@ event frames inside it).
   `generalTrailing1s`, `redTrailing1s` (count in the window ending at t).
 * `Violation[]` (§5.7). `advisory[]` (§5.9).
 * `heatmap`: `uint16[cells_y, cells_x]`, per-cell count of completed flashes of either type.
-* `timeline[k]`: for each whole second `k` (`t ∈ [k·fps, (k+1)·fps)`), the number of qualifying general and
-  red events.
+* `timeline[k]`: for each second `k` (`t ∈ [k·fps, (k+1)·fps)`), the number of qualifying general and red
+  events. There are `ceil(T/fps)` bins; a trailing partial second gets its own bin with its raw count, so the
+  bins always add up to the event totals (ADR-021).
 
 ### 5.9 Advisory (non-WCAG)
 
@@ -347,6 +360,13 @@ reported (they describe different things).
 9. Determinism: the same input analysed twice yields identical outputs (array equality and identical JSON).
 10. Red ↔ dark red (same chromaticity, ΔL ≥ 0.10) ⇒ general flash only, no red flash (wcag22); the
     legacy mode counts it as red (documents the difference between the two rules).
+11. Full-screen black ↔ white at 15, 20, 24 and 30 Hz ⇒ FAIL with `maxRatePerSec` equal to the frequency
+    (near the 60 fps sampling limit the events must not merge; ADR-019).
+12. Colours whose redness ratio is exactly 0.8 on 0–255 values (e.g. (204,51,0), (16,4,0)) count as saturated
+    red (inclusive boundary); (205,52,0) does not.
+13. Near-black red noise, rgb(0,0,0) ↔ rgb(1,0,0) at 4 Hz full screen ⇒ PASS, no red flash (ADR-020).
+14. On a 1024×100 viewport a 4 Hz flash of 600 cells (11% of the full 5 440-cell window) ⇒ PASS; the area
+    fraction is measured against the full window, not the clipped one (ADR-019).
 
 ---
 
@@ -367,11 +387,19 @@ independent of the PNG encoder). `hash = sha256(concatenation of all frameHashes
   every animation from `document.getAnimations()` (including same-origin frames) and, per frame, set each
   animation's `currentTime = t_i − startOffset`, seek `<video>` elements to `t_i` and wait for `seeked`, then
   `clock.run_for(1000/fps)` so JS/rAF animations advance, then screenshot (`animations="allow"`). Animations
-  discovered after frame 0 are treated as starting at the frame in which they first appear.
+  discovered after frame 0 are treated as starting at the frame in which they first appear. Animations inside
+  shadow roots (open or closed, recorded by an init script that wraps `attachShadow`) are driven the same way;
+  SVG SMIL timelines are paused and set with `setCurrentTime`; an animation the page resumes later is
+  re-adopted; `Math.random` is replaced by a fixed-seed generator (ADR-022).
   **Double-shot check:** at frame 0 and at the last frame the screenshot is taken twice at the same virtual
-  time; if the two hashes differ, something animates outside the controlled clocks ⇒ `deterministic=false`.
+  time, 100 ms of real time apart; if the two hashes differ, something animates outside the controlled clocks
+  ⇒ `deterministic=false`. A `<video>` seek or an animation-ready wait that times out also sets
+  `deterministic=false` with a note.
 * **B `virtual_time`.** CDP `Emulation.setVirtualTimePolicy` with a `1000/fps` ms budget per frame, plus
-  `HeadlessExperimental.beginFrame` where the launched Chromium supports it. Same double-shot check.
+  `HeadlessExperimental.beginFrame` where the launched Chromium supports it. Same double-shot check. The page is
+  loaded under 250 ms budgets and pre-rolled to a fixed 2 000 ms before frame 0 (pausing virtual time before
+  navigation never loads a page). Without BeginFrameControl, rendering follows the real clock; a once-per-build
+  self-test detects this and auto mode then skips B (ADR-023).
 * **C `realtime`.** CDP `Page.startScreencast` with timestamps, resampled to `fps` by holding the latest
   frame at or before `t_i`. `deterministic=false`; the report and UI show a warning banner; PASS is
   downgraded to INCONCLUSIVE (§6.4).

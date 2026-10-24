@@ -172,3 +172,84 @@ file is written and never depend on ffmpeg availability. `bench/truth.json` is c
 (384 KB), reproducible and useful to inspect; `bench/pages/` is regenerated.
 **Consequences.** Page *i* is identical for any *n*, so the 15-page test set is a prefix of the 200-page set;
 machines without ffmpeg produce the same truth except video pages become `video-skipped` / `SKIP`.
+
+## ADR-018 — Run boundaries: first-frame extremum, reversal tolerance, newer same-sign transition replaces pending (2026-10-24)
+
+**Context.** Review of M1 found three places where the engine's (tested, deterministic) behaviour was more
+precise than SPEC §5.4–5.5: which plateau frame stamps a transition, how tiny reversals are handled, and what
+happens when two same-direction transitions meet.
+**Decision.** (1) A transition is stamped at the **first** frame at which the run's extremum is reached, i.e.
+when the change has finished; stamping the last plateau frame would delay a slow flash by its whole plateau.
+(2) A reversal smaller than one twentieth of the threshold (0.005 in L and in the redness ratio, 1.0 in the
+legacy red value) does not end a run, so anti-aliasing wobble cannot split a ramp; such a wobble could never be
+a transition itself. (3) If a sub-threshold run separates two same-direction transitions, the newer one replaces
+the pending one in the pairer.
+**Consequences.** SPEC §5.4–5.5 amended. A rise of 0.06, a dip of 0.004 and another rise of 0.06 count as one
+0.116 transition; the strict reading of WCAG Note 2 would count none. The effect is limited to signals that wobble
+by less than 0.005.
+
+## ADR-019 — Qualifying events: backward 1-frame union, one event per two frames, absolute window area (2026-10-24)
+
+**Context.** Review of M1 found, and a run confirmed, that the leading-edge rule of ADR-006 merges every flash
+into one event when completions are two frames apart or closer. A full-screen 30 Hz strobe captured at 60 fps
+returned **PASS with a rate of 1 per second**, and 24 Hz was counted as 12. The forward union `M[t] ∪ M[t+1]`
+also put each event one frame *before* its completing frame, so the "before" and "after" evidence frames showed
+the same image. Separately, on a viewport shorter than 256 px the window was clipped and the 25% denominator
+shrank with it.
+**Decision.** `E[t] = M[t−1] ∪ M[t]`; an event lasts at most two frames, so a run of `n` consecutive qualifying
+frames holds `ceil(n/2)` events, counted at its 1st, 3rd, 5th … frame. The area fraction always divides by the
+full window size (5 440 cells at 1024 px), because WCAG's 25% is an absolute area (21 824 px). Window sizes
+round halves up. This replaces step 4 of ADR-006.
+**Consequences.** Rates up to 30 Hz are counted correctly at 60 fps (frequencies above half the capture rate
+cannot be seen in the frames at all; listed as a limitation). Evidence frames are the completing frame and the
+frame before it. Two regions that each qualify on their own on consecutive frames count as two events.
+
+## ADR-020 — Redness ratio on whole 0–255 values; reds darker than R = 16 have no hue (2026-10-24)
+
+**Context.** Review of M1 found, and an exhaustive check confirmed, that 834 of the 2 079 colours whose redness
+ratio is exactly 0.8 measured 0.7999999999999999 after the linear → sRGB round trip, so the inclusive "≥ 0.8"
+boundary was missed. A second finding: rgb(0,0,0) ↔ rgb(1,0,0) is a red transition under the UCS rule (ratio 1,
+chromaticity distance 0.259), so invisible video noise on black could fail a page.
+**Decision.** The cell colour is re-encoded to sRGB and rounded to whole 0–255 values before `R/(R+G+B)` and the
+legacy red value are computed (the brief's "0–255 sRGB components", taken literally). A colour with `R < 16` gets
+ratio 0: its hue is not visible. 16 is not arbitrary: it is the smallest red that the pre-2022 working definition
+could ever count against black, since `(R−G−B)×320 > 20` needs `R−G−B > 20/320 = 15.9/255`.
+**Consequences.** Exact-0.8 colours are saturated red; near-black noise cannot create red flashes. A deliberate
+dim red (R < 16) strobe is not a red flash (it is still a general flash if ΔL ≥ 0.10, which it cannot be at that
+brightness). SPEC §5.3 amended; acceptance tests 12 and 13 pin it.
+
+## ADR-021 — Timeline has a bin for a trailing partial second (2026-10-24)
+
+**Decision.** `timeline` has `ceil(T/fps)` bins; the last bin may cover fewer than `fps` frames and holds its raw
+count. Every qualifying event lands in exactly one bin, so the bins add up to the totals. SPEC §5.8 amended.
+
+## ADR-022 — Strategy A drives shadow-root animations, SMIL, re-started animations and Math.random (2026-10-24)
+
+**Context.** Review of M2, confirmed by a probe: `document.getAnimations()` returns 0 for an animation inside a
+shadow root (the shadow root itself returns 1), and an SVG SMIL animation advanced 0.317 s in 0.3 s of real time
+while `page.clock` was frozen. Both would have been captured on the real clock while the report said
+"deterministic".
+**Decision.** An init script wraps `Element.prototype.attachShadow` to record every shadow root (open or
+closed); strategy A collects animations and `<video>` elements from the document, every recorded shadow root and
+every same-origin frame. Outermost `<svg>` elements are paused (`pauseAnimations()`) and set per frame with
+`setCurrentTime(t)`. An animation that the page resumes after A paused it is re-adopted on the next frame. An
+init script replaces `Math.random` with a fixed-seed generator. The double-shot check waits 100 ms of real time
+between its two screenshots. Any timed-out `<video>` seek or animation-ready wait sets `deterministic=false`.
+**Consequences.** More page types are captured deterministically; what remains uncontrollable is still caught by
+detection or the double-shot check. `crypto.getRandomValues` is not seeded (listed as a limitation).
+
+## ADR-023 — Strategy B on this platform: budgets with a fixed pre-roll; self-tested and skipped without BeginFrameControl (2026-10-24)
+
+**Context.** Measured during M2 on macOS, Chromium 153 (Playwright 1.63): `Target.createTarget
+{enableBeginFrameControl: true}` fails with "BeginFrameControl is not supported on MacOS yet"; a bare
+`HeadlessExperimental.beginFrame` hangs; pausing virtual time before navigation never loads the page; and with
+budgets only, page clocks are virtual but rendering follows the real clock (CSS boxes flipped every 3–4 captured
+frames, a GIF advanced at its real cadence). Flash rates measured from such frames would be inflated.
+**Decision.** B loads the page under 250 ms budgets, pre-rolls to exactly 2 000 ms of page time, and advances
+`1000/fps` ms per frame. It probes BeginFrameControl with `Target.createTarget` (never with `beginFrame`) and runs
+a once-per-build self-test (two pictures 100 ms of real time apart at one virtual instant). Without
+BeginFrameControl, auto mode skips B and uses C; a forced B capture is marked `deterministic=false`. C records
+`Page.startScreencast` frames, resamples by holding the latest frame, and is always non-deterministic.
+**Consequences.** On this laptop every page with uncontrollable content is captured by C, so a PASS there is
+reported as INCONCLUSIVE (ADR-008). The SPEC §6.3 determinism test for B is skipped with Chromium's own error text
+rather than failed. A platform with BeginFrameControl (Linux headless) exercises the beginFrame path.
