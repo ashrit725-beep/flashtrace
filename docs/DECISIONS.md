@@ -253,3 +253,22 @@ BeginFrameControl, auto mode skips B and uses C; a forced B capture is marked `d
 **Consequences.** On this laptop every page with uncontrollable content is captured by C, so a PASS there is
 reported as INCONCLUSIVE (ADR-008). The SPEC §6.3 determinism test for B is skipped with Chromium's own error text
 rather than failed. A platform with BeginFrameControl (Linux headless) exercises the beginFrame path.
+
+## ADR-024 — Motion in the web UI: purposeful one-shot transitions, proven safe by FlashTrace itself (2026-10-24)
+
+**Context.** The student asked for a livelier viewer: reactive components, transitions and a stronger look and
+feel, using their installed motion and component skills (Motion, React Bits, Magic UI, Aceternity). The brief's
+safety rule still holds: the app's own UI never renders flashing faster than 3 Hz, and it must respect
+`prefers-reduced-motion` and keep axe-core at 0 violations.
+**Decision.** Add the `motion` library (one npm dependency, no service). Motion must explain cause and effect
+(where something came from, what changed): route and dialog entrances, the selection outline gliding between
+culprit boxes, chart bars growing from the baseline, numbers counting to their value once, the Verify result
+settling in, list items leaving smoothly. Rules: no infinite or looping animation; one-shot durations of 600 ms or
+less; no luminance toggling; user-driven toggles stay rate-limited; components taken from Magic UI / Aceternity /
+React Bits are ported to the project's CSS (no Tailwind) and stripped of looping effects such as sparkles,
+meteors, shimmer and beams; `MotionConfig reducedMotion="user"` plus the CSS media query turn motion off.
+**Proof.** A browser test serves the built UI with fixture data, captures each screen's entrance and a scripted
+"fast user" interaction sequence with FlashTrace's own capture layer, and runs FlashTrace's engine on the frames:
+every screen must PASS. FlashTrace audits itself.
+**Consequences.** More code in `web/` to explain; one extra dependency; the self-audit turns the safety rule into a
+measured result instead of a promise.
