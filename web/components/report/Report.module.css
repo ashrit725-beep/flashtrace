@@ -1,0 +1,294 @@
+/* Report screen. Everything here is static: the chart, the heatmap and the
+   evidence are still images; nothing blinks, pulses or auto-plays. */
+
+/* ---------------------------------------------------------- verdict banner */
+
+.banner {
+  border: 2px solid currentColor;
+  border-left-width: 12px;
+  border-radius: var(--radius);
+  padding: 18px 22px;
+  margin: 0 0 16px;
+}
+.banner .reason, .banner .meaning { color: var(--ink); }
+.PASS { color: var(--pass); background: var(--pass-bg); }
+.FAIL { color: var(--fail); background: var(--fail-bg); }
+.INCONCLUSIVE { color: var(--warn); background: var(--warn-bg); }
+.verdictLine {
+  font-family: var(--serif);
+  font-size: 38px;
+  line-height: 1.1;
+  margin: 0 0 10px;
+}
+.reason { font-size: 18px; margin: 0 0 6px; max-width: 72ch; }
+.meaning { font-size: 15px; margin: 0; max-width: 72ch; }
+
+.actions { margin: 20px 0 8px; }
+
+/* ----------------------------------------------------------------- summary */
+
+.summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 14px 24px;
+  margin: 24px 0 0;
+  padding: 16px 0;
+  border-top: 1px solid var(--rule);
+  border-bottom: 1px solid var(--rule);
+}
+.summary div { min-width: 0; }
+.summary dt {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  font-weight: 600;
+}
+.summary dd { margin: 2px 0 0; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.summaryWide { grid-column: 1 / -1; }
+
+/* ------------------------------------------------------------------- chart */
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 20px;
+  list-style: none;
+  margin: 0 0 8px;
+  padding: 0;
+  font-size: 14px;
+}
+.legend li { display: inline-flex; align-items: center; gap: 8px; }
+.swatch { width: 14px; height: 14px; display: inline-block; border: 1.5px solid; }
+.swatchGeneral { background: var(--chart-general); border-color: var(--chart-general); }
+.swatchRed {
+  border-color: var(--chart-red);
+  background: repeating-linear-gradient(45deg, var(--chart-red) 0 2px, transparent 2px 5px);
+}
+.swatchLimit { width: 22px; height: 0; border: 0; border-top: 2px dashed var(--fail); }
+.chartBox { width: 100%; }
+.chart { display: block; overflow: visible; }
+.chart text { font: 12px var(--sans); fill: var(--muted); font-variant-numeric: tabular-nums; }
+.chart .axisTitle { fill: var(--ink-soft); font-size: 13px; }
+.chart .limitLabel {
+  fill: var(--fail);
+  font-weight: 600;
+  paint-order: stroke;
+  stroke: var(--paper);
+  stroke-width: 4px;
+}
+.chart .spanLabel {
+  fill: var(--fail);
+  font-weight: 600;
+  paint-order: stroke;
+  stroke: var(--paper);
+  stroke-width: 4px;
+}
+.swatchSpan { width: 22px; background: var(--fail-bg); border: 0; border-top: 3px solid var(--fail); }
+.tableToggle { margin: 12px 0; }
+
+/* ---------------------------------------------------------------- evidence */
+
+/* auto-fit drops empty columns, so three frames share the row at ~340 px each
+   (big enough to see the flashing element); the 400 px cap stops a lone frame
+   from stretching across the whole column. */
+.evidence {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(240px, 100%), 1fr));
+  gap: 16px;
+}
+/* The button fills its grid cell, so every card in a row is the same height. */
+.evidence li { display: flex; max-width: 400px; }
+.thumb {
+  font: inherit;
+  width: 100%;
+  flex: 1;
+  text-align: left;
+  padding: 0 0 10px;
+  border: 1.5px solid var(--rule-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--ink);
+  cursor: zoom-in;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  overflow: hidden;
+  transition: border-color var(--transition);
+}
+.thumb:hover { border-color: var(--ink); }
+.thumb img { display: block; width: 100%; height: auto; border-bottom: 1px solid var(--rule); background: var(--paper-deep); }
+.thumbLabel { padding: 6px 10px 0; font-weight: 600; font-size: 14px; }
+.thumbMeta { padding: 0 10px; font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; margin-top: auto; }
+
+/* ------------------------------------------------------------ frame dialog */
+
+.dialog {
+  width: min(1100px, calc(100vw - 24px));
+  max-height: calc(100vh - 24px);
+  padding: 18px 20px 20px;
+  border: 2px solid var(--ink);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--ink);
+}
+/* A mid-grey dim, not near-black: opening/closing the viewer should not be a
+   large luminance jump for the whole screen. */
+.dialog::backdrop { background: rgb(20 19 17 / 0.5); }
+.dialogHead { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 4px; }
+.dialogHead h2 { margin: 0; }
+.dialogImage {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: 64vh;
+  object-fit: contain;
+  background: var(--paper-deep);
+  border: 1px solid var(--rule);
+  margin: 10px 0;
+}
+.counter { font-variant-numeric: tabular-nums; font-weight: 600; margin: 0 0 12px; }
+
+/* ----------------------------------------------------------------- heatmap */
+
+.heatmapLayout {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(220px, 1fr);
+  gap: 24px;
+  align-items: start;
+}
+.figure { margin: 0; }
+/* Box labels hang above (window) or below (culprit) their box. A box at the
+   very top or bottom of the frame would push its label off the picture, so
+   the picture sits between two 24 px bands the labels can use. Overflow is
+   clipped only here, at the sides, where labels are kept inside by
+   labelRight and a max-width of half the picture (50cqw). */
+.stageFrame {
+  padding: 24px 0;
+  overflow: hidden;
+  container-type: inline-size;
+}
+.stage {
+  position: relative;
+  line-height: 0;
+  border: 1px solid var(--rule-strong);
+  background: var(--paper-deep);
+}
+.stage img { display: block; width: 100%; height: auto; }
+.heatCanvas {
+  position: absolute;
+  left: 0;
+  top: 0;
+  image-rendering: pixelated;
+  pointer-events: none;
+}
+.box {
+  position: absolute;
+  pointer-events: none;
+  line-height: 1.2;
+}
+.windowBox {
+  border: 3px dashed #171613;
+  outline: 2px solid #ffffff;
+}
+.culpritBox {
+  border: 3px solid #1d5a3c;
+  outline: 2px solid #ffffff;
+}
+.boxLabel {
+  position: absolute;
+  left: -3px;
+  top: -3px;
+  transform: translateY(-100%);
+  background: #171613;
+  color: #ffffff;
+  font-size: 12px;
+  font-weight: 600;
+  padding: 2px 6px;
+  white-space: nowrap;
+  max-width: 50cqw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.culpritBox .boxLabel { background: #1d5a3c; top: auto; bottom: -3px; transform: translateY(100%); }
+.labelRight .boxLabel { left: auto; right: -3px; }
+.figcaption { font-size: 14px; color: var(--ink-soft); margin-top: 0; line-height: 1.5; }
+.legendBox { max-width: 360px; margin-top: 12px; }
+.rampBar { height: 14px; border: 1px solid var(--rule-strong); margin: 6px 0 4px; }
+/* Each tick is placed at its own count's position on the ramp (rampT), so
+   the ends sit flush and the middle label is centred on its colour. */
+.rampScale { position: relative; height: 1.5em; font-size: 13px; font-variant-numeric: tabular-nums; }
+.rampScale span { position: absolute; top: 0; transform: translateX(-50%); }
+.rampScale span:first-child { transform: none; }
+.rampScale span:last-child { left: auto !important; right: 0; transform: none; }
+.singleSwatch { display: flex; align-items: center; gap: 8px; font-size: 14px; }
+.swatchCell { width: 18px; height: 18px; border: 1px solid var(--rule-strong); flex: none; }
+
+/* ---------------------------------------------------------------- culprits */
+
+.selectedRow td { background: var(--pass-bg); }
+.selectedRow td:first-child { box-shadow: inset 4px 0 0 var(--accent); }
+.culpritRow { cursor: pointer; }
+
+/* On a phone the table scrolls sideways; Rank and Element stay pinned at the
+   left so a row never loses its name while you read its other columns. */
+@media (max-width: 640px) {
+  .culprits :is(th, td):nth-child(-n + 2) { position: sticky; z-index: 1; background: var(--paper); }
+  .culprits :is(th, td):first-child { left: 0; width: 3.5rem; min-width: 3.5rem; }
+  /* A fixed width, not overflow-wrap: anywhere: "anywhere" lets the table
+     squeeze the column to one character. break-word only breaks a selector
+     that is longer than the column. */
+  .culprits :is(th, td):nth-child(2) {
+    left: 3.5rem;
+    width: 9.5rem;
+    min-width: 9.5rem;
+    overflow-wrap: break-word;
+    box-shadow: 1px 0 0 var(--rule);
+  }
+  .culprits .selectedRow td:nth-child(-n + 2) { background: var(--pass-bg); }
+  .culprits .selectedRow td:first-child { box-shadow: inset 4px 0 0 var(--accent); }
+}
+
+/* ------------------------------------------------------------------- fixes */
+
+/* minmax(0, 1fr): grid items default to min-width:auto, so a long CSS line
+   in a <pre> would otherwise widen the whole page on a phone. */
+.fixes { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: 20px; }
+.fix {
+  border: 1.5px solid var(--rule-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+  padding: 16px 18px;
+}
+.fixHead { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 8px 16px; }
+.fixHead h3 { margin: 0; }
+/* Long lines wrap instead of scrolling: a scrolling <pre> is a region that
+   keyboard users cannot scroll (axe scrollable-region-focusable at phone
+   width). Copy CSS still copies the original text. */
+.code {
+  background: var(--paper-deep);
+  border: 1px solid var(--rule);
+  padding: 12px 14px;
+  margin: 10px 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.measure { max-width: 560px; margin: 8px 0 12px; }
+.status { font-size: 14px; color: var(--ink-soft); min-height: 1.5em; margin: 6px 0 0; }
+.why { font-size: 14px; color: var(--warn); font-weight: 600; margin: 8px 0 4px; }
+
+/* ------------------------------------------------------------- finding lists */
+
+.findings { padding-left: 22px; }
+.findings li { margin-bottom: 10px; }
+.findings li::marker { font-variant-numeric: tabular-nums; }
+
+@media (max-width: 860px) {
+  .heatmapLayout { grid-template-columns: minmax(0, 1fr); }
+  .verdictLine { font-size: 32px; }
+}
+
+.figureWrap { max-width: 880px; }

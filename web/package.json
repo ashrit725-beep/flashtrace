@@ -5,8 +5,9 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "pretest:a11y": "next build",
+    "test:a11y": "playwright test"
   },
   "dependencies": {
     "next": "16.4.3",

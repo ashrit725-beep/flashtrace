@@ -1,0 +1,117 @@
+[
+ {
+  "id": "20261024-163005-aa0005",
+  "url": "https://example.test/broken",
+  "createdAt": "2026-10-24T16:30:05Z",
+  "status": "error",
+  "phase": "error",
+  "progress": {
+   "current": 0,
+   "total": 0,
+   "label": ""
+  },
+  "settings": {
+   "duration": 10,
+   "viewport": {
+    "width": 1024,
+    "height": 768
+   },
+   "attribute": "bbox"
+  },
+  "verdict": null,
+  "reason": null,
+  "error": "Navigation to https://example.test/broken failed: the server did not respond within 30 s."
+ },
+ {
+  "id": "20261024-161511-aa0004",
+  "url": "http://127.0.0.1:8765/site/",
+  "createdAt": "2026-10-24T16:15:11Z",
+  "status": "running",
+  "phase": "capturing",
+  "progress": {
+   "current": 312,
+   "total": 600,
+   "label": "frames 312/600"
+  },
+  "settings": {
+   "duration": 10,
+   "viewport": {
+    "width": 1024,
+    "height": 768
+   },
+   "attribute": "ablate"
+  },
+  "verdict": null,
+  "reason": null,
+  "error": null
+ },
+ {
+  "id": "20261024-153012-aa0001",
+  "url": "http://127.0.0.1:8765/site/",
+  "createdAt": "2026-10-24T15:30:12Z",
+  "status": "done",
+  "phase": "done",
+  "progress": {
+   "current": 1,
+   "total": 1,
+   "label": "done"
+  },
+  "settings": {
+   "duration": 10,
+   "viewport": {
+    "width": 1024,
+    "height": 768
+   },
+   "attribute": "bbox"
+  },
+  "verdict": "FAIL",
+  "reason": "General flashes reached 4 per second in a 341x256 px window at frames 0-598; WCAG 2.3.1 allows at most 3.",
+  "error": null
+ },
+ {
+  "id": "20261024-140240-aa0002",
+  "url": "http://127.0.0.1:8765/calm/",
+  "createdAt": "2026-10-24T14:02:40Z",
+  "status": "done",
+  "phase": "done",
+  "progress": {
+   "current": 1,
+   "total": 1,
+   "label": "done"
+  },
+  "settings": {
+   "duration": 10,
+   "viewport": {
+    "width": 1024,
+    "height": 768
+   },
+   "attribute": "none"
+  },
+  "verdict": "PASS",
+  "reason": "No 2.3.1 violation detected under the tested conditions.",
+  "error": null
+ },
+ {
+  "id": "20261024-124503-aa0003",
+  "url": "http://127.0.0.1:8765/gif-hero/",
+  "createdAt": "2026-10-24T12:45:03Z",
+  "status": "done",
+  "phase": "done",
+  "progress": {
+   "current": 1,
+   "total": 1,
+   "label": "done"
+  },
+  "settings": {
+   "duration": 10,
+   "viewport": {
+    "width": 1024,
+    "height": 768
+   },
+   "attribute": "bbox"
+  },
+  "verdict": "INCONCLUSIVE",
+  "reason": "No 2.3.1 violation was detected, but capture was not deterministic, so a PASS cannot be given.",
+  "error": null
+ }
+]

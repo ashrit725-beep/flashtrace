@@ -1,0 +1,40 @@
+/* New audit screen: form on the left, "what happens" on the right; one
+   column on narrow screens (the explainer then follows the form). */
+
+.layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr);
+  gap: 40px;
+  align-items: start;
+}
+
+.explainer {
+  border-left: 1px solid var(--rule);
+  padding-left: 28px;
+}
+.explainer h2 { font-size: 21px; }
+.explainer ol { padding-left: 22px; margin: 0 0 16px; }
+.explainer li { margin-bottom: 8px; }
+
+.server {
+  font-size: 14px;
+  color: var(--muted);
+  margin: 0 0 20px;
+}
+
+.sizeRow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 8px 12px;
+  margin: 6px 0 0 28px;
+}
+.sizeRow label { display: block; font-weight: 600; font-size: 14px; margin-bottom: 4px; }
+.times { padding-bottom: 10px; color: var(--muted); }
+
+.submitError { margin: 0 0 16px; }
+
+@media (max-width: 860px) {
+  .layout { grid-template-columns: minmax(0, 1fr); gap: 24px; }
+  .explainer { border-left: 0; padding-left: 0; border-top: 1px solid var(--rule); padding-top: 16px; }
+}

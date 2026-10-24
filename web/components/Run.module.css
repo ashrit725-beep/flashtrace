@@ -1,0 +1,68 @@
+/* Running screen. The stepper and progress bar are completely static:
+   SAFETY (docs/SPEC.md section 9) rules out spinners and pulsing, so state
+   changes only when a poll (at most once per second) brings new numbers. */
+
+.phase {
+  font-family: var(--serif);
+  font-size: 24px;
+  margin: 0 0 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.bar {
+  appearance: none;
+  -webkit-appearance: none;
+  display: block;
+  width: 100%;
+  max-width: 640px;
+  height: 14px;
+  border: 1.5px solid var(--ink);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--accent);
+  overflow: hidden;
+}
+.bar::-webkit-progress-bar { background: var(--surface); }
+.bar::-webkit-progress-value { background: var(--accent); }
+.bar::-moz-progress-bar { background: var(--accent); }
+
+.barNote { margin: 8px 0 24px; color: var(--muted); font-size: 14px; }
+
+.stepper {
+  list-style: none;
+  margin: 0 0 24px;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 24px;
+}
+.step {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+}
+.glyph {
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border: 1.5px solid currentColor;
+  border-radius: 50%;
+  font-size: 13px;
+  font-weight: 700;
+}
+.complete { color: var(--ink-soft); }
+.complete .glyph { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+.current { color: var(--ink); font-weight: 700; }
+.current .glyph { border-width: 2.5px; border-color: var(--accent); color: var(--accent); }
+
+.settings {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 16px;
+  margin: 0 0 24px;
+  font-size: 15px;
+}
+.settings dt { color: var(--muted); }
+.settings dd { margin: 0; font-variant-numeric: tabular-nums; }
