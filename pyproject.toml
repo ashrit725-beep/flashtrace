@@ -32,6 +32,6 @@ packages = ["engine", "engine.schema", "capture", "cli", "server", "bench"]
 "engine.schema" = ["*.json"]
 
 [tool.pytest.ini_options]
-testpaths = ["engine/tests", "capture/tests", "server/tests", "bench/tests"]
+testpaths = ["tests", "engine/tests", "capture/tests", "server/tests", "bench/tests"]
 pythonpath = ["."]
 addopts = "-q"
