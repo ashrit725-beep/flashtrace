@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<!-- FlashTrace demo test subject. This page INTENTIONALLY flashes at 4-5 Hz.
+     It is served only behind the warning interstitial at /. See ../README.md. -->
+<title>Pilots 83, Foundry 78 — live match centre · Courtside Live</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to match centre</a>
+
+<header class="masthead">
+  <div class="wrap masthead-inner">
+    <a class="brand" href="#main" aria-label="Courtside Live, home">
+      <!-- Logo: a ball seen from above, drawn inline so nothing is fetched. -->
+      <svg viewBox="0 0 32 32" aria-hidden="true" focusable="false">
+        <circle cx="16" cy="16" r="14" fill="none" stroke="currentColor" stroke-width="2"/>
+        <path d="M16 2v28M2 16h28M6 6c6 5 6 15 0 20M26 6c-6 5-6 15 0 20"
+              fill="none" stroke="currentColor" stroke-width="2"/>
+      </svg>
+      <span class="brand-name">Courtside <em>Live</em></span>
+    </a>
+
+    <nav class="primary-nav" aria-label="Primary">
+      <ul>
+        <li><a href="#main" aria-current="page">Match centre</a></li>
+        <li><a href="#timeline">Play-by-play</a></li>
+        <li><a href="#standings">Standings</a></li>
+        <li><a href="#next-up">Fixtures</a></li>
+      </ul>
+    </nav>
+
+    <div class="masthead-tools">
+      <button id="pause-animations" class="btn" type="button" aria-pressed="false">
+        Pause all motion<span class="btn-state" aria-hidden="true"></span>
+      </button>
+      <!-- 96 x 32 px, red/grey at 4 Hz. Small on purpose: below the
+           WCAG 2.3.1 area threshold, so it should NOT be flagged. -->
+      <p id="live-badge" class="live-badge">Live</p>
+    </div>
+  </div>
+</header>
+
+<div class="dateline">
+  <div class="wrap dateline-inner">
+    <span>Northern Coastal Basketball League</span>
+    <span>Round 14</span>
+    <span>Saturday 24 October 2026</span>
+    <span>Marlow Harbour Arena</span>
+  </div>
+</div>
+
+<main id="main" class="wrap page">
+  <p class="rm-notice" role="note">
+    Your system asks for reduced motion, so every animation on this page is switched off.
+    The live badge and the feed loader are shown as still frames.
+  </p>
+
+  <article class="match" aria-labelledby="match-title">
+    <p class="match-kicker">Fourth quarter · Pilots lead by five</p>
+    <h1 id="match-title" class="match-title">Marlow Harbour Pilots v Kestrel Ridge Foundry</h1>
+
+    <section class="score-strip" aria-label="Score">
+      <div class="team home">
+        <span class="team-name">Marlow Harbour Pilots</span>
+        <span class="team-record">10–3 · Home</span>
+      </div>
+      <span class="score" aria-label="Pilots 83">83</span>
+      <div class="clock">
+        <span class="clock-period">Q4 · remaining</span>
+        <!-- Filled in once by app.js; no ticking timer on this page. -->
+        <span id="match-clock" class="clock-time">–:––</span>
+      </div>
+      <span class="score" aria-label="Foundry 78">78</span>
+      <div class="team away">
+        <span class="team-name">Kestrel Ridge Foundry</span>
+        <span class="team-record">11–2 · Away</span>
+      </div>
+    </section>
+
+    <div class="feed-row">
+      <section class="feed-panel" aria-labelledby="feed-heading">
+        <h2 id="feed-heading" class="visually-hidden">Live shot chart</h2>
+        <!-- Half-court diagram that the loader covers while "reconnecting". -->
+        <svg class="court" viewBox="0 0 420 300" role="img" aria-label="Half-court shot chart, no shots plotted">
+          <rect x="30" y="20" width="360" height="260" fill="none" stroke="#b9b09c" stroke-width="2"/>
+          <rect x="150" y="20" width="120" height="150" fill="none" stroke="#b9b09c" stroke-width="2"/>
+          <circle cx="210" cy="170" r="45" fill="none" stroke="#b9b09c" stroke-width="2"/>
+          <circle cx="210" cy="52" r="7" fill="none" stroke="#1d5a3c" stroke-width="2"/>
+          <path d="M60 20 V120 A150 150 0 0 0 360 120 V20" fill="none" stroke="#b9b09c" stroke-width="2"/>
+        </svg>
+        <!-- 420 x 300 px, white/black at 5 Hz. This is the real WCAG 2.3.1
+             failure: large area, large luminance change, five per second. -->
+        <div id="loader" class="loader" role="status">
+          <span class="loader-label">Reconnecting to live feed…</span>
+        </div>
+      </section>
+
+      <aside class="match-facts" aria-labelledby="facts-heading">
+        <h2 id="facts-heading">Match facts</h2>
+        <dl>
+          <dt>Venue</dt>
+          <dd>Marlow Harbour Arena</dd>
+          <dt>Attendance</dt>
+          <dd>6,412</dd>
+          <dt>Officials</dt>
+          <dd>P. Adeyemi, S. Kowalczyk, M. Haugen</dd>
+          <dt>Tip-off</dt>
+          <dd>19:30 local</dd>
+          <dt>Series</dt>
+          <dd>Foundry lead 2–1 this season</dd>
+        </dl>
+      </aside>
+    </div>
+
+    <section class="section" aria-labelledby="quarters-heading">
+      <h2 id="quarters-heading">Scoring by quarter</h2>
+      <table>
+        <caption>Fourth quarter in progress.</caption>
+        <thead>
+          <tr>
+            <th scope="col">Team</th>
+            <th scope="col">Q1</th>
+            <th scope="col">Q2</th>
+            <th scope="col">Q3</th>
+            <th scope="col">Q4</th>
+            <th scope="col" class="total">Total</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <th scope="row">Marlow Harbour Pilots</th>
+            <td>24</td><td>19</td><td>28</td><td>12</td><td class="total">83</td>
+          </tr>
+          <tr>
+            <th scope="row">Kestrel Ridge Foundry</th>
+            <td>21</td><td>26</td><td>22</td><td>9</td><td class="total">78</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section id="timeline" class="section" aria-labelledby="pbp-heading">
+      <h2 id="pbp-heading">Play-by-play</h2>
+      <ol class="pbp" reversed aria-label="Fourth quarter, most recent first">
+        <li><span class="at">06:42</span><span class="tag">PIL</span><span>Timeout, Pilots (full).</span><span class="running">83–78</span></li>
+        <li><span class="at">06:50</span><span class="tag">PIL</span><span>T. Marchetti makes driving layup.</span><span class="running">83–78</span></li>
+        <li><span class="at">06:58</span><span class="tag away">FND</span><span>R. Valdez makes layup (assist: D. Okonkwo).</span><span class="running">81–78</span></li>
+        <li><span class="at">07:05</span><span class="tag">PIL</span><span>J. Lindqvist makes three-point jump shot (assist: T. Marchetti).</span><span class="running">81–76</span></li>
+        <li><span class="at">07:21</span><span class="tag">PIL</span><span>T. Marchetti makes cutting layup.</span><span class="running">78–76</span></li>
+        <li><span class="at">07:40</span><span class="tag away">FND</span><span>L. Brandt makes layup; rebound on the previous miss by R. Valdez.</span><span class="running">76–76</span></li>
+        <li><span class="at">08:05</span><span class="tag">PIL</span><span>H. Sato makes free throw 2 of 2.</span><span class="running">76–74</span></li>
+        <li><span class="at">08:05</span><span class="tag">PIL</span><span>H. Sato makes free throw 1 of 2.</span><span class="running">75–74</span></li>
+        <li><span class="at">08:05</span><span class="tag away">FND</span><span>Shooting foul on D. Okonkwo (2nd personal).</span><span class="running">74–74</span></li>
+        <li><span class="at">08:30</span><span class="tag away">FND</span><span>R. Valdez makes pull-up jump shot.</span><span class="running">74–74</span></li>
+        <li><span class="at">08:51</span><span class="tag">PIL</span><span>J. Lindqvist makes three-point jump shot.</span><span class="running">74–72</span></li>
+        <li><span class="at">09:40</span><span class="tag away">FND</span><span>D. Okonkwo makes three-point jump shot.</span><span class="running">71–72</span></li>
+        <li><span class="at">10:00</span><span class="tag" aria-hidden="true">—</span><span>Start of the fourth quarter.</span><span class="running">71–69</span></li>
+      </ol>
+    </section>
+  </article>
+
+  <aside class="sidebar" aria-label="Fixtures and standings">
+    <!-- 0.5 Hz opacity fade: a harmless distractor that must pass. -->
+    <section id="next-up" class="card next-up" aria-labelledby="next-heading">
+      <h2 id="next-heading">Next up</h2>
+      <p class="fixture">Saltmarsh Rooks at Marlow Harbour Pilots</p>
+      <p class="meta">Wednesday 28 October, 19:30 · Marlow Harbour Arena</p>
+    </section>
+
+    <section id="standings" class="section" aria-labelledby="standings-heading">
+      <h2 id="standings-heading">Standings</h2>
+      <table>
+        <caption>After 13 of 22 rounds. GB: games behind.</caption>
+        <thead>
+          <tr>
+            <th scope="col">Team</th>
+            <th scope="col">W</th>
+            <th scope="col">L</th>
+            <th scope="col">Pct</th>
+            <th scope="col">GB</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr class="playing"><th scope="row">Kestrel Ridge Foundry</th><td>11</td><td>2</td><td>.846</td><td>—</td></tr>
+          <tr class="playing"><th scope="row">Marlow Harbour Pilots</th><td>10</td><td>3</td><td>.769</td><td>1.0</td></tr>
+          <tr><th scope="row">Saltmarsh Rooks</th><td>8</td><td>5</td><td>.615</td><td>3.0</td></tr>
+          <tr><th scope="row">Dunmore Quarrymen</th><td>7</td><td>6</td><td>.538</td><td>4.0</td></tr>
+          <tr><th scope="row">Fennick Bay Lanterns</th><td>5</td><td>8</td><td>.385</td><td>6.0</td></tr>
+          <tr><th scope="row">Oldcastle Tramways</th><td>2</td><td>11</td><td>.154</td><td>9.0</td></tr>
+        </tbody>
+      </table>
+    </section>
+  </aside>
+</main>
+
+<footer class="site-footer">
+  <div class="wrap">
+    <p>Courtside Live is a fictional publication built as a test page for FlashTrace. Teams, players, venues and results are invented.</p>
+    <p>This page intentionally contains content that flashes four to five times per second. Use “Pause all motion” in the header to stop it, or turn on your system’s reduced-motion setting.</p>
+  </div>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>

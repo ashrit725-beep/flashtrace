@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>FlashTrace demo — read before continuing</title>
+<link rel="icon" href="data:,">
+<!-- Warning interstitial for the FlashTrace demo. This page has NO motion of
+     any kind. The hazardous page is one deliberate click away at /site/. -->
+<style>
+  :root {
+    --paper: #f6f3ec;
+    --paper-deep: #ebe6d9;
+    --ink: #171613;
+    --ink-soft: #4a463f;
+    --muted: #6f6a5f;
+    --rule: #d5cebf;
+    --accent: #1d5a3c;
+    --warn: #7a1f1f;
+  }
+  * { box-sizing: border-box; }
+  html { background: var(--paper); color: var(--ink);
+         font: 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  body { margin: 0; }
+  main { max-width: 680px; margin: 0 auto; padding: 48px 24px 64px; }
+  h1 { font-family: Georgia, "Times New Roman", serif; font-weight: 400; font-size: 32px; line-height: 1.15; margin: 0 0 6px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.1em; margin: 32px 0 8px; color: var(--ink-soft); }
+  p, li { margin: 0 0 10px; }
+  ul { padding-left: 20px; }
+  .kicker { font-size: 13px; text-transform: uppercase; letter-spacing: 0.1em; color: var(--accent); font-weight: 600; margin: 0 0 10px; }
+  .warning { border: 2px solid var(--warn); border-left-width: 10px; padding: 14px 18px; margin: 20px 0 0; background: #fff; }
+  .warning p:last-child { margin-bottom: 0; }
+  .warning strong { color: var(--warn); }
+  code, pre { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 14px; }
+  pre { background: var(--paper-deep); border: 1px solid var(--rule); padding: 12px 14px; overflow-x: auto; margin: 8px 0 10px; }
+  a { color: var(--accent); }
+  :focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+  .hazard-link { display: inline-block; margin-top: 8px; padding: 10px 16px; border: 2px solid var(--warn); border-radius: 3px;
+                 color: var(--warn); background: #fff; font-weight: 600; text-decoration: none; }
+  .hazard-link:hover, .hazard-link:focus-visible { background: var(--warn); color: #fff; }
+  .hazard-note { font-size: 14px; color: var(--muted); margin-top: 8px; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; margin: 6px 0 10px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+  th { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); font-weight: 600; }
+  th:first-child, td:first-child { padding-left: 0; }
+  footer { border-top: 2px solid var(--ink); margin-top: 40px; padding-top: 14px; font-size: 14px; color: var(--muted); }
+  footer p { margin: 0 0 6px; }
+  .disclaimer { color: var(--ink); font-weight: 600; }
+</style>
+</head>
+<body>
+<main>
+  <p class="kicker">FlashTrace demo</p>
+  <h1>Read this before you continue</h1>
+  <p>This local server hosts a fictional sports page, “Courtside Live”, built as a test subject for FlashTrace.</p>
+
+  <section class="warning" aria-labelledby="warn-heading">
+    <h2 id="warn-heading" style="margin-top:0">Warning</h2>
+    <p><strong>The page behind the link below flashes.</strong> It contains a loader that strobes between white and black five times a second, and a badge that flashes red four times a second. Both are there deliberately so FlashTrace has something hazardous to find.</p>
+    <p><strong>Do not open it</strong> if you have photosensitive epilepsy, or if flashing light has ever triggered a seizure, a migraine or discomfort for you. Do not open it on a large screen in a dark room, and do not show it to anyone without warning them first.</p>
+  </section>
+
+  <h2>You do not need to look at it</h2>
+  <p>The audit runs in a headless browser. No window opens and nothing flashes on your screen. With this server running, open a terminal and run:</p>
+  <pre><code>flashtrace audit <span id="audit-url">http://127.0.0.1:8765/site/</span></code></pre>
+  <p>FlashTrace captures frames, measures luminance and red changes, applies the WCAG 2.3.1 thresholds and writes a report with still-frame evidence only. The report itself never flashes.</p>
+
+  <h2>What the page contains</h2>
+  <table>
+    <thead>
+      <tr><th scope="col">Element</th><th scope="col">Behaviour</th><th scope="col">Expected result</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>#loader</code></td><td>420 × 300 px, white/black, 5 per second</td><td>Flagged: large area, large luminance change, more than three flashes per second</td></tr>
+      <tr><td><code>#live-badge</code></td><td>96 × 32 px, red/grey, 4 per second</td><td>Not flagged: about 3% of a 341 × 256 px window, under the 25% area rule</td></tr>
+      <tr><td><code>#next-up</code></td><td>Slow opacity fade, once every 2 s</td><td>Not flagged: half a flash per second</td></tr>
+    </tbody>
+  </table>
+
+  <h2>If you do open it</h2>
+  <ul>
+    <li>The header has a <strong>“Pause all motion”</strong> button. It stops every animation on the page at once; press it again to resume.</li>
+    <li>If your operating system’s reduced-motion setting is on, the page shows no animation at all and says so.</li>
+    <li>Close the tab when you are done. The page does not reload or redirect itself.</li>
+  </ul>
+
+  <h2>The hazardous page</h2>
+  <p>
+    <a class="hazard-link" href="site/" rel="noopener">Open the flashing test page (/site/) — flashes at 4–5 Hz</a>
+  </p>
+  <p class="hazard-note">Opens in this tab. Served from this computer only (127.0.0.1); nothing is sent anywhere.</p>
+
+  <footer>
+    <p class="disclaimer">Analysis aid, not a compliance certification.</p>
+    <p>A PASS from FlashTrace means “no WCAG 2.3.1 violation detected under the tested conditions”. It never claims a page is WCAG compliant.</p>
+    <p>Started with <code>flashtrace demo</code>. Press Ctrl-C in that terminal to stop the server.</p>
+  </footer>
+</main>
+
+<script>
+  // Fill in the real origin so the copy-paste command matches this server's
+  // port. Runs once; changes text only, nothing moves or animates.
+  (function () {
+    if (location.protocol !== "http:" && location.protocol !== "https:") { return; }
+    var el = document.getElementById("audit-url");
+    if (el) { el.textContent = location.origin + "/site/"; }
+  })();
+</script>
+</body>
+</html>

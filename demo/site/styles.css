@@ -1,0 +1,509 @@
+/* Courtside Live — styles for the FlashTrace demo page.
+
+   READ THIS FIRST. This page is a deliberately hazardous TEST SUBJECT for
+   FlashTrace. It contains two fast flashing animations:
+
+     #live-badge  red <-> dark grey at 4 Hz, but only 96 x 32 px
+                  (about 3% of a 341 x 256 px window, so under the WCAG
+                  2.3.1 area rule it should NOT count as a violation)
+     #loader      white <-> near-black at 5 Hz over 420 x 300 px
+                  (far more than 25% of a 341 x 256 px window: this is the
+                  real WCAG 2.3.1 failure the demo exists to find)
+
+   and one slow, harmless fade (#next-up, 0.5 Hz) as a distractor.
+   Do not copy the two fast animations into a real page. Everything else on
+   the page is intentionally still. */
+
+:root {
+  --paper: #f6f3ec;
+  --paper-deep: #ebe6d9;
+  --ink: #171613;
+  --ink-soft: #4a463f;
+  --muted: #6f6a5f;
+  --rule: #d5cebf;
+  --rule-strong: #b9b09c;
+  --accent: #1d5a3c;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --serif: Georgia, "Iowan Old Style", "Times New Roman", Times, serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html {
+  background: var(--paper);
+  color: var(--ink);
+  font: 15px/1.45 var(--sans);
+  -webkit-text-size-adjust: 100%;
+}
+
+body { margin: 0; }
+
+/* One centred column; 24 px gutters at 1024 px wide, grows to 1120 px. */
+.wrap {
+  max-width: 1120px;
+  margin: 0 auto;
+  padding: 0 24px;
+}
+
+a { color: var(--accent); }
+
+:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Skip link: hidden until it receives keyboard focus. */
+.skip-link {
+  position: absolute;
+  left: 24px;
+  top: -48px;
+  padding: 8px 12px;
+  background: var(--ink);
+  color: var(--paper);
+  text-decoration: none;
+  z-index: 10;
+}
+.skip-link:focus { top: 8px; }
+
+.visually-hidden {
+  position: absolute !important;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ---------- Masthead ---------- */
+
+.masthead { border-bottom: 2px solid var(--ink); }
+
+.masthead-inner {
+  display: flex;
+  align-items: center;
+  gap: 28px;
+  height: 60px;
+}
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  color: inherit;
+  text-decoration: none;
+}
+.brand svg { width: 30px; height: 30px; flex: none; }
+.brand-name {
+  font-family: var(--serif);
+  font-size: 24px;
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+}
+.brand-name em { font-style: normal; color: var(--accent); }
+
+.primary-nav ul {
+  display: flex;
+  gap: 22px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.primary-nav a {
+  display: inline-block;
+  padding: 6px 0;
+  color: var(--ink-soft);
+  text-decoration: none;
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  border-bottom: 2px solid transparent;
+  white-space: nowrap;
+}
+.primary-nav a:hover { color: var(--ink); }
+.primary-nav a[aria-current="page"] {
+  color: var(--ink);
+  border-bottom-color: var(--accent);
+}
+
+.masthead-tools {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+/* ---------- Pause-all-motion button ---------- */
+
+.btn {
+  font: inherit;
+  font-size: 14px;
+  padding: 6px 12px;
+  border: 1.5px solid var(--ink);
+  border-radius: 3px;
+  background: var(--paper);
+  color: var(--ink);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.btn:hover { background: var(--paper-deep); }
+.btn[aria-pressed="true"] {
+  background: var(--ink);
+  color: var(--paper);
+}
+/* The accessible name stays "Pause all motion"; aria-pressed carries the
+   state. The suffix below is aria-hidden and purely visual. */
+.btn[aria-pressed="true"] .btn-state::after { content: " — paused"; }
+
+/* ---------- LIVE badge: 4 Hz red flash, small area (should pass 2.3.1) ---------- */
+
+.live-badge {
+  width: 96px;
+  height: 32px;
+  margin: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: #fff;
+  background: rgb(255, 0, 0);
+  font-weight: 700;
+  font-size: 13px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  border-radius: 3px;
+  /* 0.25 s per cycle = 4 full red/grey cycles per second. steps(1, end)
+     makes each half a hard cut rather than a cross-fade. */
+  animation: live-pulse 0.25s steps(1, end) infinite;
+}
+.live-badge::before {
+  content: "";
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #fff;
+}
+
+@keyframes live-pulse {
+  0%   { background-color: rgb(255, 0, 0); }
+  50%  { background-color: rgb(40, 40, 40); }
+  100% { background-color: rgb(255, 0, 0); }
+}
+
+/* ---------- Dateline ---------- */
+
+.dateline {
+  border-bottom: 1px solid var(--rule);
+  font-size: 13px;
+  color: var(--muted);
+}
+.dateline-inner {
+  display: flex;
+  gap: 18px;
+  height: 34px;
+  align-items: center;
+  white-space: nowrap;
+  overflow: hidden;
+}
+.dateline-inner span + span::before {
+  content: "·";
+  margin-right: 18px;
+  color: var(--rule-strong);
+}
+
+/* ---------- Page grid ---------- */
+
+.page {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 304px;
+  gap: 32px;
+  padding-top: 20px;
+  padding-bottom: 40px;
+}
+
+/* Shown only when the operating system asks for reduced motion. */
+.rm-notice {
+  display: none;
+  grid-column: 1 / -1;
+  margin: 0;
+  padding: 10px 14px;
+  border: 1px solid var(--rule-strong);
+  background: var(--paper-deep);
+  font-size: 13px;
+}
+
+/* ---------- Match headline and score strip ---------- */
+
+.match-kicker {
+  margin: 0 0 4px;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--accent);
+}
+.match-title {
+  margin: 0 0 14px;
+  font-family: var(--serif);
+  font-size: 26px;
+  font-weight: 400;
+  line-height: 1.15;
+}
+
+.score-strip {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto auto minmax(0, 1fr);
+  align-items: center;
+  gap: 14px;
+  padding: 12px 0;
+  border-top: 2px solid var(--ink);
+  border-bottom: 1px solid var(--rule);
+}
+.team { display: flex; flex-direction: column; min-width: 0; }
+.team.away { text-align: right; }
+.team-name {
+  font-family: var(--serif);
+  font-size: 18px;
+  line-height: 1.2;
+}
+.team-record { font-size: 12px; color: var(--muted); }
+.score {
+  font-family: var(--serif);
+  font-size: 44px;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+.clock { text-align: center; padding: 0 10px; }
+.clock-period {
+  display: block;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--muted);
+}
+.clock-time {
+  display: block;
+  font-family: var(--mono);
+  font-size: 20px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- Live feed panel + strobing loader (the real 2.3.1 failure) ---------- */
+
+.feed-row {
+  display: grid;
+  grid-template-columns: 422px minmax(0, 1fr);
+  gap: 20px;
+  margin-top: 16px;
+}
+
+/* 422 x 302 px outer size: the 1 px border sits outside a 420 x 300 px
+   content box, which is exactly the area the loader overlay covers. */
+.feed-panel {
+  position: relative;
+  width: 422px;
+  height: 302px;
+  border: 1px solid var(--rule-strong);
+  background: var(--paper-deep);
+  overflow: hidden;
+}
+.feed-panel .court {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+.loader {
+  position: absolute;
+  inset: 0;                      /* fills the 420 x 300 px panel */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgb(20, 20, 20);   /* resting state when animation is off */
+  /* 0.2 s per cycle = 5 white/black cycles per second, hard cuts. */
+  animation: strobe 0.2s steps(1, end) infinite;
+}
+@keyframes strobe {
+  0%   { background-color: rgb(255, 255, 255); }
+  50%  { background-color: rgb(20, 20, 20); }
+  100% { background-color: rgb(255, 255, 255); }
+}
+
+/* The label sits in its own opaque, non-flashing pill so it stays legible
+   whichever state the background is in. */
+.loader-label {
+  display: inline-block;
+  padding: 8px 16px;
+  border: 2px solid var(--ink);
+  border-radius: 999px;
+  background: var(--paper-deep);
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.match-facts {
+  border-top: 2px solid var(--ink);
+  padding-top: 8px;
+  font-size: 13px;
+  min-width: 0;
+}
+.match-facts h2 {
+  margin: 0 0 4px;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+.match-facts dl { margin: 0; }
+.match-facts dt {
+  margin-top: 10px;
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.match-facts dd { margin: 2px 0 0; }
+
+/* ---------- Sections and tables ---------- */
+
+.section { margin-top: 28px; }
+.section > h2 {
+  margin: 0 0 10px;
+  padding-bottom: 6px;
+  border-bottom: 2px solid var(--ink);
+  font-family: var(--serif);
+  font-size: 19px;
+  font-weight: 400;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+}
+th, td {
+  padding: 7px 8px;
+  text-align: right;
+  border-bottom: 1px solid var(--rule);
+}
+th:first-child, td:first-child { text-align: left; padding-left: 0; }
+thead th {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  border-bottom: 1px solid var(--rule-strong);
+}
+tbody th { font-weight: 400; }
+td.total, th.total { font-weight: 700; }
+tr.playing th, tr.playing td { font-weight: 600; }
+caption {
+  caption-side: bottom;
+  padding-top: 6px;
+  text-align: left;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* ---------- Play-by-play ---------- */
+
+.pbp { list-style: none; margin: 0; padding: 0; }
+.pbp li {
+  display: grid;
+  grid-template-columns: 48px 44px minmax(0, 1fr) 64px;
+  gap: 12px;
+  align-items: baseline;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--rule);
+  font-size: 14px;
+}
+.pbp .at {
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--ink-soft);
+}
+.pbp .tag {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+.pbp .tag.away { color: var(--ink-soft); }
+.pbp .running {
+  text-align: right;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- Sidebar ---------- */
+
+.sidebar { padding-top: 6px; min-width: 0; }
+
+.card {
+  padding: 16px 18px;
+  border: 1px solid var(--rule-strong);
+  background: #fff;
+}
+
+/* Slow 0.5 Hz fade: well under three per second, must PASS. */
+.next-up { animation: slow-fade 2s ease-in-out infinite; }
+@keyframes slow-fade {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.6; }
+}
+.next-up h2 {
+  margin: 0 0 8px;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--accent);
+}
+.next-up .fixture {
+  margin: 0 0 6px;
+  font-family: var(--serif);
+  font-size: 18px;
+  line-height: 1.25;
+}
+.next-up .meta { margin: 0; font-size: 13px; color: var(--muted); }
+
+.sidebar .section { margin-top: 24px; }
+.sidebar table { font-size: 13px; }
+.sidebar th, .sidebar td { padding: 6px 6px; }
+
+/* ---------- Footer ---------- */
+
+.site-footer {
+  border-top: 2px solid var(--ink);
+  margin-top: 8px;
+  padding: 18px 0 32px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.site-footer p { margin: 0 0 6px; }
+
+/* ---------- Motion controls ---------- */
+
+/* "Pause all motion" button: freezes every animation in place. */
+html.motion-paused *,
+html.motion-paused *::before,
+html.motion-paused *::after {
+  animation-play-state: paused !important;
+}
+
+/* Operating-system reduced-motion preference: remove every animation
+   and show the notice. The badge rests on red, the loader on near-black. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation: none !important;
+    transition: none !important;
+  }
+  .rm-notice { display: block; }
+}

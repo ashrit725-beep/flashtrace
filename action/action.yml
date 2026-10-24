@@ -1,0 +1,134 @@
+name: "FlashTrace audit"
+description: "Audit a URL against WCAG 2.2 SC 2.3.1 (Three Flashes or Below Threshold) with FlashTrace. Analysis aid, not a compliance certification."
+author: "FlashTrace"
+
+branding:
+  icon: "eye"
+  color: "gray-dark"
+
+inputs:
+  url:
+    description: "Page to audit (http(s) URL, or a file path inside the checkout)."
+    required: true
+  duration:
+    description: "Seconds of animation time to capture."
+    required: false
+    default: "10"
+  viewport:
+    description: "Viewport as WIDTHxHEIGHT in CSS px. 1024x768 is the WCAG reference size."
+    required: false
+    default: "1024x768"
+  fps:
+    description: "Frames per second of animation time."
+    required: false
+    default: "60"
+  attribute:
+    description: "Attribution mode: none, bbox or ablate (ablate re-captures the page several times)."
+    required: false
+    default: "bbox"
+  fail-on-inconclusive:
+    description: "When true (default) an INCONCLUSIVE verdict fails the job, like FAIL."
+    required: false
+    default: "true"
+  report-json:
+    description: "Where to write the JSON report."
+    required: false
+    default: "flashtrace-report.json"
+  report-html:
+    description: "Where to write the HTML report."
+    required: false
+    default: "flashtrace-report.html"
+  python-version:
+    description: "Python version to set up (3.11 or newer)."
+    required: false
+    default: "3.12"
+
+outputs:
+  verdict:
+    description: "PASS, FAIL or INCONCLUSIVE."
+    value: ${{ steps.read.outputs.verdict }}
+  reason:
+    description: "One-sentence reason from the report."
+    value: ${{ steps.read.outputs.reason }}
+  exit-code:
+    description: "FlashTrace exit code: 0 PASS, 1 FAIL/INCONCLUSIVE, 2 error."
+    value: ${{ steps.audit.outputs.code }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install FlashTrace and Chromium
+      shell: bash
+      run: |
+        # The action lives in <repo>/action; the package is the repository root.
+        python -m pip install --quiet --upgrade pip
+        python -m pip install --quiet "${{ github.action_path }}/.."
+        python -m playwright install --with-deps chromium
+
+    - name: Run the audit
+      id: audit
+      shell: bash
+      run: |
+        set +e
+        NO_FAIL=""
+        if [ "${{ inputs.fail-on-inconclusive }}" != "true" ]; then NO_FAIL="--no-fail"; fi
+        flashtrace audit "${{ inputs.url }}" \
+          --duration "${{ inputs.duration }}" \
+          --viewport "${{ inputs.viewport }}" \
+          --fps "${{ inputs.fps }}" \
+          --attribute "${{ inputs.attribute }}" \
+          --out "${{ inputs.report-json }}" \
+          --html "${{ inputs.report-html }}" \
+          $NO_FAIL
+        CODE=$?
+        echo "code=$CODE" >> "$GITHUB_OUTPUT"
+        exit 0
+
+    - name: Read the verdict
+      id: read
+      shell: bash
+      run: |
+        python - "${{ inputs.report-json }}" <<'PY' >> "$GITHUB_OUTPUT"
+        import json, sys, pathlib
+        p = pathlib.Path(sys.argv[1])
+        if not p.exists():
+            print("verdict=ERROR"); print("reason=no report was written"); raise SystemExit
+        r = json.loads(p.read_text())
+        print("verdict=" + r.get("verdict", "ERROR"))
+        print("reason=" + r.get("reason", "").replace("\n", " "))
+        PY
+
+    - name: Summarise
+      shell: bash
+      run: |
+        {
+          echo "## FlashTrace: ${{ steps.read.outputs.verdict }}"
+          echo
+          echo "${{ steps.read.outputs.reason }}"
+          echo
+          echo "_Analysis aid, not a compliance certification._ A PASS means no 2.3.1 violation was detected under the tested conditions."
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Upload reports
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: flashtrace-report
+        path: |
+          ${{ inputs.report-json }}
+          ${{ inputs.report-html }}
+          .flashtrace/**/frames/*.png
+        if-no-files-found: ignore
+
+    - name: Fail the job when the audit did not pass
+      shell: bash
+      run: |
+        if [ "${{ steps.audit.outputs.code }}" != "0" ]; then
+          echo "FlashTrace exit code ${{ steps.audit.outputs.code }} (verdict ${{ steps.read.outputs.verdict }})"
+          exit 1
+        fi

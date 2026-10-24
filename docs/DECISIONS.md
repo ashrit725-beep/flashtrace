@@ -106,3 +106,26 @@ are the classic hazard).
 **Decision.** Treat black as achromatic: use D65 (u′, v′) = (0.1978, 0.4683), computed from the same
 sRGB matrix. The distance from sRGB red (0.4507, 0.5229) to D65 is 0.259 > 0.2, so red ↔ black, red ↔ white
 and red ↔ grey are red transitions; red ↔ orange (255,128,0) is not (0.13).
+
+## ADR-012 — Demo server is loopback-only and sits behind an interstitial (2026-10-24)
+
+**Context.** SPEC §9.2: the demo page intentionally strobes at 4–5 Hz; it exists only as a test subject.
+**Decision.** `demo/serve.py` refuses any non-loopback host with a `ValueError` (not a warning), serves the
+warning interstitial at `/` and the hazardous page at `/site/`, sends `Cache-Control: no-store`, and the page
+honours `prefers-reduced-motion` and offers a "Pause all motion" button (state via `aria-pressed`).
+**Consequences.** The flashing page is never reachable from another machine; the audit targets `/site/`
+directly and no human has to look at it.
+
+## ADR-013 — Ablation must suppress animations inside the capturer, not only via injected CSS (2026-10-24)
+
+**Context.** Measured while building the demo: once a script has called `pause()`/`play()` on a
+`CSSAnimation` through the Web Animations API, that animation no longer obeys the CSS
+`animation-play-state` property. Strategy A pauses and seeks every animation through that API, so an
+injected `[data-ft-id="X"]{animation-play-state:paused!important}` rule alone would be silently ineffective
+during an ablation capture.
+**Decision.** Ablation re-captures are fresh page loads in which the capturer (a) excludes animations whose
+target matches the suppressed `data-ft-id` from seeking and holds them at their frame-0 state (and cancels
+CSS transitions on that target via the injected `transition:none!important`), and (b) hides JS/canvas/video/img
+candidates with `visibility:hidden!important`. The injected CSS from the brief is still emitted (it is what a
+developer would write) and recorded in the report, but it is not what makes the ablation effective.
+**Consequences.** Ablation results do not depend on whether the page's own scripts touched the animation.
