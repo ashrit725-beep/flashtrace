@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>FlashTrace synthetic page: Web Animations API</title>
+<!--
+  Synthetic capture test page (deliberately flashing; only ever opened by FlashTrace's own tests).
+  Same visual contract as css_keyframes.html (see the comment there), but both animations are
+  created from script with element.animate(), so they are WAAPI Animation objects rather than
+  CSSAnimation objects.
+-->
+<style>
+  html, body { margin: 0; padding: 0; background: #fff; width: 100%; height: 100%; overflow: hidden; }
+  #box  { position: absolute; left: 100px; top: 100px; width: 400px; height: 300px; background-color: #000; }
+  #fade { position: absolute; left: 600px; top: 100px; width: 200px; height: 200px; background-color: #333; opacity: 0; }
+</style>
+</head>
+<body>
+  <div id="box"></div>
+  <div id="fade"></div>
+  <script>
+    // Per-keyframe easing mirrors CSS 'animation-timing-function: steps(1, end)', which applies to
+    // each keyframe segment: black is held on [0%, 50%) and white on [50%, 100%).
+    document.getElementById('box').animate(
+      [
+        { backgroundColor: '#000', offset: 0,   easing: 'steps(1, end)' },
+        { backgroundColor: '#fff', offset: 0.5, easing: 'steps(1, end)' },
+        { backgroundColor: '#000', offset: 1 }
+      ],
+      { duration: 250, iterations: Infinity }
+    );
+    document.getElementById('fade').animate(
+      [ { opacity: 0, offset: 0 }, { opacity: 1, offset: 0.5 }, { opacity: 0, offset: 1 } ],
+      { duration: 2000, iterations: Infinity, easing: 'linear' }
+    );
+  </script>
+</body>
+</html>

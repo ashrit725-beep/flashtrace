@@ -1,0 +1,423 @@
+"""``capture()``: turn a page into a deterministic frame sequence (SPEC.md section 6).
+
+This module owns everything that is the same for every strategy: launching Chromium, building a
+fresh context with the exact viewport, loading the page, waiting for fonts, injecting extra CSS,
+running the interaction script, scanning for uncontrollable content, and choosing the strategy
+(A ``waapi_step`` -> B ``virtual_time`` -> C ``realtime``). The strategy itself only controls time
+and takes screenshots.
+"""
+
+from __future__ import annotations
+
+import tempfile
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+from urllib.parse import urlparse
+
+from playwright.sync_api import Browser, BrowserContext, Page, sync_playwright
+from playwright.sync_api import Error as PlaywrightError
+
+from capture.detect import CANVAS_PROBE_JS, find_uncontrollable
+from capture.frames import FrameSequence
+from capture.hashing import sequence_hash
+from capture.strategies import (
+    FALLBACK_ORDER,
+    REGISTRY,
+    CaptureSettings,
+    CaptureStrategy,
+    FrameSink,
+    StrategyOutcome,
+)
+
+ProgressCallback = Callable[[int, int], None]
+
+#: Where frames go when the caller does not say (a fresh sub-directory per capture).
+DEFAULT_OUTPUT_ROOT = Path(".flashtrace") / "captures"
+
+#: Milliseconds Playwright may spend loading the page before the capture is an error.
+NAVIGATION_TIMEOUT_MS = 30_000
+
+
+@dataclass
+class CaptureMeta:
+    """Everything the report needs to know about how the frames were obtained."""
+
+    strategy: str
+    deterministic: bool
+    frame_hashes: list[str]
+    hash: str
+    uncontrollable: list[str]
+    fallback_reason: str | None
+    notes: list[str]
+    viewport: tuple[int, int]
+    fps: int
+    duration_s: float
+    frame_count: int
+    url: str
+    wall_time_s: float
+
+    def to_report_capture(self) -> dict[str, object]:
+        """Exactly the ``capture`` object of ``engine/schema/report.schema.json``."""
+        return {
+            "strategy": self.strategy,
+            "deterministic": self.deterministic,
+            "frameCount": self.frame_count,
+            "hash": self.hash,
+            "frameHashes": list(self.frame_hashes),
+            "fallbackReason": self.fallback_reason,
+            "uncontrollable": list(self.uncontrollable),
+            "notes": list(self.notes),
+        }
+
+    def to_dict(self) -> dict[str, object]:
+        """The schema's ``capture`` keys plus the extra settings, all camelCase."""
+        data = self.to_report_capture()
+        data.update(
+            {
+                "viewport": {"width": self.viewport[0], "height": self.viewport[1]},
+                "fps": self.fps,
+                "durationS": self.duration_s,
+                "url": self.url,
+                "wallTimeS": self.wall_time_s,
+            }
+        )
+        return data
+
+
+@dataclass
+class CaptureResult:
+    frames: FrameSequence
+    meta: CaptureMeta
+
+
+@dataclass
+class _Attempt:
+    """Bookkeeping for one strategy attempt inside ``capture``."""
+
+    name: str
+    strategy: CaptureStrategy
+    #: True in "auto" mode when a later strategy exists to fall through to.
+    may_fall_through: bool
+    notes: list[str] = field(default_factory=list)
+    uncontrollable: list[str] = field(default_factory=list)
+    sink: FrameSink | None = None
+    outcome: StrategyOutcome | None = None
+    loop_seconds: float = 0.0
+    #: ``(kind, reason)`` once the attempt has been given up in favour of the next strategy; ``kind`` is
+    #: "skipped" (uncontrollable content), "failed" (the strategy rejected its own result) or "errored".
+    abandoned: tuple[str, str] | None = None
+
+    def abandon(self, kind: str, reason: str) -> None:
+        self.abandoned = (kind, reason)
+
+
+@dataclass
+class _Chain:
+    """The strategies given up so far and why: the source of ``meta.fallbackReason`` (SPEC 6.2)."""
+
+    steps: list[tuple[str, str, str]] = field(default_factory=list)  # (strategy, kind, reason)
+
+    def record(self, attempt: _Attempt) -> None:
+        if attempt.abandoned is None:
+            raise ValueError("only an abandoned attempt can be recorded in the chain")
+        kind, reason = attempt.abandoned
+        self.steps.append((attempt.name, kind, reason))
+
+    @property
+    def fallback_reason(self) -> str | None:
+        """Every reason in order, or ``None`` when the first strategy was used."""
+        if not self.steps:
+            return None
+        return "; ".join(f"{name} {kind}: {reason}" for name, kind, reason in self.steps)
+
+    def notes(self, used: str) -> list[str]:
+        """One line naming the whole chain, then one line per abandoned strategy."""
+        if not self.steps:
+            return []
+        chain = " -> ".join(f"{name} ({kind})" for name, kind, _reason in self.steps) + f" -> {used} (used)"
+        return [f"strategy chain: {chain}"] + [f"{name} {kind}: {reason}" for name, kind, reason in self.steps]
+
+
+def _first_line(exc: BaseException) -> str:
+    """An exception's message without the multi-line call log Playwright appends."""
+    text = str(exc).strip()
+    return text.splitlines()[0] if text else type(exc).__name__
+
+
+# ------------------------------------------------------------------------------------- helpers
+def resolve_url(url_or_path: str, allow_local_files: bool = True) -> str:
+    """Turn the caller's input into something ``page.goto`` accepts.
+
+    ``http(s)://`` URLs pass through; ``file://`` URLs and existing local paths become ``file://``
+    URLs (only when ``allow_local_files`` is true, which a server exposed to others should disable).
+    """
+    parsed = urlparse(url_or_path)
+    if parsed.scheme in ("http", "https"):
+        return url_or_path
+    if parsed.scheme == "file":
+        if not allow_local_files:
+            raise ValueError("local files are not allowed for this capture")
+        return url_or_path
+    if parsed.scheme and parsed.scheme not in ("", "file") and len(parsed.scheme) > 1:
+        raise ValueError(f"unsupported URL scheme '{parsed.scheme}' in {url_or_path!r}")
+    path = Path(url_or_path).expanduser()
+    if not path.exists():
+        raise FileNotFoundError(f"no such file or URL: {url_or_path!r}")
+    if not allow_local_files:
+        raise ValueError("local files are not allowed for this capture")
+    return path.resolve().as_uri()
+
+
+def _prepare_out_dir(out_dir: str | Path | None) -> Path:
+    """Create (or reuse) the directory that receives the frame PNG files."""
+    if out_dir is not None:
+        path = Path(out_dir)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+    DEFAULT_OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix="capture-", dir=DEFAULT_OUTPUT_ROOT))
+
+
+def _new_context(browser: Browser, viewport: tuple[int, int]) -> BrowserContext:
+    """A fresh, isolated browsing context with the exact capture conditions of SPEC 6.2.
+
+    device_scale_factor=1 so one CSS pixel is one image pixel (the WCAG window is in CSS pixels);
+    light colour scheme; reduced motion is *not* requested, because the audit must see the motion
+    users without that preference see.
+    """
+    return browser.new_context(
+        viewport={"width": viewport[0], "height": viewport[1]},
+        device_scale_factor=1,
+        color_scheme="light",
+        reduced_motion="no-preference",
+        java_script_enabled=True,
+        ignore_https_errors=True,
+    )
+
+
+def _settle_page(page: Page, attempt: _Attempt, settings: CaptureSettings) -> None:
+    """After load: fonts ready, extra CSS in place, interaction script finished."""
+    # Fonts arriving after frame 0 would change text pixels mid-capture for no page-authored reason.
+    attempt.notes.extend(attempt.strategy.wait_for_fonts(page))
+    if settings.extra_css:
+        # A <style> element, exactly like a page-authored stylesheet, so ablation and fix overrides
+        # take part in the normal cascade (they rely on !important to win).
+        page.add_style_tag(content=settings.extra_css)
+        attempt.notes.append("extra CSS injected as a <style> element before frame 0")
+    if settings.interaction_script:
+        attempt.notes.extend(attempt.strategy.run_interaction(page, settings.interaction_script))
+
+
+# ------------------------------------------------------------------------------------- entry point
+def capture(
+    url_or_path: str,
+    duration_s: float = 10,
+    viewport: tuple[int, int] = (1024, 768),
+    fps: int = 60,
+    interaction_script: str | None = None,
+    strategy: str = "auto",
+    out_dir: str | Path | None = None,
+    extra_css: str | None = None,
+    progress: ProgressCallback | None = None,
+    allow_local_files: bool = True,
+    browser: Browser | None = None,
+) -> CaptureResult:
+    """Capture ``url_or_path`` as ``round(duration_s * fps)`` frames of animation time.
+
+    ``strategy`` is ``"auto"`` (A, falling through to B then C) or one strategy name. ``browser`` lets
+    a caller that captures many times (ablation, fix verification) reuse one Chromium process; each
+    capture still gets a fresh context. Frames are written to ``out_dir`` (default: a new directory
+    under ``.flashtrace/captures/``).
+    """
+    if duration_s <= 0:
+        raise ValueError("duration_s must be positive")
+    if fps < 1:
+        raise ValueError("fps must be at least 1")
+    width, height = int(viewport[0]), int(viewport[1])
+    if width < 1 or height < 1:
+        raise ValueError("viewport must be at least 1x1")
+    if strategy != "auto" and strategy not in FALLBACK_ORDER:
+        raise ValueError(f"unknown strategy {strategy!r}; expected 'auto' or one of {FALLBACK_ORDER}")
+
+    started = time.perf_counter()
+    url = resolve_url(url_or_path, allow_local_files)
+    target_dir = _prepare_out_dir(out_dir)
+    settings = CaptureSettings(
+        url=url,
+        duration_s=float(duration_s),
+        viewport=(width, height),
+        fps=int(fps),
+        interaction_script=interaction_script,
+        extra_css=extra_css,
+        forced=strategy != "auto",
+    )
+    names: tuple[str, ...] = FALLBACK_ORDER if strategy == "auto" else (strategy,)
+    auto = strategy == "auto"
+
+    if browser is not None:
+        return _capture_with_browser(browser, settings, names, auto, target_dir, progress, started)
+    with sync_playwright() as playwright:
+        own_browser = playwright.chromium.launch(headless=True)
+        try:
+            return _capture_with_browser(own_browser, settings, names, auto, target_dir, progress, started)
+        finally:
+            own_browser.close()
+
+
+def _capture_with_browser(
+    browser: Browser,
+    settings: CaptureSettings,
+    names: tuple[str, ...],
+    auto: bool,
+    target_dir: Path,
+    progress: ProgressCallback | None,
+    started: float,
+) -> CaptureResult:
+    """Try the strategies in ``names`` in order until one produces frames it stands behind.
+
+    SPEC 6.2 fall-through A -> B -> C. A strategy is given up ("abandoned") when the page holds content
+    it cannot control, when it rejects its own frames (double-shot or page-clock check), when it cannot
+    load the page under its time source, or when it raises; every reason is kept in the chain and
+    written to ``meta.fallbackReason`` and ``meta.notes``. The last strategy (or a forced one) is never
+    abandoned: its result is returned as it is, and its exceptions propagate.
+    """
+    chain = _Chain()
+    for position, name in enumerate(names):
+        strategy_class = REGISTRY.get(name)
+        if strategy_class is None:
+            reason = f"; fallback reason: {chain.fallback_reason}" if chain.fallback_reason else ""
+            raise NotImplementedError(f"capture strategy '{name}' is not implemented yet{reason}")
+        attempt = _Attempt(name=name, strategy=strategy_class(), may_fall_through=auto and position < len(names) - 1)
+        try:
+            _run_attempt(browser, attempt, settings, target_dir, progress)
+        except (PlaywrightError, RuntimeError, OSError) as exc:
+            if not attempt.may_fall_through:
+                raise
+            attempt.abandon("errored", f"{type(exc).__name__}: {_first_line(exc)}")
+        if attempt.abandoned is not None:
+            chain.record(attempt)
+            continue
+        return _build_result(attempt, chain, settings, started)
+
+    # Unreachable: the loop either returns or raises. Kept so the function has an explicit end.
+    raise RuntimeError("no capture strategy produced frames")
+
+
+def _browser_for(attempt: _Attempt, browser: Browser) -> tuple[Browser, bool]:
+    """The browser an attempt runs in, and whether this attempt owns (must close) it.
+
+    A strategy that declares ``launch_args`` gets its own Chromium with those switches so the caller's
+    browser, and every other strategy, keeps running under the switches it was validated with.
+    """
+    switches = attempt.strategy.launch_args
+    if not switches or not attempt.strategy.needs_launch_args(browser):
+        return browser, False
+    try:
+        dedicated = browser.browser_type.launch(headless=True, args=list(switches))
+    except PlaywrightError as exc:
+        attempt.notes.append(f"could not launch a dedicated Chromium with {' '.join(switches)}: {_first_line(exc)}; using the shared browser")
+        return browser, False
+    attempt.notes.append(f"dedicated Chromium launched with: {' '.join(switches)}")
+    return dedicated, True
+
+
+def _run_attempt(
+    browser: Browser,
+    attempt: _Attempt,
+    settings: CaptureSettings,
+    target_dir: Path,
+    progress: ProgressCallback | None,
+) -> None:
+    """Run one strategy end to end in a fresh context; fills ``attempt`` (or abandons it)."""
+    attempt_browser, owned = _browser_for(attempt, browser)
+    try:
+        context = _new_context(attempt_browser, settings.viewport)
+        try:
+            _load_and_capture(context, attempt, settings, target_dir, progress)
+        finally:
+            context.close()
+    finally:
+        if owned:
+            attempt_browser.close()
+
+
+def _load_and_capture(
+    context: BrowserContext,
+    attempt: _Attempt,
+    settings: CaptureSettings,
+    target_dir: Path,
+    progress: ProgressCallback | None,
+) -> None:
+    """Prepare, load, scan and capture inside ``context`` (the per-attempt steps of SPEC 6.2)."""
+    strategy = attempt.strategy
+    # The canvas probe must be in place before any page script asks for a WebGL context.
+    context.add_init_script(CANVAS_PROBE_JS)
+    strategy.prepare_context(context, settings)
+    page = strategy.create_page(context, settings)
+    page.set_default_navigation_timeout(NAVIGATION_TIMEOUT_MS)
+    strategy.prepare_page(page, settings)
+
+    load_failure = strategy.navigate(page, settings)
+    if load_failure is not None:
+        if attempt.may_fall_through:
+            attempt.abandon("failed", load_failure)
+            return
+        # Forced strategy that cannot even load the page: an empty capture that says why, so the caller
+        # (SPEC 6.4: fewer than 2*fps frames => INCONCLUSIVE) still gets the diagnosis in the notes.
+        attempt.sink = FrameSink(FrameSequence.new_in_dir(target_dir))
+        notes = strategy.describe_setup() + [load_failure]
+        attempt.outcome = StrategyOutcome(deterministic=False, notes=notes, failure_reason=load_failure)
+        return
+
+    _settle_page(page, attempt, settings)
+    attempt.uncontrollable, detect_notes = find_uncontrollable(page)
+    attempt.notes.extend(detect_notes)
+    if attempt.uncontrollable and strategy.requires_controllable_content:
+        reason = "uncontrollable content: " + "; ".join(attempt.uncontrollable)
+        if attempt.may_fall_through:
+            attempt.abandon("skipped", reason)
+            return
+        # The caller insisted. The frames are still taken, but that content runs on clocks the strategy
+        # does not control (measured: a 120 ms GIF advances between A's frames and A's double-shot,
+        # ~30 ms apart, rarely sees it), so the capture is reported as non-deterministic.
+        attempt.notes.append(
+            f"{attempt.name} was used although uncontrollable content is present: "
+            + "; ".join(attempt.uncontrollable)
+            + "; deterministic=false because that content runs on clocks this strategy does not control"
+        )
+
+    attempt.sink = FrameSink(FrameSequence.new_in_dir(target_dir))
+    loop_started = time.perf_counter()
+    attempt.outcome = strategy.run(page, settings, attempt.sink, progress)
+    attempt.loop_seconds = time.perf_counter() - loop_started
+    # Only a strategy that promises determinism can be wrong about it; C's frames are what they are.
+    if attempt.outcome.failure_reason and attempt.may_fall_through and strategy.deterministic_by_design:
+        attempt.abandon("failed", attempt.outcome.failure_reason)
+
+
+def _build_result(attempt: _Attempt, chain: _Chain, settings: CaptureSettings, started: float) -> CaptureResult:
+    """Assemble ``CaptureResult`` from a completed attempt and the chain that led to it."""
+    if attempt.sink is None or attempt.outcome is None:
+        raise RuntimeError(f"strategy '{attempt.name}' finished without producing an outcome")
+    sink, outcome = attempt.sink, attempt.outcome
+    notes = chain.notes(attempt.name) + attempt.notes + outcome.notes
+    notes.append(f"frame loop took {attempt.loop_seconds:.2f} s for {len(sink.hashes)} frames")
+    forced_over_uncontrollable = bool(attempt.uncontrollable) and attempt.strategy.requires_controllable_content
+    meta = CaptureMeta(
+        strategy=attempt.strategy.name,
+        deterministic=outcome.deterministic and attempt.strategy.deterministic_by_design and not forced_over_uncontrollable,
+        frame_hashes=list(sink.hashes),
+        hash=sequence_hash(sink.hashes),
+        uncontrollable=list(attempt.uncontrollable),
+        fallback_reason=chain.fallback_reason,
+        notes=notes,
+        viewport=settings.viewport,
+        fps=settings.fps,
+        duration_s=settings.duration_s,
+        frame_count=len(sink.hashes),
+        url=settings.url,
+        wall_time_s=time.perf_counter() - started,
+    )
+    return CaptureResult(frames=sink.frames, meta=meta)

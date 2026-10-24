@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>FlashTrace synthetic page: requestAnimationFrame</title>
+<!--
+  Synthetic capture test page (deliberately flashing; only ever opened by FlashTrace's own tests).
+  Same visual contract as css_keyframes.html (see the comment there), but nothing is animated by
+  the browser: a requestAnimationFrame loop reads performance.now() and writes inline styles, the
+  way hand-written JS animations and many animation libraries do. There are no Animation objects
+  for document.getAnimations() to find, so only the fake clock can control this page.
+-->
+<style>
+  html, body { margin: 0; padding: 0; background: #fff; width: 100%; height: 100%; overflow: hidden; }
+  #box  { position: absolute; left: 100px; top: 100px; width: 400px; height: 300px; background-color: #000; }
+  #fade { position: absolute; left: 600px; top: 100px; width: 200px; height: 200px; background-color: #333; opacity: 0; }
+</style>
+</head>
+<body>
+  <div id="box"></div>
+  <div id="fade"></div>
+  <script>
+    const box = document.getElementById('box');
+    const fade = document.getElementById('fade');
+    const start = performance.now();   // elapsed time is measured from script start, the usual idiom
+    function tick() {
+      const t = (performance.now() - start) / 1000;        // seconds since start
+      // 4 Hz square wave: 125 ms black, 125 ms white (floor(t * 8) counts 125 ms half-periods).
+      box.style.backgroundColor = Math.floor(t * 8) % 2 === 0 ? '#000' : '#fff';
+      // 0.5 Hz triangle wave on opacity: 0 -> 1 over the first second, 1 -> 0 over the next.
+      const phase = (t % 2) / 2;
+      fade.style.opacity = String(phase < 0.5 ? phase * 2 : (1 - phase) * 2);
+      requestAnimationFrame(tick);
+    }
+    tick();
+  </script>
+</body>
+</html>
