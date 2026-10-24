@@ -1,0 +1,26 @@
+# python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.hypothesis/
+dist/
+build/
+# flashtrace runtime output
+.flashtrace/
+report.json
+report.html
+# generated benchmark pages (reproducible: python -m bench.generate --n 200 --seed 1)
+bench/pages/
+*.webm
+# node / next
+node_modules/
+web/.next/
+web/out/
+web/playwright-report/
+web/test-results/
+# os / editor
+.DS_Store
+.idea/
+.vscode/

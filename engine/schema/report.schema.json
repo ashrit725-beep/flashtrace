@@ -1,0 +1,202 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://flashtrace.local/schema/report.schema.json",
+  "title": "FlashTrace audit report",
+  "description": "Contract for every report FlashTrace writes. See docs/SPEC.md section 8. Analysis aid, not a compliance certification.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version", "url", "capturedAt", "engineVersion", "settings", "capture", "verdict", "reason",
+    "violations", "advisory", "timeline", "heatmap", "culprits", "fixes", "evidenceFrames",
+    "limitations", "assumptions", "disclaimer"
+  ],
+  "properties": {
+    "version": { "type": "string", "pattern": "^1\\.[0-9]+$" },
+    "url": { "type": "string", "minLength": 1 },
+    "capturedAt": { "type": "string", "format": "date-time" },
+    "engineVersion": { "type": "string" },
+    "settings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["duration", "viewport", "fps", "redRule", "attribute", "windowPx", "cellPx"],
+      "properties": {
+        "duration": { "type": "number", "exclusiveMinimum": 0 },
+        "viewport": { "$ref": "#/$defs/size" },
+        "fps": { "type": "integer", "minimum": 1 },
+        "redRule": { "type": "string", "enum": ["wcag22", "wcag21-legacy"] },
+        "attribute": { "type": "string", "enum": ["none", "bbox", "ablate"] },
+        "windowPx": { "$ref": "#/$defs/size" },
+        "cellPx": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "capture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["strategy", "deterministic", "frameCount", "hash", "frameHashes", "fallbackReason", "uncontrollable", "notes"],
+      "properties": {
+        "strategy": { "type": "string", "enum": ["waapi_step", "virtual_time", "realtime", "none"] },
+        "deterministic": { "type": "boolean" },
+        "frameCount": { "type": "integer", "minimum": 0 },
+        "hash": { "type": "string", "pattern": "^[0-9a-f]{64}$|^$" },
+        "frameHashes": { "type": "array", "items": { "type": "string", "pattern": "^[0-9a-f]{64}$" } },
+        "fallbackReason": { "type": ["string", "null"] },
+        "uncontrollable": { "type": "array", "items": { "type": "string" } },
+        "notes": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "verdict": { "type": "string", "enum": ["PASS", "FAIL", "INCONCLUSIVE"] },
+    "reason": { "type": "string", "minLength": 1 },
+    "violations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["start", "end", "type", "maxRatePerSec", "window", "frameIndices"],
+        "properties": {
+          "start": { "type": "integer", "minimum": 0 },
+          "end": { "type": "integer", "minimum": 0 },
+          "type": { "$ref": "#/$defs/flashType" },
+          "maxRatePerSec": { "type": "number", "minimum": 0 },
+          "window": { "$ref": "#/$defs/rect" },
+          "frameIndices": { "type": "array", "items": { "type": "integer", "minimum": 0 } }
+        }
+      }
+    },
+    "advisory": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["type", "flashType", "start", "end", "meanRatePerSec", "label"],
+        "properties": {
+          "type": { "type": "string", "enum": ["sustained-flashing"] },
+          "flashType": { "$ref": "#/$defs/flashType" },
+          "start": { "type": "integer", "minimum": 0 },
+          "end": { "type": "integer", "minimum": 0 },
+          "meanRatePerSec": { "type": "number", "minimum": 0 },
+          "label": { "type": "string", "const": "advisory - not a WCAG 2.3.1 criterion" }
+        }
+      }
+    },
+    "timeline": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["t", "generalFlashes", "redFlashes"],
+        "properties": {
+          "t": { "type": "number", "minimum": 0 },
+          "generalFlashes": { "type": "integer", "minimum": 0 },
+          "redFlashes": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "heatmap": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cellSize", "w", "h", "data"],
+      "description": "data is base64 of a little-endian uint16 array, row-major, h rows by w columns",
+      "properties": {
+        "cellSize": { "type": "integer", "minimum": 1 },
+        "w": { "type": "integer", "minimum": 0 },
+        "h": { "type": "integer", "minimum": 0 },
+        "data": { "type": "string" }
+      }
+    },
+    "culprits": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["rank", "selector", "nodeType", "ftId", "rect", "animation", "overlap", "ablationDelta", "inMinimalSet"],
+        "properties": {
+          "rank": { "type": "integer", "minimum": 1 },
+          "selector": { "type": "string" },
+          "nodeType": { "type": "string" },
+          "ftId": { "type": ["string", "null"] },
+          "rect": { "$ref": "#/$defs/rect" },
+          "animation": {
+            "type": ["object", "null"],
+            "additionalProperties": false,
+            "required": ["name", "duration", "keyframes"],
+            "properties": {
+              "name": { "type": "string" },
+              "duration": { "type": ["number", "null"], "description": "milliseconds; null when unknown or infinite" },
+              "keyframes": { "type": "array", "items": { "type": "object" } }
+            }
+          },
+          "overlap": { "type": "number", "minimum": 0, "maximum": 1 },
+          "ablationDelta": { "type": ["number", "null"], "description": "reduction in qualifying flashes when the candidate is suppressed; null when ablation was not run" },
+          "inMinimalSet": { "type": "boolean" }
+        }
+      }
+    },
+    "fixes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["culprit", "kind", "css", "rationale", "before", "after", "verified"],
+        "properties": {
+          "culprit": { "type": "integer", "minimum": 1, "description": "rank of the culprit this fix targets" },
+          "kind": { "type": "string", "enum": ["rate", "luminance", "red", "area"] },
+          "css": { "type": "string" },
+          "rationale": { "type": "string" },
+          "before": { "$ref": "#/$defs/measurement" },
+          "after": { "oneOf": [ { "$ref": "#/$defs/measurement" }, { "type": "null" } ] },
+          "verified": { "type": "boolean" }
+        }
+      }
+    },
+    "evidenceFrames": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["index", "pngPath", "label"],
+        "properties": {
+          "index": { "type": "integer", "minimum": 0 },
+          "pngPath": { "type": "string" },
+          "label": { "type": "string" }
+        }
+      }
+    },
+    "limitations": { "type": "array", "items": { "type": "string" } },
+    "assumptions": { "type": "array", "items": { "type": "string" } },
+    "disclaimer": { "type": "string", "const": "Analysis aid, not a compliance certification." }
+  },
+  "$defs": {
+    "flashType": { "type": "string", "enum": ["general", "red"] },
+    "size": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["width", "height"],
+      "properties": {
+        "width": { "type": "integer", "minimum": 1 },
+        "height": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "rect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["x", "y", "w", "h"],
+      "properties": {
+        "x": { "type": "number" }, "y": { "type": "number" },
+        "w": { "type": "number", "minimum": 0 }, "h": { "type": "number", "minimum": 0 }
+      }
+    },
+    "measurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verdict", "generalMaxRatePerSec", "redMaxRatePerSec", "qualifyingGeneral", "qualifyingRed", "deterministic"],
+      "properties": {
+        "verdict": { "type": "string", "enum": ["PASS", "FAIL", "INCONCLUSIVE"] },
+        "generalMaxRatePerSec": { "type": "number", "minimum": 0 },
+        "redMaxRatePerSec": { "type": "number", "minimum": 0 },
+        "qualifyingGeneral": { "type": "integer", "minimum": 0 },
+        "qualifyingRed": { "type": "integer", "minimum": 0 },
+        "deterministic": { "type": "boolean" }
+      }
+    }
+  }
+}
