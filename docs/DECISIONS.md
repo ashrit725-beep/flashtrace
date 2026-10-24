@@ -129,3 +129,46 @@ CSS transitions on that target via the injected `transition:none!important`), an
 candidates with `visibility:hidden!important`. The injected CSS from the brief is still emitted (it is what a
 developer would write) and recorded in the report, but it is not what makes the ablation effective.
 **Consequences.** Ablation results do not depend on whether the page's own scripts touched the animation.
+
+## ADR-014 — Benchmark geometry in 4-px cells; near-limit single elements use the nearest legal rectangle (2026-10-24)
+
+**Context.** The truth file must state the exact number of flashing cells the engine will see. 1 306 cells
+(0.24 × 5 440) and 1 414 (0.26 × 5 440) have no factor pair that fits a single rectangle inside the 85 × 64-cell
+window.
+**Decision.** Element rectangles are cell-aligned, at least 2 × 2 cells, laid side by side with 1-cell gaps inside
+one 85 × 64-cell region anchored at fixed cell offsets. Multi-element pages split the target count exactly;
+single-element pages take the nearest legal count (1 305, 1 416) and the truth records both `areaFraction`
+(grid value) and `areaFractionActual` / `totalCells` (real). Scoring uses the real values.
+**Consequences.** Truth area is exact, never estimated; 0.24 / 0.26 remain boundary cases either way.
+
+## ADR-015 — Benchmark videos: JPEG frames piped to Playwright's ffmpeg, single-threaded VP8 (2026-10-24)
+
+**Context.** Playwright's bundled ffmpeg (n7.0.1 build 1011) is compiled with `--disable-everything`: no
+rawvideo demuxer, no `fd:` protocol, only image2pipe + mjpeg input, libvpx VP8 and the WebM muxer.
+**Decision.** Feed two solid JPEG frames (quality 100, no chroma subsampling) through
+`-f image2pipe -vcodec mjpeg -i pipe:0` and encode with `-c:v libvpx -b:v 2M -deadline best -cpu-used 0
+-auto-alt-ref 0 -pix_fmt yuv420p -g 15 -fflags +bitexact -flags +bitexact -threads 1 -r 60`. Frame state uses
+integer arithmetic `((i*2*hz)//60) % 2`.
+**Consequences.** Measured: WebM output byte-identical across two full 200-page runs on this machine; Chromium
+renders the greys exactly and red as (254,0,0). Video pages with target ΔL ≤ 0.11 or area 0.24 / 0.26 are
+tagged boundary because the codec is lossy.
+
+## ADR-016 — Benchmark distractors are inert by construction; WAAPI step timing lives on keyframes (2026-10-24)
+
+**Context.** A distractor that produced qualifying flashes or added cells to the flashing window would make
+the expected verdict wrong. The brief's WAAPI recipe (`easing: "steps(1,end)"` in the `animate()` options)
+never reaches its 50% keyframe: an options-level easing shapes the whole iteration's progress, which stays at 0.
+**Decision.** The 0.5 Hz fade uses colour (224,236,252), L = 0.8287, so its darker state is never below 0.80
+(SPEC T2); the checkerboard is static; the marquee is at least one window away from the flashing region; all
+items are ≥ 8 px from the elements. WAAPI pages put `steps(1,end)` on each keyframe (CSS per-segment timing).
+**Consequences.** The expected verdict depends only on the flashing elements; pages still contain real
+non-culprit animations for attribution to ignore. Any synthetic page built from the brief's WAAPI options
+recipe is static and must be fixed the same way.
+
+## ADR-017 — Benchmark randomness is seeded per page by (seed, index) (2026-10-24)
+
+**Decision.** Each page uses `random.Random("flashtrace-bench:{seed}:{index}")`; all draws happen before any
+file is written and never depend on ffmpeg availability. `bench/truth.json` is committed because it is small
+(384 KB), reproducible and useful to inspect; `bench/pages/` is regenerated.
+**Consequences.** Page *i* is identical for any *n*, so the 15-page test set is a prefix of the 200-page set;
+machines without ffmpeg produce the same truth except video pages become `video-skipped` / `SKIP`.
