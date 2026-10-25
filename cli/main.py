@@ -185,6 +185,10 @@ def bench(
     workers: int = typer.Option(4, "--workers", help="Parallel audit processes."),
     attribute: Attribute = typer.Option(Attribute.none, "--attribute", help="Attribution mode per page."),
     determinism_sample: int = typer.Option(20, "--determinism-sample", help="Pages audited twice to check determinism."),
+    ablate_sample: int = typer.Option(0, "--ablate-sample",
+                                      help="After the main pass, audit the first K FAIL pages again with ablation."),
+    ablate_duration: float | None = typer.Option(None, "--ablate-duration",
+                                                 help="Seconds captured per ablation-sample page (default: --duration)."),
     out: Path = typer.Option(Path("docs/RESULTS.md"), "--out",
                              help="Markdown results file; the per-page JSON is written next to it as .json."),
     regenerate: bool = typer.Option(False, "--regenerate", help="Regenerate the pages and truth first."),
@@ -203,7 +207,8 @@ def bench(
         results = run_bench(n=n, seed=seed, duration=duration, fps=fps, workers=workers,
                             attribute=attribute.value, determinism_sample=determinism_sample, out=out,
                             regenerate=regenerate, pages=pages, truth=truth, work_dir=work_dir,
-                            command_line=command_line, quiet=quiet)
+                            command_line=command_line, quiet=quiet, ablate_sample=ablate_sample,
+                            ablate_duration=ablate_duration)
     except Exception as exc:  # noqa: BLE001
         raise fail(exc, debug) from None
     for line in results["summaryLines"]:
