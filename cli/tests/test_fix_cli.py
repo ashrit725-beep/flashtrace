@@ -82,7 +82,8 @@ def test_fix_lists_fixes_and_prints_one(job: tuple[AnalysedJob, dict[str, Any]])
 def test_fix_errors_exit_2(job: tuple[AnalysedJob, dict[str, Any]], tmp_path: Path) -> None:
     path = job[0].job_dir / "report.json"
     out_of_range = flashtrace("fix", str(path), "--apply", "3")
-    assert out_of_range.returncode == 2 and lines(out_of_range) == ["error: --apply 3: the report has 2 fix(es); use 1 to 2"]
+    assert out_of_range.returncode == 2
+    assert lines(out_of_range) == ["error: --apply 3: the report has 2 fix(es); use 1 to 2", DISCLAIMER]
     no_number = flashtrace("fix", str(path), "--verify")
     assert no_number.returncode == 2 and "--verify needs --apply N" in no_number.stderr
     not_a_report = tmp_path / "x.json"

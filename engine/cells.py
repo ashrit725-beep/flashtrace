@@ -2,9 +2,13 @@
 
 Why cells at all: WCAG thresholds are about regions of the screen, not single
 pixels, and a 1024x768 frame has 786 432 pixels.  Averaging each 4x4 block
-into one colour gives 49 152 cells, a sixteenth of the numbers to track over
-hundreds of frames, and still fine enough to measure the 25 % area rule
-precisely.
+into one colour gives 49 152 cells, a sixteenth of the signals to follow over
+hundreds of frames.  The cell signals decide WHEN a cell's runs start and end;
+whether a run is a transition is then decided pixel by pixel between the run's
+two end frames (pixel_blocks() and the pixel measures below), so a cell that a
+flashing element only partly covers counts only the pixels that flash and the
+25 % area rule is measured to the pixel, wherever the element sits (SPEC 5.4,
+5.6, ADR-002 as amended).
 
 The average is taken in linear light (ADR-002): luminance is linear in light,
 so a cell's L is exactly the mean of its pixels' L, which is what the
@@ -24,6 +28,7 @@ from engine.color import (
     legacy_red_value,
     redness_ratio,
     relative_luminance,
+    srgb8_from_linear,
     srgb8_to_linear,
     uv_chromaticity,
 )
@@ -108,6 +113,50 @@ def window_cells(
     return min(wy, cells_y), min(wx, cells_x)
 
 
+def pixel_blocks(frame_u8: np.ndarray, cell_px: int = CELL_PX) -> np.ndarray:
+    """uint8 frame [H, W, 3] -> each cell's pixels in a row, uint8 [N, cell_px * cell_px, 3].
+
+    Cells are in the same row-major order as cell_signals() (index y * cells_x + x);
+    inside a cell the pixels run row by row.  Pixels beyond the last whole cell are
+    dropped, as in frame_to_cells().
+    """
+    frame = np.asarray(frame_u8)
+    if frame.ndim != 3 or frame.shape[2] != 3:
+        raise ValueError(f"expected a frame shaped [H, W, 3], got {frame.shape}")
+    cells_y, cells_x = grid_shape(frame.shape[0], frame.shape[1], cell_px)
+    if cells_y == 0 or cells_x == 0:
+        raise ValueError(f"frame {frame.shape[:2]} is smaller than one {cell_px}x{cell_px} cell")
+    cropped = frame[: cells_y * cell_px, : cells_x * cell_px, :]
+    # [cy, py, cx, px, 3] -> [cy, cx, py, px, 3]: the pixels of one cell become neighbours.
+    blocks = cropped.reshape(cells_y, cell_px, cells_x, cell_px, 3).transpose(0, 2, 1, 3, 4)
+    return blocks.reshape(cells_y * cells_x, cell_px * cell_px, 3)
+
+
+def _linear_and_whole(pixels_u8: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """uint8 colours [..., 3] -> (linear light, the same whole 0..255 values as float64)."""
+    pixels = np.asarray(pixels_u8)
+    return srgb8_to_linear(pixels), pixels.astype(np.float64)
+
+
+def measure_general(pixels_u8: np.ndarray) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """uint8 colours [..., 3] -> (relative luminance L [...], no aux): the general rule's inputs per pixel."""
+    linear, _ = _linear_and_whole(pixels_u8)
+    return relative_luminance(linear), {}
+
+
+def measure_red_wcag22(pixels_u8: np.ndarray) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """uint8 colours [..., 3] -> (redness ratio, {"u", "v"}): the WCAG 2.2 red rule's inputs per pixel."""
+    linear, rgb8 = _linear_and_whole(pixels_u8)
+    uv = uv_chromaticity(linear, rgb8)
+    return redness_ratio(linear, rgb8), {"u": uv[..., 0], "v": uv[..., 1]}
+
+
+def measure_red_legacy(pixels_u8: np.ndarray) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """uint8 colours [..., 3] -> (legacy red value, {"ratio"}): the legacy red rule's inputs per pixel."""
+    linear, rgb8 = _linear_and_whole(pixels_u8)
+    return legacy_red_value(linear, rgb8), {"ratio": redness_ratio(linear, rgb8)}
+
+
 @dataclass
 class CellSignals:
     """The five per-cell numbers the transition rules look at, each float64[N].
@@ -129,11 +178,13 @@ def cell_signals(cells_rgb: np.ndarray) -> CellSignals:
     if rgb.ndim != 3 or rgb.shape[2] != 3:
         raise ValueError(f"expected cells shaped [cells_y, cells_x, 3], got {rgb.shape}")
     flat = rgb.reshape(-1, 3)
-    uv = uv_chromaticity(flat)
+    # The cell colour as whole 0..255 values, computed once for the three signals that use it.
+    rgb8 = srgb8_from_linear(flat)
+    uv = uv_chromaticity(flat, rgb8)
     return CellSignals(
         L=relative_luminance(flat),
-        ratio=redness_ratio(flat),
+        ratio=redness_ratio(flat, rgb8),
         u=uv[:, 0],
         v=uv[:, 1],
-        rv=legacy_red_value(flat),
+        rv=legacy_red_value(flat, rgb8),
     )

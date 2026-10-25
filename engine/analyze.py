@@ -2,16 +2,18 @@
 
 Per frame (streaming: a frame is dropped as soon as its signals are read):
     uint8 frame -> linear light -> 4x4 cell means -> per-cell signals
-        -> RunTracker (general on L; red on ratio+u'v' or on the legacy value)
-        -> FlashPairer -> "this cell completed a flash at frame f" masks
-        -> heatmap increments.
+        -> RunTracker (general on L; red on ratio+u'v' or on the legacy value;
+           run ends found on the cell signal, the rule applied pixel by pixel)
+        -> FlashPairer (per pixel) -> "n pixels of this cell completed a flash
+           at frame f" masks -> heatmap increments.
 After the last frame:
-    masks -> area scoring (which events cover > 25 % of a window)
+    masks -> area scoring (which events cover > 25 % of a window, in pixels)
         -> sliding one-second counts -> violations, advisories, timeline.
 
-What stays in memory for the whole capture is one true/false per cell per
+What stays in memory for the whole capture is one small count per cell per
 frame for each flash type (the masks, needed by the area step) plus a few
-numbers per cell for the trackers; the frames themselves are never kept.
+numbers and the pixels of two frames per cell for the trackers; the frames
+themselves are never kept.
 
 Everything is float64 / int64, in a fixed order, with no randomness and no
 threads, so the same frames always give byte-identical JSON.
@@ -29,6 +31,10 @@ from engine.cells import (
     cell_signals,
     frame_to_cells,
     grid_shape,
+    measure_general,
+    measure_red_legacy,
+    measure_red_wcag22,
+    pixel_blocks,
     window_cells,
     window_cells_full,
     window_px,
@@ -37,6 +43,7 @@ from engine.constants import CELL_PX, EVENT_FRAME_TOLERANCE, RED_RULES, RUN_REVE
 from engine.rate import find_advisories, find_violations, timeline, trailing_counts, window_counts
 from engine.transitions import (
     FlashPairer,
+    Measure,
     Rule,
     RunTracker,
     Transition,
@@ -55,6 +62,9 @@ from engine.types import (
 
 FrameSource = np.ndarray | Iterable[np.ndarray]
 ProgressCallback = Callable[[int], None]
+
+# Every cell is CELL_PX x CELL_PX pixels; flashes and areas are counted in these pixels.
+PIXELS_PER_CELL: int = CELL_PX * CELL_PX
 
 
 def _iter_frames(frames: FrameSource) -> Iterator[np.ndarray]:
@@ -83,39 +93,44 @@ def _check_frame(frame: object, expected: tuple[int, int, int] | None) -> np.nda
 class _FlashStream:
     """One flash type's tracker + pairer + per-frame masks, fed one frame at a time."""
 
-    def __init__(self, n_cells: int, rule: Rule, tolerance: float) -> None:
+    def __init__(self, n_cells: int, rule: Rule, tolerance: float, measure: Measure) -> None:
         self.n_cells = n_cells
-        self.tracker = RunTracker(n_cells, rule, tolerance)
-        self.pairer = FlashPairer(n_cells)
-        # One bool[N] per frame, created as frames arrive.  Transitions are
+        self.tracker = RunTracker(n_cells, rule, tolerance, measure)
+        self.pairer = FlashPairer(n_cells, PIXELS_PER_CELL)
+        # One uint8[N] per frame, created as frames arrive: how many pixels of
+        # each cell completed a flash at that frame (0..16).  Transitions are
         # timestamped in the past (at the run's extremum), so the mask for
         # that earlier frame already exists and can still be written.
         self.masks: list[np.ndarray] = []
 
-    def push(self, t: int, signal: np.ndarray, aux: dict[str, np.ndarray], heatmap: np.ndarray) -> None:
-        self.masks.append(np.zeros(self.n_cells, dtype=bool))
-        self._absorb(self.tracker.update(t, signal, aux), heatmap)
+    def push(
+        self, t: int, signal: np.ndarray, aux: dict[str, np.ndarray], pixels: np.ndarray, heatmap: np.ndarray
+    ) -> None:
+        self.masks.append(np.zeros(self.n_cells, dtype=np.uint8))
+        self._absorb(self.tracker.update(t, signal, aux, pixels), heatmap)
 
     def finish(self, t_last: int, heatmap: np.ndarray) -> None:
         self._absorb(self.tracker.finish(t_last), heatmap)
 
     def _absorb(self, transitions: list[Transition], heatmap: np.ndarray) -> None:
         for tr in transitions:
-            completed = self.pairer.add(tr)
-            if completed.size:
-                self.masks[tr.frame][completed] = True
-                heatmap[completed] += 1  # indices are unique within one transition
+            cells, pixel_counts = self.pairer.complete(tr)
+            if cells.size:
+                # A cell's transitions have strictly increasing stamp frames, so
+                # it completes at most one flash per frame: plain assignment.
+                self.masks[tr.frame][cells] = pixel_counts
+                heatmap[cells] += 1  # indices are unique within one transition
 
     def stacked(self, cells_y: int, cells_x: int) -> np.ndarray:
-        """All masks as bool [T, cells_y, cells_x]."""
+        """All masks as uint8 [T, cells_y, cells_x] pixel counts."""
         return np.stack(self.masks, axis=0).reshape(len(self.masks), cells_y, cells_x)
 
 
-def _red_rule_for(name: str) -> tuple[Rule, float]:
-    """The red transition rule and its reversal tolerance for a red_rule name."""
+def _red_rule_for(name: str) -> tuple[Rule, float, Measure]:
+    """The red transition rule, its reversal tolerance and its pixel measure for a red_rule name."""
     if name == "wcag22":
-        return red_rule_wcag22, RUN_REVERSAL_TOLERANCE["ratio"]
-    return red_rule_legacy, RUN_REVERSAL_TOLERANCE["rv"]
+        return red_rule_wcag22, RUN_REVERSAL_TOLERANCE["ratio"], measure_red_wcag22
+    return red_rule_legacy, RUN_REVERSAL_TOLERANCE["rv"], measure_red_legacy
 
 
 @dataclass(frozen=True)
@@ -133,7 +148,7 @@ class _Geometry:
 class _TypeResult:
     """Everything measured for one flash type (general or red) after the last frame."""
 
-    masks: np.ndarray            # bool [T, cells_y, cells_x]: cells completing a flash at t
+    masks: np.ndarray            # uint8 [T, cells_y, cells_x]: pixels of each cell completing a flash at t
     area: AreaResult
     violations: list[Violation]
     advisories: list[Advisory]
@@ -190,13 +205,14 @@ def _next_frame(source: Iterator[np.ndarray], expected: tuple[int, int, int] | N
 def _push_frame(
     t: int, frame: np.ndarray, red_rule: str, general: _FlashStream, red: _FlashStream, heatmap: np.ndarray
 ) -> None:
-    """Read one frame's cell signals and feed them to both flash streams (SPEC 5.2-5.5)."""
+    """Read one frame's cell signals and pixels and feed them to both flash streams (SPEC 5.2-5.5)."""
     signals = cell_signals(frame_to_cells(frame, CELL_PX))
-    general.push(t, signals.L, {}, heatmap)
+    pixels = pixel_blocks(frame, CELL_PX)
+    general.push(t, signals.L, {}, pixels, heatmap)
     if red_rule == "wcag22":
-        red.push(t, signals.ratio, {"u": signals.u, "v": signals.v}, heatmap)
+        red.push(t, signals.ratio, {"u": signals.u, "v": signals.v}, pixels, heatmap)
     else:
-        red.push(t, signals.rv, {"ratio": signals.ratio}, heatmap)
+        red.push(t, signals.rv, {"ratio": signals.ratio}, pixels, heatmap)
 
 
 def _stream(
@@ -213,9 +229,9 @@ def _stream(
     Out: the general and red streams (holding their per-frame masks), the
     flat uint16 heatmap and the number of frames seen.
     """
-    red_fn, red_tol = _red_rule_for(red_rule)
-    general = _FlashStream(n_cells, general_rule, RUN_REVERSAL_TOLERANCE["L"])
-    red = _FlashStream(n_cells, red_fn, red_tol)
+    red_fn, red_tol, red_measure = _red_rule_for(red_rule)
+    general = _FlashStream(n_cells, general_rule, RUN_REVERSAL_TOLERANCE["L"], measure_general)
+    red = _FlashStream(n_cells, red_fn, red_tol, red_measure)
     heatmap_flat = np.zeros(n_cells, dtype=np.uint16)
     expected_shape = (int(first.shape[0]), int(first.shape[1]), 3)  # every frame must match the first
     t = 0
@@ -228,7 +244,7 @@ def _stream(
         frame = _next_frame(source, expected_shape)
     if t < 2:
         raise ValueError(f"analyze() needs at least 2 frames; got {t}")
-    # Runs still open after the last frame are closed there (SPEC 5.4).
+    # Runs still open after the last frame are closed if their signal has arrived (SPEC 5.4).
     general.finish(t - 1, heatmap_flat)
     red.finish(t - 1, heatmap_flat)
     return general, red, heatmap_flat, t
@@ -288,7 +304,9 @@ def _score_type(flash_type: str, stream: _FlashStream, geo: _Geometry, fps: int)
     Out: its masks, area scoring, violations, advisories and maximum rate.
     """
     masks = stream.stacked(geo.cells_y, geo.cells_x)
-    area = qualifying_events(masks, geo.wy, geo.wx, full_window_cells=geo.full_window_cells)
+    area = qualifying_events(
+        masks, geo.wy, geo.wx, full_window_cells=geo.full_window_cells, pixels_per_cell=PIXELS_PER_CELL
+    )
     return _TypeResult(
         masks=masks,
         area=area,
@@ -301,8 +319,8 @@ def _score_type(flash_type: str, stream: _FlashStream, geo: _Geometry, fps: int)
 def _frame_stats(general: _TypeResult, red: _TypeResult, fps: int) -> FrameStats:
     """Per-frame statistics of both flash types (SPEC 5.8)."""
     return FrameStats(
-        general_cells=general.masks.sum(axis=(1, 2)).astype(np.int64),
-        red_cells=red.masks.sum(axis=(1, 2)).astype(np.int64),
+        general_cells=(general.masks > 0).sum(axis=(1, 2)).astype(np.int64),
+        red_cells=(red.masks > 0).sum(axis=(1, 2)).astype(np.int64),
         general_area_max=general.area.area_max,
         red_area_max=red.area.area_max,
         general_window_y=general.area.window_y,
@@ -319,14 +337,15 @@ def _frame_stats(general: _TypeResult, red: _TypeResult, fps: int) -> FrameStats
 def _violation_cells(violation: Violation, masks: np.ndarray) -> np.ndarray:
     """Cells that flashed in one violation's events: the union of E[t] over its event frames.
 
-    In: the violation and the bool masks [T, cells_y, cells_x] of its flash type.
-    Out: bool [cells_y, cells_x].  E[t] = M[t-1] | M[t] (SPEC 5.6 step 1, ADR-019), so each
-    event frame also brings in the completions of the frame before it.
+    In: the violation and the masks [T, cells_y, cells_x] of its flash type (pixel counts).
+    Out: bool [cells_y, cells_x], True where at least one pixel completed a flash.
+    E[t] = M[t-1] | M[t] (SPEC 5.6 step 1, ADR-019), so each event frame also brings in the
+    completions of the frame before it.
     """
     cells = np.zeros(masks.shape[1:], dtype=bool)
     for t in violation.frame_indices:
         first = max(0, t - EVENT_FRAME_TOLERANCE)  # frames before frame 0 count as empty
-        cells |= masks[first : t + 1].any(axis=0)
+        cells |= (masks[first : t + 1] > 0).any(axis=0)
     return cells
 
 

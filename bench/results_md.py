@@ -69,6 +69,12 @@ def confusion_lines(confusion: Mapping[str, Mapping[str, int]]) -> list[str]:
 
 
 # --------------------------------------------------------------------------------------- sections
+def results_json_link(results: Mapping[str, Any]) -> str:
+    """The per-page JSON as a Markdown link: the text is its repository path (docs/RESULTS.json), the
+    target its file name, because bench/run.py always writes it in the same folder as this page."""
+    return f"[`{results['resultsJson']}`]({Path(results['resultsJson']).name})"
+
+
 def run_section(results: Mapping[str, Any]) -> list[str]:
     machine = results["machine"]
     machine_text = (f"{machine['platform']}; Python {machine['python']}; Chromium {machine['chromium']}; "
@@ -80,7 +86,9 @@ def run_section(results: Mapping[str, Any]) -> list[str]:
         ["Machine", machine_text],
         # The JSON written next to this page by the same run, and its sha256, so a reader can check
         # that the per-page data they open is the data these figures came from.
-        ["Per-page results", f"`{results['resultsJson']}` (sha256 `{results['resultsJsonSha256']}`)"],
+        ["Per-page results", f"{results_json_link(results)} (sha256 `{results['resultsJsonSha256']}`)"],
+        # bench/run.py record_warnings: --out outside the repository, or uncommitted changes.
+        ["Record warnings", "; ".join(results.get("recordWarnings", [])) or "none"],
     ])
 
 
@@ -267,7 +275,7 @@ def render_results_md(results: Mapping[str, Any]) -> str:
     blocks = [
         [title(int(s["n"]), float(s["duration"])), "",
          "Written by `flashtrace bench` from one run; nothing on this page is typed by hand. Full per-page "
-         f"results: `{results['resultsJson']}`, written by the same run (its sha256 is in the Run table)."],
+         f"results: {results_json_link(results)}, written by the same run (its sha256 is in the Run table)."],
         run_section(results), settings_section(results), clear_section(results["scores"]),
         boundary_section(results["scores"]), mechanism_section(results["scores"]),
         types_section(results["scores"]), advisory_section(results["scores"]),

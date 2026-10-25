@@ -19,11 +19,21 @@ Jobs that were queued or running when the server stopped become "error" on the n
   put back and the job stays "done", with the reason in ``error`` (see ``mark_follow_up_failed``);
 * a job that ``flashtrace audit`` is running in the same work directory is not the server's to recover.
   The server leaves its meta.json alone and re-reads it while it is still running (``managed`` False).
+
+Deleting a job survives a server stop.  DELETE first leaves a ``deleted`` marker file in the folder.  A
+running job's folder is removed only after its task stops, so if the server stops first, the next start
+finds the marker and finishes the deletion (``remove_deleted_jobs``) instead of listing the job again.
+A folder is removed by renaming it to ``<id>.deleted`` first, a name that is not a job id, so it leaves
+the history in one step even if removing its files fails halfway.
+
+A status that cannot be written to meta.json (a full disk, a read-only folder, a damaged file) is kept
+in memory and logged; it never raises, so recording how a task ended cannot fail (server/runner.py).
 """
 
 from __future__ import annotations
 
 import dataclasses
+import logging
 import os
 import shutil
 import threading
@@ -83,6 +93,11 @@ FOLLOW_UP_BACKUP_DIR_NAME = "before-follow-up"
 REPORT_FILES: tuple[str, ...] = (REPORT_JSON_NAME, REPORT_HTML_NAME, ATTRIBUTION_NOTES_NAME)  # put back whole
 FOLLOW_UP_FILES: tuple[str, ...] = (*REPORT_FILES, META_JSON_NAME)  # meta.json: only its settings are put back
 
+DELETED_MARKER_NAME = "deleted"  # DELETE leaves this file in the job folder (see the module docstring)
+DELETED_SUFFIX = ".deleted"  # a folder being removed is renamed <id>.deleted first; that is not a job id
+
+log = logging.getLogger(__name__)
+
 
 @dataclass
 class Progress:
@@ -115,6 +130,10 @@ class JobRecord:
     cancel: threading.Event = field(default_factory=threading.Event, repr=False)
     delete_when_stopped: bool = False  # DELETE arrived while the runner was working on this job
     stopped_by_shutdown: bool = False  # the server is shutting down, not the user cancelling
+    # Seconds without a progress callback after which the runner's watchdog stopped the job's hung
+    # browser; None unless that happened (server/runner.py, Watchdog).
+    timed_out_after: float | None = None
+    last_callback: float = 0.0  # time.monotonic() of the task's latest progress callback (for the watchdog)
     # False for a job another process (``flashtrace audit``) created and the server never worked on:
     # the server does not write its status, and re-reads it from disk while it is still running.
     managed: bool = True
@@ -165,15 +184,20 @@ def job_summary(record: JobRecord, jobs_ahead: int | None = None) -> dict[str, A
 
 # --------------------------------------------------------------------------------------- disk
 def save_state(record: JobRecord) -> None:
-    """Write the record's status fields into its meta.json (a job deleted meanwhile is skipped).
+    """Write the record's status fields into its meta.json; never raises.
 
-    The STATUS_WRITER_KEY says the server set this status, so a restart knows the job is the server's.
+    A job deleted meanwhile is skipped.  Any other failure (a full disk, a read-only folder, a damaged
+    meta.json) is logged and the status stays in memory, which is the source of truth while the server
+    runs.  The STATUS_WRITER_KEY says the server set this status, so a restart knows the job is the server's.
     """
     try:
         update_meta(record.job_dir, status=record.status, phase=record.phase, verdict=record.verdict,
                     reason=record.reason, error=record.error, **{STATUS_WRITER_KEY: SERVER_SOURCE})
     except FileNotFoundError:
         pass
+    except (OSError, ValueError) as exc:  # ValueError: meta.json is not valid JSON
+        log.warning("job %s: could not write status %r to meta.json (%s); it is kept in memory",
+                    record.id, record.status, exc)
 
 
 def new_meta(record: JobRecord) -> dict[str, object]:
@@ -281,7 +305,11 @@ def set_follow_up_failed(record: JobRecord, message: str) -> None:
 
 
 def load_records(work_dir: Path) -> list[JobRecord]:
-    """Every readable job under ``<work_dir>/jobs``, with interrupted ones already marked "error"."""
+    """Every readable job under ``<work_dir>/jobs``, with interrupted ones already marked "error".
+
+    Deletions that a server stop cut off are finished first, so a deleted job never comes back.
+    """
+    remove_deleted_jobs(work_dir)
     records: list[JobRecord] = []
     for job_id in list_jobs(work_dir):
         record = record_from_disk(jobs_root(work_dir) / job_id)
@@ -319,9 +347,44 @@ def adopt_run(job_dir: Path, audit_dir: Path) -> None:
     shutil.rmtree(job_dir / RUN_DIR_NAME, ignore_errors=True)
 
 
+def mark_deleted(job_dir: Path) -> None:
+    """Leave the DELETED_MARKER_NAME file in the job folder, so its deletion survives a server stop."""
+    try:
+        (job_dir / DELETED_MARKER_NAME).touch()
+    except FileNotFoundError:  # the folder is already gone
+        pass
+    except OSError as exc:
+        log.warning("job %s: could not mark the folder as deleted (%s)", job_dir.name, exc)
+
+
 def delete_job_files(job_dir: Path) -> None:
-    """Remove a job directory and everything in it (a folder that is already gone is fine)."""
-    shutil.rmtree(job_dir, ignore_errors=True)
+    """Remove a job directory and everything in it (a folder that is already gone is fine).
+
+    The folder is renamed to ``<id>.deleted`` first: no listing shows it from then on, even if removing
+    its files fails halfway, and ``remove_deleted_jobs`` clears such a leftover at the next start.
+    """
+    trash = job_dir.with_name(job_dir.name + DELETED_SUFFIX)
+    try:
+        os.replace(job_dir, trash)
+    except FileNotFoundError:
+        return
+    except OSError:  # for example an older leftover with that name: remove the folder where it is
+        trash = job_dir
+    shutil.rmtree(trash, ignore_errors=True)
+
+
+def remove_deleted_jobs(work_dir: Path) -> None:
+    """Finish deletions a server stop cut off: folders with the marker, and ``<id>.deleted`` leftovers."""
+    root = jobs_root(work_dir)
+    if not root.is_dir():
+        return
+    for entry in sorted(root.iterdir()):
+        if not entry.is_dir():
+            continue
+        if entry.name.endswith(DELETED_SUFFIX):
+            shutil.rmtree(entry, ignore_errors=True)
+        elif (entry / DELETED_MARKER_NAME).exists():
+            delete_job_files(entry)
 
 
 # --------------------------------------------------------------------------------------- follow-up backup

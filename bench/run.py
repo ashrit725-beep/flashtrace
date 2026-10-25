@@ -11,7 +11,10 @@ Steps:
 4. Score (bench/score.py), then write the per-page JSON next to the Markdown summary (``--out`` with a
    .json suffix: docs/RESULTS.json for the official run), a convenience copy at
    <work_dir>/results.json, and the Markdown summary itself (bench/results_md.py; docs/RESULTS.md by
-   default), which names the JSON file and its sha256.
+   default), which names the JSON file by its repository path and gives its sha256.
+
+Before step 1 and again in the summary, record_warnings says when the output could not serve as the
+committed record: ``--out`` outside the repository, or uncommitted changes in the working tree.
 """
 
 from __future__ import annotations
@@ -192,7 +195,7 @@ def outcome_from_report(page_id: str, report: dict[str, Any], job_dir: Path,
         "culprits": [{"selector": c["selector"], "inMinimalSet": bool(c["inMinimalSet"])} for c in report["culprits"]],
         "auditWallS": measurements.get("audit_s", 0.0),
         "attributionRecaptures": attribution_recaptures(job_dir),
-        "jobDir": str(job_dir),
+        "jobDir": repo_path(Path(job_dir)),  # repository path, like every path in the committed JSON
     }
 
 
@@ -263,19 +266,69 @@ def row_for(entry: dict[str, Any], outcome: dict[str, Any] | None) -> dict[str, 
     return row
 
 
-# --------------------------------------------------------------------------------------- machine
-def commit_hash() -> str:
+# --------------------------------------------------------------------------------------- record
+def git(*args: str) -> str:
+    """Output of one git command run in the repository (OSError / SubprocessError when it fails)."""
+    return subprocess.run(["git", *args], cwd=REPO_ROOT, capture_output=True, text=True, check=True,
+                          timeout=30).stdout
+
+
+def inside_repository(path: Path) -> bool:
+    return path.resolve().is_relative_to(REPO_ROOT)
+
+
+def repo_path(path: Path) -> str:
+    """How a summary names a file: relative to the repository root when it is inside the repository
+    (docs/RESULTS.json), so the committed page never carries one machine's folders; absolute otherwise."""
+    resolved = path.resolve()
+    return resolved.relative_to(REPO_ROOT).as_posix() if inside_repository(path) else str(resolved)
+
+
+def uncommitted_paths(ignore: Sequence[Path] = ()) -> list[str] | None:
+    """Paths with uncommitted changes ('git status --porcelain'), minus ``ignore``; None without git.
+
+    ``ignore`` holds this run's own output files: a summary left over from an earlier run does not
+    change any measurement, so it must not mark the code that ran as changed.
+    """
+    try:
+        status = git("status", "--porcelain")
+    except (OSError, subprocess.SubprocessError):
+        return None
+    skipped = {repo_path(p) for p in ignore if inside_repository(p)}
+    changed = [line[3:].strip('"') for line in status.splitlines() if line.strip()]
+    return [p for p in changed if p not in skipped]
+
+
+def commit_hash(ignore: Sequence[Path] = ()) -> str:
     """Short commit of the repository, with '-dirty' when the working tree has uncommitted changes."""
     try:
-        head = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=REPO_ROOT, capture_output=True,
-                              text=True, check=True, timeout=30).stdout.strip()
-        status = subprocess.run(["git", "status", "--porcelain"], cwd=REPO_ROOT, capture_output=True,
-                                text=True, check=True, timeout=30).stdout.strip()
+        head = git("rev-parse", "--short", "HEAD").strip()
     except (OSError, subprocess.SubprocessError):
         return "unknown (git not available)"
-    return head + ("-dirty" if status else "")
+    changed = uncommitted_paths(ignore)
+    return head + ("-dirty" if changed is None or changed else "")
 
 
+def record_warnings(out: Path) -> list[str]:
+    """Why this run's summary cannot serve as the committed benchmark record (empty when it can).
+
+    The record is docs/RESULTS.md with docs/RESULTS.json next to it, committed together and made from
+    a commit with no uncommitted changes, so anyone can check out that commit and re-run the command.
+    """
+    warnings = []
+    if not inside_repository(out):
+        warnings.append(f"--out {out} is outside the repository, so this summary and its per-page JSON "
+                        "cannot be committed as the record")
+    changed = uncommitted_paths(ignore=(out, results_json_path(out)))
+    if changed is None:
+        warnings.append("git cannot list uncommitted changes, so the commit named in the summary is unchecked")
+    elif changed:
+        warnings.append(f"the working tree has {len(changed)} uncommitted change(s) (first: {changed[0]}), so "
+                        "these figures cannot be reproduced from the commit alone")
+    return warnings
+
+
+# --------------------------------------------------------------------------------------- machine
 def chromium_version() -> str:
     """Version string of the Chromium that Playwright launches."""
     try:
@@ -331,6 +384,9 @@ def run_bench(
     problems = config.problems() + AuditSettings(duration_s=config.duration_s, fps=fps, attribute=attribute).problems()
     if problems:
         raise AuditInputError("; ".join(problems))
+    for warning in record_warnings(config.out):
+        # Printed even with --quiet, before an hour of capturing: the run can still be stopped here.
+        print(f"bench: warning: {warning}", file=sys.stderr, flush=True)
     find_attributor(attribute)  # fail once, up front, instead of once per page
     if config.ablate_sample:
         find_attributor("ablate")
@@ -401,8 +457,8 @@ def ablation_sample(config: BenchConfig, audited: list[dict[str, Any]], first: l
 def results_json_path(out: Path) -> Path:
     """Where the per-page JSON goes: next to the Markdown, same name, .json suffix.
 
-    docs/RESULTS.md -> docs/RESULTS.json, so the committed summary cites a file that is committed with
-    it and that only a run writing that same summary replaces.
+    docs/RESULTS.md -> docs/RESULTS.json, so the committed summary cites (by its repository path, see
+    repo_path) a file that is committed with it and that only a run writing that same summary replaces.
     """
     target = out.with_suffix(".json")
     # An --out that already ends in .json would make the JSON overwrite the Markdown; keep them apart.
@@ -413,9 +469,11 @@ def build_results(config: BenchConfig, settings: AuditSettings, rows: list[dict[
                   determinism: dict[str, Any], processes: int,
                   sample: dict[str, Any] | None = None) -> dict[str, Any]:
     audited = [r for r in rows if r["verdict"] != "SKIP"]
+    outputs = (config.out, results_json_path(config.out))
     return {
         "date": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
-        "commit": commit_hash(),
+        "commit": commit_hash(ignore=outputs),
+        "recordWarnings": record_warnings(config.out),
         "commandLine": config.command_line,
         "machine": machine_info(),
         "settings": {
@@ -432,8 +490,8 @@ def build_results(config: BenchConfig, settings: AuditSettings, rows: list[dict[
         "determinism": determinism,
         "rows": rows,
         "ablationSample": sample,
-        "resultsJson": str(results_json_path(config.out)),
-        "resultsMd": str(config.out),
+        "resultsJson": repo_path(results_json_path(config.out)),
+        "resultsMd": repo_path(config.out),
     }
 
 
@@ -467,6 +525,7 @@ def summary_lines(results: dict[str, Any]) -> list[str]:
         f"({det['notCompared']} of {det['total']} sampled pages not compared)",
         *attribution_summary_lines(scores),
         f"results: {results['resultsMd']} and {results['resultsJson']} (sha256 {results['resultsJsonSha256']})",
+        *(f"warning: {warning}" for warning in results.get("recordWarnings", [])),
     ]
 
 

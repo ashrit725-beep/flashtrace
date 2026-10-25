@@ -251,7 +251,10 @@ def test_results_markdown_has_every_section() -> None:
     assert "**Accuracy: 3/4 (75.0%)**" in text
     assert "Not measured (attribution: none)" in text
     assert "abc1234-dirty" in text and "`flashtrace bench --n 8`" in text
-    assert f"| Per-page results | `docs/RESULTS.json` (sha256 `{'0' * 64}`) |" in text
+    # The JSON is named by its repository path and linked by file name (it sits next to this page).
+    assert f"| Per-page results | [`docs/RESULTS.json`](RESULTS.json) (sha256 `{'0' * 64}`) |" in text
+    assert "Full per-page results: [`docs/RESULTS.json`](RESULTS.json), written by the same run" in text
+    assert "| Record warnings | none |" in text
     assert text.rstrip().endswith("Analysis aid, not a compliance certification.")
 
 
@@ -346,6 +349,52 @@ def test_results_json_sits_next_to_the_markdown(tmp_path: Path) -> None:
     assert run.results_json_path(Path("out/r.json")) == Path("out/r.rows.json")
 
 
+def test_summary_names_files_by_repository_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # A committed RESULTS.md must not carry one machine's folders (the M3 record cited a scratch folder).
+    assert run.repo_path(REPO_ROOT / "docs" / "RESULTS.json") == "docs/RESULTS.json"
+    assert run.repo_path(tmp_path / "RESULTS.json") == str((tmp_path / "RESULTS.json").resolve())
+    monkeypatch.setattr(run, "machine_info", lambda: {})  # no Chromium launch in a non-browser test
+    config = bench_config(tmp_path, REPO_ROOT / "docs" / "RESULTS.md", "flashtrace bench")
+    results = run.build_results(config, AuditSettings(), [], compare_runs([], []), 1)
+    assert (results["resultsMd"], results["resultsJson"]) == ("docs/RESULTS.md", "docs/RESULTS.json")
+
+
+def test_per_page_rows_name_the_job_folder_by_repository_path() -> None:
+    report = {"verdict": "PASS", "reason": "r", "violations": [], "advisory": [], "culprits": [],
+              "capture": {"strategy": "waapi_step", "deterministic": True, "hash": "h", "frameHashes": ["a", "b"]}}
+    job_dir = REPO_ROOT / ".flashtrace" / "bench" / "run1" / "jobs" / "job-1"
+    row = run.outcome_from_report("p1", report, job_dir, {})
+    assert row["jobDir"] == ".flashtrace/bench/run1/jobs/job-1"
+
+
+def test_record_warnings_name_out_outside_repo_and_uncommitted_changes(monkeypatch: pytest.MonkeyPatch,
+                                                                         tmp_path: Path) -> None:
+    official = REPO_ROOT / "docs" / "RESULTS.md"
+    monkeypatch.setattr(run, "uncommitted_paths", lambda ignore=(): [])
+    assert run.record_warnings(official) == []
+    outside = run.record_warnings(tmp_path / "RESULTS.md")
+    assert len(outside) == 1 and "outside the repository" in outside[0]
+    monkeypatch.setattr(run, "uncommitted_paths", lambda ignore=(): ["engine/analyze.py", "bench/run.py"])
+    dirty = run.record_warnings(official)
+    assert len(dirty) == 1 and "2 uncommitted change(s) (first: engine/analyze.py)" in dirty[0]
+    monkeypatch.setattr(run, "uncommitted_paths", lambda ignore=(): None)
+    assert "git cannot list uncommitted changes" in run.record_warnings(official)[0]
+    lines = run.summary_lines(dict(fake_results(), recordWarnings=dirty))
+    assert lines[-1] == f"warning: {dirty[0]}"
+
+
+def test_uncommitted_paths_leave_out_this_runs_own_outputs(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A summary left over from an earlier run changes no measurement; an edited engine file does.
+    status = " M docs/RESULTS.md\n?? docs/RESULTS.json\n M engine/analyze.py\n"
+    monkeypatch.setattr(run, "git", lambda *args: "abc1234\n" if args[0] == "rev-parse" else status)
+    outputs = (REPO_ROOT / "docs" / "RESULTS.md", REPO_ROOT / "docs" / "RESULTS.json")
+    assert run.uncommitted_paths(ignore=outputs) == ["engine/analyze.py"]
+    assert run.commit_hash(ignore=outputs) == "abc1234-dirty"
+    status = " M docs/RESULTS.md\n?? docs/RESULTS.json\n"
+    assert run.uncommitted_paths(ignore=outputs) == [] and run.commit_hash(ignore=outputs) == "abc1234"
+    assert run.commit_hash() == "abc1234-dirty"
+
+
 def test_a_later_run_does_not_replace_the_json_an_earlier_summary_cites(tmp_path: Path) -> None:
     official_md = tmp_path / "docs" / "RESULTS.md"
     official = bench_config(tmp_path, official_md, "flashtrace bench")
@@ -362,7 +411,7 @@ def test_a_later_run_does_not_replace_the_json_an_earlier_summary_cites(tmp_path
     assert json.loads(cited.read_text(encoding="utf-8"))["commandLine"] == "flashtrace bench"
     assert hashlib.sha256(cited.read_bytes()).hexdigest() == digest
     text = official_md.read_text(encoding="utf-8")
-    assert f"`{cited}` (sha256 `{digest}`)" in text and "results.json" not in text
+    assert f"[`{cited}`](RESULTS.json) (sha256 `{digest}`)" in text and "results.json" not in text
     # The work-directory copy is only a convenience and now holds the later run.
     work_copy = json.loads((tmp_path / "work" / "results.json").read_text(encoding="utf-8"))
     assert work_copy["commandLine"] == "flashtrace bench --n 3"
@@ -446,7 +495,10 @@ def test_partial_bench_end_to_end(tmp_path: Path) -> None:
     # The per-page JSON sits next to the Markdown, which names it and its sha256.
     json_path = tmp_path / "RESULTS.json"
     assert hashlib.sha256(json_path.read_bytes()).hexdigest() == results["resultsJsonSha256"]
-    assert f"`{json_path}` (sha256 `{results['resultsJsonSha256']}`)" in text
+    assert f"[`{json_path.resolve()}`](RESULTS.json) (sha256 `{results['resultsJsonSha256']}`)" in text
+    # tmp_path is outside the repository: the summary says it cannot be the committed record.
+    assert any("outside the repository" in warning for warning in results["recordWarnings"])
+    assert "| Record warnings | --out " in text
     assert results["settings"]["poolProcesses"] == 2
     saved = json.loads(json_path.read_text(encoding="utf-8"))
     assert saved == json.loads((tmp_path / "work" / "results.json").read_text(encoding="utf-8"))

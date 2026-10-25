@@ -215,15 +215,16 @@ more than … 25%" means exactly 25% passes).
 | T1 | *relative luminance* Note 1: `L = 0.2126*R + 0.7152*G + 0.0722*B`, with each channel linearised by `if C ≤ 0.04045 then C/12.92 else ((C+0.055)/1.055)^2.4`, `C = C8bit/255` | `LUMINANCE_COEFFICIENTS = (0.2126, 0.7152, 0.0722)`, `SRGB_LINEAR_CUTOFF = 0.04045`, `SRGB_LINEAR_DIVISOR = 12.92`, `SRGB_GAMMA_OFFSET = 0.055`, `SRGB_GAMMA_SCALE = 1.055`, `SRGB_GAMMA = 2.4` | Exactly as written. The constant is 0.04045 (WCAG Note 2 records that 0.03928 was used before May 2021). |
 | T2 | general flash: "a pair of opposing changes in relative luminance of 10% or more of the maximum relative luminance (1.0) where the relative luminance of the darker image is below 0.80" | `GENERAL_MIN_DELTA_L = 0.10` (inclusive), `GENERAL_DARK_STATE_MAX_L = 0.80` (exclusive) | A **general transition** is a monotone run of a cell's L whose magnitude `|L_end − L_start| ≥ 0.10` and whose darker end has `min(L_start, L_end) < 0.80`. A **general flash** is two consecutive opposing general transitions (§5.5). |
 | T3 | red flash, Note 3 (WCAG 2.2): "a pair of opposing transitions where, one transition is either to or from a state with a value R/(R + G + B) that is greater than or equal to 0.8, and the difference between states is more than 0.2 (unitless) in the CIE 1976 UCS chromaticity diagram" | `RED_SATURATION_MIN_RATIO = 0.8` (inclusive), `RED_MIN_DELTA_UV = 0.2` (exclusive) | A **red transition** is a monotone run of a cell's redness ratio `R/(R+G+B)` (§5.3) whose two end states satisfy: at least one end has ratio ≥ 0.8 **and** the Euclidean distance between the ends in CIE 1976 (u′, v′) is > 0.2. A **red flash** is two consecutive opposing red transitions. **Correction to the build brief:** the brief's working value ("(R−G−B)×320 … change > 20") is the pre-2022 working definition that appeared in WCAG 2.0/2.1; both current Recommendations (WCAG 2.2 of 12 Dec 2024 and WCAG 2.1 as republished 06 May 2025) print the CIE 1976 UCS definition above. FlashTrace therefore uses the UCS rule for verdicts. The legacy rule is kept only as an explicitly labelled comparison mode (`red_rule="wcag21-legacy"`, ADR-001) because reference tools such as PEAT and IRIS still implement it. |
-| T4 | area: "25% of any 10 degree visual field"; Note 1: "a 341 x 256 pixel rectangle anywhere on the displayed screen area when the content is viewed at 1024 x 768 pixels"; [UNDERSTANDING]: "341 x 256 CSS pixels, or a flashing area of 87,296 CSS pixels" | `REFERENCE_VIEWPORT = (1024, 768)`, `WINDOW_PX = (341, 256)`, `MAX_AREA_FRACTION = 0.25` (exclusive: > 0.25 qualifies) | A flash **event** is *qualifying* when the cells completing it cover **more than 25%** of at least one 341×256 px window placed anywhere in the viewport (§5.6). For viewports whose width is not 1024 the window is scaled by the width ratio and this is recorded as an assumption in the report (ADR-007). |
+| T4 | area: "25% of any 10 degree visual field"; Note 1: "a 341 x 256 pixel rectangle anywhere on the displayed screen area when the content is viewed at 1024 x 768 pixels"; [UNDERSTANDING]: "341 x 256 CSS pixels, or a flashing area of 87,296 CSS pixels" | `REFERENCE_VIEWPORT = (1024, 768)`, `WINDOW_PX = (341, 256)`, `MAX_AREA_FRACTION = 0.25` (exclusive: > 0.25 qualifies) | A flash **event** is *qualifying* when the pixels completing it cover **more than 25%** of at least one 341×256 px window placed anywhere in the viewport (§5.6, ADR-044). For viewports whose width is not 1024 the window is scaled by the width ratio and this is recorded as an assumption in the report (ADR-007). |
 | T5 | SC text: "flashes more than three times in any one second period"; glossary: "no more than three general flashes and / or no more than three red flashes within any one-second period" | `MAX_FLASHES_PER_SECOND = 3` (exclusive), `RATE_WINDOW_SECONDS = 1.0` | **FAIL** when the number of qualifying general flashes **or** the number of qualifying red flashes whose completing frame falls inside any window of `fps` consecutive frames is **greater than 3** (§5.7). The two types are counted separately and never summed. |
-| T6 | Exception: "a fine, balanced, pattern such as white noise or an alternating checkerboard pattern with 'squares' smaller than 0.1 degree" | — | **Not implemented.** Listed in every report's `limitations[]`. (Averaging into 4×4 px cells already attenuates sub-cell patterns, which makes FlashTrace lenient, not strict, for such content.) |
+| T6 | Exception: "a fine, balanced, pattern such as white noise or an alternating checkerboard pattern with 'squares' smaller than 0.1 degree" | — | **Not implemented.** Listed in every report's `limitations[]`. (A balanced pattern inside a 4×4 px cell, half its pixels brightening while the other half darken, leaves the cell's mean signal still, so no run starts there (§5.4) and nothing is counted: FlashTrace is lenient, not strict, for such content; ADR-044.) |
 | T7 | *not WCAG* — advisory modelled on IRIS "extended failure" (2–3 flashes/s sustained over 5 s) | `ADVISORY_MIN_FLASHES_PER_SECOND = 2`, `ADVISORY_MIN_DURATION_SECONDS = 5.0` (exclusive) | Emit an **advisory** (never a FAIL) when, for one type, the trailing-one-second qualifying-flash count is ≥ 2 at every frame of a span longer than 5 s (§5.9). Reports label it "advisory, not a WCAG 2.3.1 criterion". |
 
 Derived numbers (for readers; the code derives them from the constants above, never hard-codes them):
 window area 341×256 = 87 296 CSS px; 25% = 21 824 px. In 4×4 px cells the window is 85×64 = 5 440 cells
 (341/4 = 85.25 rounded to 85, 256/4 = 64) and the qualifying threshold is > 1 360 cells (ADR-006 records the
-0.3% under-estimate caused by rounding).
+0.3% under-estimate caused by rounding). Areas are counted in pixels (§5.6, ADR-044): the scored window is
+85 × 64 × 16 = 87 040 px and an event needs more than 21 760 flashing pixels inside it.
 
 ---
 
@@ -248,6 +249,11 @@ The frame is divided into 4×4 px cells (`CELL_PX = 4`). Pixels beyond the last 
 not a multiple of 4) are dropped (ADR-002). Each pixel is linearised per channel (T1) and the cell colour is
 the **mean linear RGB** of its 16 pixels (averaging in linear light; ADR-002). 1024×768 ⇒ 256×192 cells.
 
+The cell colour's signals (§5.3) decide **when** a cell's runs start and end (§5.4). Each frame also hands over
+every cell's 16 pixels unchanged (`engine/cells.py` `pixel_blocks`), because **whether** a run is a transition is
+decided pixel by pixel (§5.4, ADR-044): the mean alone would count a whole cell of which a black/white edge
+covers 2 pixels, and miss a low-contrast element that covers half a cell.
+
 ### 5.3 Per-cell signals (per frame)
 
 * `L[t, y, x]` — relative luminance of the cell's mean linear RGB (T1).
@@ -259,9 +265,13 @@ the **mean linear RGB** of its 16 pixels (averaging in linear light; ADR-002). 1
   sRGB/D65 matrix (rows: X = 0.4124 R + 0.3576 G + 0.1805 B; Y = 0.2126 R + 0.7152 G + 0.0722 B;
   Z = 0.0193 R + 0.1192 G + 0.9505 B; the Y row is identical to T1), then
   `u′ = 4X/(X+15Y+3Z)`, `v′ = 9Y/(X+15Y+3Z)`. When `X+15Y+3Z = 0` (pure black) the chromaticity is
-  undefined; FlashTrace uses the chromaticity of white computed with the same matrix (≈ `(0.1978, 0.4683)`, the
-  D65 white point) so that black counts as achromatic (ADR-011).
+  undefined. When it is pure black, **or when R8, G8 and B8 are all below 16** (near-black, ADR-020), FlashTrace
+  uses the chromaticity of white computed with the same matrix (≈ `(0.1978, 0.4683)`, the D65 white point), so
+  that black and every colour that looks black count as achromatic (ADR-011, ADR-043).
 * Legacy mode only: `RV[t, y, x] = max(0, (R−G−B)) × 320` on 0–1 sRGB-encoded components.
+
+The same signals are computed for single pixels, from each pixel's own whole 0–255 values (`measure_general`,
+`measure_red_wcag22`, `measure_red_legacy`); the per-pixel rule of §5.4 uses them.
 
 ### 5.4 Transitions (per cell, per signal)
 
@@ -269,47 +279,80 @@ Following Note 2 ("the change … between adjacent peaks and valleys in a plot �
 signal `s[t]` is split into **monotone runs**: a run starts at an extremum and ends at the next extremum.
 Plateaus do not end a run, and neither does a reversal smaller than the signal's *reversal tolerance*
 (0.005 for L and for the redness ratio, 1.0 for the legacy red value; one twentieth of the threshold, so such a
-wobble could never be a transition itself) (ADR-018). The run's end frame is the **first frame at which the
-extremum value is reached** (for a square wave: the first frame showing the new state). A run that is still open
-at the last frame is evaluated there and stamped at its extremum frame in the same way (ADR-004, ADR-018). A run from state A (frame `a`) to state B
-(frame `b`) is a **transition timestamped at frame `b`** when:
+wobble could never be a transition itself) (ADR-018). The run's end frame (its *stamp*) is the frame at which the
+signal **arrived** at its extremum: while the signal keeps moving, every new extremum moves the stamp, so a smooth
+fade is stamped at the bottom of its valley; once the signal has stood still or wobbled back by no more than the
+tolerance (it has *settled*), a further gain moves the stamp only when it goes more than the tolerance beyond the
+stamped value, and the signal then counts as moving again (ADR-018, ADR-038). For a square wave the stamp is the
+first frame showing the new state; sub-tolerance noise on a flat colour cannot move it. The threshold rule below is
+always evaluated on the true extremum.
+
+**End of the capture (ADR-042).** A run still open at the last frame is evaluated only if its signal has settled
+(stood still or turned back by no more than the tolerance since its stamp); it is then stamped at its stamp frame as
+usual. A run still moving at the last frame has not reached its extremum inside the capture and gives no transition.
+
+**Pixel by pixel (ADR-044).** The run boundaries above come from the cell's signal. When a run ends, the rule below
+is applied to **each of the cell's 16 pixels**: state A is the pixel's colour where the run started (the previous
+extremum) and state B its colour at the run's extremum. The cell makes a **transition timestamped at frame `b`** (the
+run's stamp) when at least one of its pixels passes, and the transition records which pixels did. A cell whose 16
+pixels are one colour at both ends is evaluated once. A balanced pattern inside a cell (half its pixels rising while
+the other half fall) leaves the cell's signal still, so no run starts and nothing is evaluated (T6). The rule, for
+one pixel going from state A to state B:
 
 * general: signal is `L`; `|L_B − L_A| ≥ 0.10` and `min(L_A, L_B) < 0.80` (T2);
 * red (wcag22): signal is `ratio`; `max(ratio_A, ratio_B) ≥ 0.8` and `‖uv_B − uv_A‖₂ > 0.2` (T3);
 * red (wcag21-legacy): signal is `RV`; `max(ratio_A, ratio_B) ≥ 0.8` and `|RV_B − RV_A| > 20`.
 
-Runs that do not meet the rule produce no transition but still reset the run start (the next run starts at
+Runs in which no pixel meets the rule produce no transition but still reset the run start (the next run starts at
 their end extremum). Transition sign is the run direction.
 
 ### 5.5 Flashes (per cell, per type)
 
-A cell's transitions are paired **non-overlapping, in order** (1st+2nd, 3rd+4th, …), and only opposing
-transitions pair. Two same-direction transitions in a row are possible when a run below the threshold sits
+Transitions are paired **per pixel, non-overlapping, in order** (1st+2nd, 3rd+4th, …), and only opposing
+transitions pair: each pixel a transition reached (§5.4) pairs it with that pixel's pending transition (ADR-044).
+Two same-direction transitions in a row are possible when a run below the threshold sits
 between them (e.g. rise, small dip, rise); the newer one then replaces the pending one (ADR-018). Each pair is one **flash, timestamped at the frame of
-its second (completing) transition** (ADR-005). A 4 Hz square wave therefore yields 8 transitions and 4
+its second (completing) transition** (ADR-005). A cell *completes a flash* at frame `t` when at least one of its
+pixels does; §5.6 counts how many. A 4 Hz square wave therefore yields 8 transitions and 4
 flashes per second, which is the counting convention of PEAT/IRIS ("more than 6 transitions in 1 s" ⇔ "more
 than 3 flashes").
 
 ### 5.6 Area: qualifying flash events
 
-For each type separately, `M[t]` is the boolean cell mask "completes a flash at frame t".
+For each type separately, `M[t]` holds, per cell, the number of its pixels (0–16) that complete a flash at frame `t`
+(ADR-044).
 
-1. **1-frame tolerance:** `E[t] = M[t−1] ∪ M[t]` (cells whose completions are within one frame of each other
-   belong to the same event; `M[−1] = ∅`). Looking backwards keeps the event on the frame where the flash
-   completes (ADR-019).
-2. **Window scoring:** with a 2-D integral image of `E[t]`, the count of flashing cells inside every
+1. **1-frame tolerance:** `E[t] = min(16, M[t−1] + M[t])` (pixels whose completions are within one frame of each
+   other belong to the same event; `M[−1] = 0`). The capped sum is the union: a pixel cannot complete two flashes
+   one frame apart (a flash needs two of its transitions, on different frames), so the pixels counted at `t−1` and
+   at `t` are different pixels. Looking backwards keeps the event on the frame where the flash completes (ADR-019).
+2. **Window scoring:** with a 2-D integral image of `E[t]`, the number of flashing pixels inside every
    `(wy × wx)`-cell window position is computed; `area_max[t]` is the maximum fraction
-   `count / window_cells` and `window_argmax[t]` its top-left cell (ties → smallest y, then smallest x), where
-   `window_cells` is the size of the **full** window (85 × 64 = 5 440 cells at 1024 px wide) even when a short
-   viewport forces the scanned window to be clipped to the grid: 25% is an absolute area, 21 824 px (ADR-019).
-   This is O(cells) per frame and makes the result independent of where the region sits (translation
-   invariance).
+   `count / window_pixels` and `window_argmax[t]` its top-left cell (ties → smallest y, then smallest x), where
+   `window_pixels` is the size of the **full** window (85 × 64 = 5 440 cells = 87 040 px at 1024 px wide) even when a
+   short viewport forces the scanned window to be clipped to the grid: 25% is an absolute area (ADR-019). An event
+   therefore needs more than 21 760 flashing pixels in one window position. This is O(cells) per frame. Because
+   pixels are counted, the result does not depend on where a region sits (translation invariance, ADR-044): it is
+   exact when the cells a region touches fit inside one window position. Windows slide in whole cells (4 px steps),
+   so a region that spans more cells than the window (wider or taller than about 340 × 256 px) can lose up to 3 px
+   along such an edge, in the lenient direction (§10).
 3. **Qualifying:** `Q_raw[t] = area_max[t] > 0.25` (T4).
-4. **Counting events:** one event spans at most two frames (its completing frame and the next one, the
-   1-frame tolerance). So a maximal run of `n` consecutive `Q_raw` frames starting at frame `s` contains
-   `ceil(n/2)` events, counted at frames `s, s+2, s+4, …`. A single flash gives a run of 2 frames and is
-   counted once, at its completing frame; a 30 Hz strobe at 60 fps keeps `Q_raw` true on every frame and is
-   counted 30 times per second. (ADR-019, which replaces the leading-edge rule of ADR-006.)
+4. **Counting events (claim rule, ADR-038):** going forward through the frames, an event counted at frame `t`
+   *claims* frames `t` and `t+1` (the 1-frame tolerance): their completions belong to it. A frame `t` with
+   `Q_raw[t]` that is not claimed yet is scored again using only the completions of frames `t−1` and `t` that no
+   earlier event has claimed; when that best-window share is still **> 0.25**, an event is counted at `t`
+   (`Q[t]`). Consequences, each pinned by `engine/tests/test_area.py` or the acceptance tests:
+   * the same cells completing a flash on `n` consecutive frames give `ceil(n/2)` events, at `s, s+2, s+4, …`;
+     a single flash is counted once, at its completing frame; a 30 Hz strobe at 60 fps is counted 30 times
+     per second;
+   * one flash whose cells complete on two neighbouring frames (a smooth fade over dim and bright cells) keeps
+     `Q_raw` true on three frames but is counted **once** (item 15);
+   * two separate regions that each exceed 25% on their own and complete **one** frame apart are counted as
+     **one** event; **two or more** frames apart they are two events. The count is therefore not monotone in
+     the delay between such regions; ADR-038 records this trade-off.
+
+   (ADR-019 replaced the leading-edge rule of ADR-006; ADR-038 replaced ADR-019's `ceil(n/2)`-per-run count with
+   the claim rule.)
 
 The window in cells is `wx = round(341·s/4)`, `wy = round(256·s/4)` with `s = W_css/1024` (ADR-007), rounding
 halves up; the scanned window is clamped to the cell grid, the area denominator is not (step 2).
@@ -330,11 +373,14 @@ event frames inside it).
 
 ### 5.8 Outputs
 
-* `FrameStats[t]`: `generalCells`, `redCells` (cells completing a flash), `generalAreaMax`, `redAreaMax`,
-  `generalWindow`, `redWindow` (cell coordinates), `generalQualifying`, `redQualifying` (after leading edge),
+* `FrameStats[t]`: `generalCells`, `redCells` (cells with at least one pixel completing a flash at t),
+  `generalAreaMax`, `redAreaMax` (the best window's share of the full window, measured in pixels, §5.6 step 2),
+  `generalWindow`, `redWindow` (cell coordinates), `generalQualifying`, `redQualifying` (true at the frames where
+  a qualifying event is counted, §5.6 step 4),
   `generalTrailing1s`, `redTrailing1s` (count in the window ending at t).
 * `Violation[]` (§5.7). `advisory[]` (§5.9).
-* `heatmap`: `uint16[cells_y, cells_x]`, per-cell count of completed flashes of either type.
+* `heatmap`: `uint16[cells_y, cells_x]`, per-cell count of completed flashes of either type (a transition that
+  completes a flash in any of the cell's pixels adds one).
 * `timeline[k]`: for each second `k` (`t ∈ [k·fps, (k+1)·fps)`), the number of qualifying general and red
   events. There are `ceil(T/fps)` bins; a trailing partial second gets its own bin with its raw count, so the
   bins always add up to the event totals (ADR-021).
@@ -358,7 +404,8 @@ reported (they describe different things).
    general violation.
 7. A region split across two window positions that only exceeds 25% when one window contains both parts
    ⇒ FAIL (and each half alone ⇒ PASS).
-8. Translation invariance: the same region at two offsets gives identical verdict, counts and area.
+8. Translation invariance: the same region at two offsets gives identical verdict, counts and area (offsets off
+   the 4 px grid: item 19).
 9. Determinism: the same input analysed twice yields identical outputs (array equality and identical JSON).
 10. Red ↔ dark red (same chromaticity, ΔL ≥ 0.10) ⇒ general flash only, no red flash (wcag22); the
     legacy mode counts it as red (documents the difference between the two rules).
@@ -369,6 +416,22 @@ reported (they describe different things).
 13. Near-black red noise, rgb(0,0,0) ↔ rgb(1,0,0) at 4 Hz full screen ⇒ PASS, no red flash (ADR-020).
 14. On a 1024×100 viewport a 4 Hz flash of 600 cells (11% of the full 5 440-cell window) ⇒ PASS; the area
     fraction is measured against the full window, not the clipped one (ADR-019).
+15. A smooth 3 Hz pulse whose left half peaks at byte 120 and right half at byte 255 completes each flash on two
+    neighbouring frames and keeps more than 25% of a window on three frames in a row ⇒ PASS, `maxRatePerSec == 3`
+    (each flash is one event under the claim rule, ADR-038).
+16. A 4 Hz grey 60 ↔ 200 square wave over 1 680 cells (30.9% of a window) with +0/+1 byte of noise per cell per
+    frame ⇒ FAIL with `maxRatePerSec == 4` and the same `area_max` as the clean wave (sub-tolerance noise cannot
+    move a settled stamp, §5.4, ADR-038).
+17. A smooth black ↔ white page pulse at 3 Hz (cosine or quadratic ease-in-out) and at 2.9 Hz, 600 frames sampled
+    at `(i + 1/4)/60` and ending part-way through a fall ⇒ PASS, `maxRatePerSec == 3`, at the phases tested (a run
+    still moving at the last frame is dropped, §5.4, ADR-042). Counterpart: a 4 Hz square wave whose last black
+    state is held for a few frames keeps its last flash (80 frames ⇒ events at 15, 30, 45, 60, 75).
+18. A (150,0,0) ↔ black cosine pulse at 4 Hz ⇒ FAIL via the red rule, red `maxRatePerSec == 4`, no general
+    violation, exactly like the square wave between the same colours; (150,0,0) square-waved against (1,0,0),
+    (2,2,2) or (15,0,0) ⇒ the same verdict and rates as against (0,0,0) (near-black is achromatic, §5.3, ADR-043).
+19. 4 Hz rectangles moved 1–3 px off the 4 px grid (offsets (0,0), (1,0), (2,2) and (3,1) from (100,100)) keep
+    their verdict: 172×120 px and 340×64 px black ↔ white ⇒ PASS; 88×256 px grey 118 ↔ 150 (ΔL 0.124) ⇒ FAIL. A
+    172×120 px rectangle measures exactly 20 640 px (over the 87 040 px window) at every offset (§5.6, ADR-044).
 
 ---
 
@@ -386,30 +449,82 @@ independent of the PNG encoder). `hash = sha256(concatenation of all frameHashes
 
 * **A `waapi_step` (default).** Playwright Chromium, device scale factor 1, viewport as requested. Install
   `page.clock` at virtual time 0 (controls `Date`, timers, `requestAnimationFrame`, `performance.now`). Pause
-  every animation from `document.getAnimations()` (including same-origin frames) and, per frame, set each
-  animation's `currentTime = t_i − startOffset`, seek `<video>` elements to `t_i` and wait for `seeked`, then
-  `clock.run_for(1000/fps)` so JS animations advance, run the page's `requestAnimationFrame` callbacks once
-  at that clock time (as a browser does once per drawn frame; ADR-029), then screenshot (`animations="allow"`). Animations
-  discovered after frame 0 are treated as starting at the frame in which they first appear. Animations inside
-  shadow roots (open or closed, recorded by an init script that wraps `attachShadow`) are driven the same way;
-  SVG SMIL timelines are paused and set with `setCurrentTime`; an animation the page resumes later is
-  re-adopted; `Math.random` is replaced by a fixed-seed generator (ADR-022).
-  **Double-shot check:** at frame 0 and at the last frame the screenshot is taken twice at the same virtual
-  time, 100 ms of real time apart; if the two hashes differ, something animates outside the controlled clocks
-  ⇒ `deterministic=false`. A `<video>` seek or an animation-ready wait that times out also sets
+  every animation from `document.getAnimations()` (including same-origin frames). Per frame `i`, in this order:
+  (1) advance `page.clock` with one `clock.run_for(round(t_i) − round(t_{i−1}))`, whole milliseconds (frame 0 runs
+  `round(t_0)`, a quarter-frame, ADR-029), so timers and JS animations advance;
+  (2) run the page's queued `requestAnimationFrame` callbacks once at that clock time, as a browser does once per
+  drawn frame (ADR-029); (3) seek each animation to `currentTime = phase + playbackRate × (t_i − startOffset)`,
+  honouring the phase and rate the page gave it (ADR-022, ADR-029), and seek each `<video>` like an animation
+  (below), waiting for `seeked`; (4) screenshot (`animations="allow"`). Steps 2 and 3 are one pass in the page. The
+  clock moves first so that an animation a timer or callback creates in that step is seeked before the picture,
+  not one frame later. Animations discovered after frame 0 are treated as starting at the frame in which they
+  first appear. Animations inside shadow roots (open or closed, recorded by an init script that wraps
+  `attachShadow`) are driven the same way; SVG SMIL timelines are paused and set with `setCurrentTime`; an
+  animation the page resumes later is re-adopted; `Math.random` is replaced by a fixed-seed generator (ADR-022).
+  **`<video>` (ADR-045):** each video is muted, paused and seeked per frame to media time
+  `phase + playbackRate × (t_i − start)`, wrapped when it loops and held at its end otherwise. `start` is the
+  frame in which the page started it (`autoplay` or `play()`) and `phase` the media time the page gave it. The
+  page's `pause()`, `play()`, `currentTime` and `playbackRate` changes are honoured from the frame in which they
+  happen; a video the page never started keeps its picture.
+  **Checks during the frame loop (ADR-046):** at frame 0, at the first frame of every captured second (every
+  `fps`-th frame) and at the last frame, the page clock must read the virtual time, and the screenshot is taken
+  twice at the same virtual time, 100 ms of real time apart (**double-shot check**); if the two hashes differ,
+  something animates outside the controlled clocks. At **every** frame strategy A also looks again for
+  uncontrollable content (the list below): image elements, WebGL and offscreen canvases, cross-origin frames,
+  workers, and every image URL the page requested since the previous frame; at those checkpoint frames it also
+  walks every CSS property that paints an image. A failed check, or uncontrollable content that appears after
+  frame 0, makes auto fall through to the next strategy (the A loop stops at its first failure, since its frames
+  would be discarded); a forced A capture becomes `deterministic=false` and lists the content in
+  `meta.uncontrollable`. A `<video>` seek or an animation-ready wait that times out also sets
   `deterministic=false` with a note.
 * **B `virtual_time`.** CDP `Emulation.setVirtualTimePolicy` with a `1000/fps` ms budget per frame, plus
-  `HeadlessExperimental.beginFrame` where the launched Chromium supports it. Same double-shot check. The page is
+  `HeadlessExperimental.beginFrame` where the launched Chromium supports it. Double-shot check at frame 0 and at
+  the last frame. The page is
   loaded under 250 ms budgets and pre-rolled to a fixed 2 000 ms before frame 0 (pausing virtual time before
   navigation never loads a page). Without BeginFrameControl, rendering follows the real clock; a once-per-build
-  self-test detects this and auto mode then skips B (ADR-023).
+  self-test detects this and auto mode then skips B (ADR-023). That self-test measures only a CSS animation, so a
+  budget-only B (no BeginFrameControl) also steps aside, as A does, for uncontrollable content that the scan before
+  frame 0 finds; forced, it captures and reports `deterministic=false` with the content in `meta.uncontrollable`
+  (ADR-046). Unlike A, B does not look again during its frame loop, and its page-clock and double-shot checks run
+  only at frame 0 and at the last frame, so content that appears after frame 0 is caught under B only if the
+  last frame's double-shot sees it move.
 * **C `realtime`.** CDP `Page.startScreencast` with timestamps, resampled to `fps` by holding the latest
-  frame at or before `t_i`. `deterministic=false`; the report and UI show a warning banner; PASS is
-  downgraded to INCONCLUSIVE (§6.4).
+  frame at or before each sample time. Chromium's compositor draws on a 60 Hz clock, so the screencast timestamps
+  sit on one 1/60 s lattice; the sample grid starts half a compositor tick away from that lattice (the circular
+  mean of the timestamps' phases), or a quarter of a sample after the first frame when the timestamps agree on no
+  phase (ADR-048). A compositor frame drawn late or dropped can still move a transition by one frame, so a
+  realtime rate can be one flash per second off (§10). `deterministic=false`; the report and UI show a warning
+  banner; PASS is downgraded to INCONCLUSIVE (§6.4).
 
-Fall-through A → B → C happens when the page contains *uncontrollable* content: animated GIF/WebP/APNG
-(detected by file header, not extension), WebGL canvases, cross-origin iframes, or when the double-shot check
-fails. The reason is recorded in `meta.fallbackReason`.
+**Page loading (every strategy, ADR-047).** Every navigation may take at most 30 s. Strategies A and C wait for
+`DOMContentLoaded`, then give the `load` event at most 10 s of real time (a subresource that never answers no
+longer holds the capture; a note says that `load` never fired); B loads under its budgets (above). A and C then
+wait at most 10 s of real time for web fonts before frame 0 (B, whose page is paused, reads their status). A font
+still loading after that is noted, and because Playwright's `page.screenshot` waits for `document.fonts.ready`
+before every picture, strategy A then gives up its attempt (auto falls through; a forced A returns no frames, with
+the reason). A main document that answers with HTTP status 400 or above raises `PageLoadError` (exported by
+`capture`): a capture error (§6.4 rule 1), never retried under another strategy. Each image read over the network
+for detection may take 5 s of real time; an image that does not answer counts as `image-unverified`, and image
+classifications are reused by the later strategies of the same capture.
+
+Fall-through A → B → C happens when the page contains *uncontrollable* content (ADR-046), recognised from bytes,
+never from a file extension:
+
+* animated images: GIF, APNG, animated WebP, and SVG images (`.svg` or gzipped `.svgz`) that contain SMIL
+  animation elements or CSS `@keyframes`, wherever the page shows an image (`<img>`, SVG `<image>`,
+  `<input type=image>`, `<object>`, `<embed>`, `<video poster>` and every CSS property that paints an image);
+* images that could not be checked: unreadable bytes (`image-unverified`), a GIF whose frames or an SVG whose
+  markup go on past the first 4 MB (`gif-unverified`, `svg-unverified`), and image URLs beyond the first 200 per
+  page, scan and later checks together (`images-unverified`);
+* WebGL canvases and canvases handed to an `OffscreenCanvas`;
+* cross-origin iframes;
+* Web Workers and SharedWorkers (recorded by an init script that wraps their constructors), whose timers run on
+  the real clock.
+
+An `<object>` or `<embed>` that shows a same-origin document is not an image: strategy A drives that document's
+animations like the page's own. Fall-through also happens when a check of the frame loop fails (above), when a
+strategy cannot load the page under its time source, or when it raises. The reason is recorded in
+`meta.fallbackReason`.
 
 ### 6.3 Determinism test (M2)
 
@@ -418,31 +533,64 @@ Three synthetic pages (CSS keyframes, WAAPI, rAF+JS) captured twice under A and 
 
 ### 6.4 Verdict escalation (CLI/server layer)
 
-* Capture error or fewer than `2·fps` frames ⇒ **INCONCLUSIVE**, reason given.
-* Engine FAIL ⇒ **FAIL** regardless of strategy (what was observed did flash).
-* Engine PASS with `deterministic=false` ⇒ **INCONCLUSIVE** ("page passed under non-deterministic capture;
-  frames may have been missed").
-* Engine PASS with `deterministic=true` ⇒ **PASS**.
+The rules are applied in this order and the first one that matches decides (`cli/report.py` `decide_verdict`,
+ADR-008, ADR-039):
 
-Exit codes: 0 PASS, 1 FAIL, 2 error; INCONCLUSIVE exits 1 unless `--no-fail`.
+1. Capture error, or fewer than 2 frames (the engine cannot run) ⇒ **INCONCLUSIVE**, reason given. A capture
+   error includes `PageLoadError`, a page that answered with HTTP status 400 or above (§6.2, ADR-047); a forced
+   strategy that gave up before frame 0 returns no frames.
+2. Engine FAIL ⇒ **FAIL** regardless of strategy **and of capture length** (what was observed did flash; a
+   capture shorter than `2·fps` frames that already shows more than three qualifying flashes in one second
+   is a FAIL).
+3. Fewer than `2·fps` frames ⇒ **INCONCLUSIVE** (too short for a PASS to mean anything), reason given.
+4. Engine PASS with `deterministic=false` ⇒ **INCONCLUSIVE** ("page passed under non-deterministic capture;
+   frames may have been missed").
+5. Engine PASS with `deterministic=true` ⇒ **PASS**.
+
+Exit codes: 0 PASS, 1 FAIL, 2 error; INCONCLUSIVE exits 1 unless `--no-fail`. Exit 2 is for errors that stop
+FlashTrace before a report exists (invalid input, a failure of the tool itself); a capture that fails after the
+inputs were accepted, `PageLoadError` included, is an INCONCLUSIVE report that says why. Every invocation's
+human-readable output ends with the disclaimer, error exits included (ADR-050).
 
 ---
 
 ## 7. Attribution and fixes (summary; details in code comments and ADRs)
 
 * Candidates per failing window: animation targets from `getAnimations()` (effect target, name, duration,
-  keyframes), `elementsFromPoint` on a 5×5 grid inside the window, and `<video>/<canvas>/<img>` with animated
-  formats. Each candidate gets a stable `data-ft-id`, a unique CSS selector, bounding rect and animation
-  details. Cross-origin iframes are reported as an "unattributable region".
-* Stage 1 (bbox): rank by overlap between candidate rect and the failing cells of the event.
-* Stage 2 (ablation): for the top k ≤ 6, re-capture with the candidate suppressed
-  (`[data-ft-id="X"]{animation-play-state:paused!important;transition:none!important}`; media:
-  `visibility:hidden!important`). Score = reduction in qualifying flashes. Greedy minimal culprit set.
-* Fixes (≤ 3 per culprit, CSS override strings derived from measured values): rate
-  (`animation-duration` for ≤ 2.5 flashes/s), luminance (ΔL < 0.10 by lowering the brighter state's
-  lightness, or opacity), red (desaturate below 0.8), area (scale factor reported, never auto-applied).
-  Verify = inject as `<style>`, re-capture with the same strategy, re-run the engine; "verified" only when the
-  re-run passes under deterministic capture.
+  keyframes), `elementsFromPoint` on a 5×5 grid inside the window, and `<video>`, `<canvas>` and `<img>` whose
+  bytes are an animated image (`capture/detect.py`, §6.2). Each candidate gets a stable `data-ft-id`, a unique CSS
+  selector, bounding rect and animation details. Cross-origin iframes are reported as an "unattributable region".
+* Stage 1 (bbox): rank by overlap between the candidate's box and the failing cells of the violation (the cells in
+  which at least one pixel completed a flash in the violation's events, ADR-044), as the intersection over union
+  of 4 px cell masks; ties go to the smaller box, then to an element that can flash by itself, then to document
+  order (ADR-026).
+* Stage 2 (ablation): for the top k ≤ 6, a fresh capture of the page with the candidate suppressed **inside the
+  capturer**, by its unique selector (the `data-ft-id` tags of the inspection page do not exist in a fresh load):
+  the suppressed element's own animations and CSS transitions are held at their frame-0 state, a media element
+  (video, canvas, img, svg, iframe) is hidden whole, and an element without an animation of its own (page script
+  changes it) has its own paint hidden. Its children are **not** suppressed: they are candidates of their own,
+  so a wrapper does not get the credit for what it contains. No ablation CSS is injected or recorded in the
+  report (ADR-013, ADR-027, ADR-040). Score (`ablationDelta`) = qualifying general + red events of the baseline
+  minus those of the re-capture. Greedy by score, then pruned to a minimal culprit set (ADR-027).
+* Which culprits get fixes: every member of ablation's minimal set; otherwise (bbox ranking, or ablation that
+  found no set) the culprits whose overlap is ≥ 0.5, keeping those that move by themselves when there are any,
+  else only the top-ranked one, at most 3 culprits (ADR-031).
+* Fixes (≤ 3 per culprit, in the order rate, luminance, red, area; CSS override strings derived from measured
+  values, ADR-030):
+  * rate: `animation-duration` so the element flashes at most 2.5 times per second (CSS animations and Web
+    Animations with a finite duration; no rate fix for transitions, script, canvas or video);
+  * luminance (general violations only), target difference ≤ 0.09: the brighter keyframe colours lowered in
+    linear light, keeping the hue; else, for keyframes that switch only opacity between two values, the two
+    opacity values moved toward their middle; else a `contrast()` filter (not for an element that is
+    see-through in one of its states);
+  * red (red violations only): saturated keyframe reds mixed in linear light with the grey of equal luminance
+    down to R/(R+G+B) = 0.75; else a `saturate()` filter that takes the measured red state just below 0.8;
+  * area: a `transform: scale()` factor reported, never auto-applied.
+
+  Verify = inject the fix as `<style>` (together with one fix per other member when the culprit belongs to a
+  minimal set of two or more, because with any member still flashing the page fails), re-capture with the job's
+  settings and the same strategy (forced), re-run the engine; "verified" only when the re-run passes under
+  deterministic capture (ADR-032).
 
 ---
 
@@ -471,10 +619,15 @@ written. Field list in the build brief; additions: `settings.redRule`, `settings
 * Headless sRGB rendering is not a physical display; brightness, gamma and viewing distance differ per user.
 * Canvas/WebGL attribution is element-level only (what is drawn inside cannot be attributed).
 * Cross-origin iframes are unattributable and cannot be clock-controlled.
-* Animated GIF/WebP/APNG force non-deterministic capture (strategy C) and a PASS becomes INCONCLUSIVE.
+* Animated GIF/WebP/APNG, animated SVG images and Web Workers force non-deterministic capture (strategy C) and a
+  PASS becomes INCONCLUSIVE.
+* Under realtime capture (strategy C) a measured rate can be one flash per second higher or lower than the page's,
+  because a compositor frame drawn late or dropped moves a transition by one frame.
 * The fine-pattern exception (T6) and spatial-pattern hazards are not evaluated.
 * Only the captured viewport and duration are analysed; content revealed by scrolling or interaction is
   analysed only if an interaction script drives it.
 * Window size for viewports other than 1024 px wide is scaled by the width ratio (an assumption).
+* The 341×256 px window is scored in whole 4×4 px cells and slides in 4 px steps, so a flashing area wider or
+  taller than the window can be under-measured by up to 3 px along such an edge.
 * No numbers in this repository are estimates: accuracy, agreement and runtime figures exist only in
   `docs/RESULTS.md`, produced by `flashtrace bench`, with date and commit hash.

@@ -14,10 +14,12 @@ Security rules (build brief and docs/API.md):
   must be whole numbers inside the capture (so no request can name a file outside a job directory);
 * only URLs the user submitted are fetched; local files only inside the project directory unless
   ``--allow-local-files``; no credentials are stored (URLs with a password are refused);
-* every capture gets a fresh browser context (guaranteed by capture.capture).
+* every capture gets a fresh browser context (guaranteed by capture.capture);
+* every response forbids being shown in a frame of another page (clickjacking) and MIME sniffing.
 
 Every error is ``{"detail": "<one sentence>"}`` with 400 (bad state), 404 (unknown job), 409 (job busy)
-or 422 (invalid input); the security checks add 400 (bad Host header) and 403 (foreign Origin).
+or 422 (invalid input); the security checks add 400 (Host header not 127.0.0.1 or localhost) and 403
+(POST or DELETE from another origin).
 """
 
 from __future__ import annotations
@@ -25,6 +27,7 @@ from __future__ import annotations
 import html
 import importlib.metadata
 import json
+import mimetypes
 import os
 import sys
 from contextlib import asynccontextmanager
@@ -41,19 +44,18 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.datastructures import Headers
 from starlette.middleware.cors import CORSMiddleware
-from starlette.middleware.trustedhost import TrustedHostMiddleware
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from cli.jobs import FRAMES_DIR_NAME, REPORT_HTML_NAME, REPORT_JSON_NAME, AuditSettings, default_base
 from cli.report import DISCLAIMER
 from engine import ENGINE_VERSION
-from server.jobs import JobRecord, JobStore, delete_job_files
+from server.jobs import JobRecord, JobStore, delete_job_files, mark_deleted
 from server.runner import Runner, Task
 from server.validation import (
-    ALLOWED_HOST_NAMES,
     DEV_UI_ORIGINS,
     LOOPBACK_HOST,
     TargetError,
+    host_allowed,
     is_job_id,
     origin_allowed,
     validate_target,
@@ -69,6 +71,19 @@ STARTUP_FAILURE_EXIT_CODE = 3  # what uvicorn.run exits with when the server cou
 MIN_DURATION_S, MAX_DURATION_S, DEFAULT_DURATION_S = 1, 60, 10.0
 MIN_SIDE_PX, MAX_SIDE_PX = 200, 3840
 DEFAULT_VIEWPORT = (1024, 768)
+
+# Sent with every response.  A page on another site could otherwise show the UI in a frame and trick
+# the user into clicking "Verify this fix" or "Re-run attribution with ablation" (clickjacking): the
+# framed UI's requests carry this server's own Origin, so the Origin check cannot tell.
+SECURITY_HEADERS: tuple[tuple[bytes, bytes], ...] = (
+    (b"content-security-policy", b"frame-ancestors 'none'"),
+    (b"x-frame-options", b"DENY"),
+    (b"x-content-type-options", b"nosniff"),
+)
+
+# With nosniff a browser refuses a script or stylesheet served under another type, and on Windows a
+# registry entry can make Python's mimetypes answer text/plain for ".js"; the UI build needs these.
+UI_MEDIA_TYPES: dict[str, str] = {".js": "text/javascript", ".mjs": "text/javascript", ".css": "text/css"}
 
 
 def package_version() -> str:
@@ -259,10 +274,15 @@ def verify_fix(job_id: str, request: Request, n: int = PathParam(ge=0)) -> dict[
 
 @router.delete("/jobs/{job_id}", status_code=204)
 def delete_job(job_id: str, request: Request) -> Response:
-    """Cancel the job if it is queued or running, then delete its directory."""
+    """Cancel the job if it is queued or running, then delete its directory.
+
+    The folder is marked deleted first, so a running job's folder, which the runner removes only once
+    the task has stopped, is removed at the next start if the server stops before that (server/jobs.py).
+    """
     state = server_state(request)
     record = find_record(request, job_id)
     state.store.remove(record.id)
+    mark_deleted(record.job_dir)
     if record.active:
         state.store.mark_cancelled(record)  # kept on disk only if deleting the folder fails
     if not state.runner.cancel(record):
@@ -313,18 +333,56 @@ class SameOriginMiddleware:
         await self.app(scope, receive, send)
 
 
+class AllowedHostMiddleware:
+    """Refuse requests whose Host header is not 127.0.0.1 or localhost: 400 with the usual JSON ``detail``.
+
+    A DNS-rebinding page reaches 127.0.0.1 under its own domain name; the Host header gives it away.
+    (Starlette's TrustedHostMiddleware makes the same check but answers in plain text.)
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http" and not host_allowed(Headers(scope=scope).get("host")):
+            response = JSONResponse(status_code=400, content={"detail": "The Host header must be 127.0.0.1 or localhost."})
+            await response(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
+class SecurityHeadersMiddleware:
+    """Add SECURITY_HEADERS to every HTTP response, errors included."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_headers(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                message = {**message, "headers": [*message.get("headers", []), *SECURITY_HEADERS]}
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
+
+
 def dev_cors_enabled() -> bool:
     return os.environ.get(DEV_CORS_VARIABLE) == "1"
 
 
 def add_security_middleware(app: FastAPI) -> None:
-    """Origin check (innermost), Host check, then CORS for the dev UI only (outermost)."""
+    """Origin check (innermost), Host check, CORS for the dev UI only, then the headers (outermost)."""
     dev_origins = DEV_UI_ORIGINS if dev_cors_enabled() else ()
     app.add_middleware(SameOriginMiddleware, extra_origins=dev_origins)
-    app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(ALLOWED_HOST_NAMES))
+    app.add_middleware(AllowedHostMiddleware)
     if dev_origins:
         app.add_middleware(CORSMiddleware, allow_origins=list(dev_origins), allow_methods=["GET", "POST", "DELETE"],
                            allow_headers=["Accept", "Content-Type"])
+    app.add_middleware(SecurityHeadersMiddleware)  # outermost, so the refusals above carry the headers too
 
 
 # --------------------------------------------------------------------------------------- web UI
@@ -357,6 +415,8 @@ def mount_ui(app: FastAPI, static_dir: Path) -> None:
     Without a build, the UI routes answer with a short page that says how to build it.
     """
     if (static_dir / "index.html").is_file():
+        for suffix, media_type in UI_MEDIA_TYPES.items():
+            mimetypes.add_type(media_type, suffix)  # StaticFiles looks the type up per file
         app.mount("/", StaticFiles(directory=static_dir, html=True), name="ui")
         return
     for route in UI_ROUTES:

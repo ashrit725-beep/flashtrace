@@ -10,6 +10,6 @@
 | `#live-badge` | 96x32 px, red rgb(255,0,0) <-> rgb(40,40,40), 4 Hz | **Passes** the area rule: 3 072 px is about 3.5% of a 341x256 window (threshold is more than 25%, i.e. more than 21 824 px). Fast but small. |
 | `#next-up` | opacity 1 -> 0.6 -> 1 over 2 s | **Passes** on rate: 0.5 flashes/s, well under three per second. |
 
-Serve: `flashtrace demo` (once the CLI lands), or `.venv/bin/python demo/serve.py --port 8765`, then `flashtrace audit http://127.0.0.1:8765/site/`.
+Serve: `flashtrace demo` (or `.venv/bin/python demo/serve.py --port 8765`), then, in a second terminal, `flashtrace audit http://127.0.0.1:8765/site/`.
 
 Analysis aid, not a compliance certification.

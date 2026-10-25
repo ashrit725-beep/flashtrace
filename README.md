@@ -9,8 +9,11 @@ and re-runs the audit to check that the fix works.
 > tested conditions* (this viewport, this duration, this browser). It does not certify a page.
 
 Built for the Congressional App Challenge by one student. Everything runs on your own computer: no accounts, no
-paid services, no AI inside the product, and the same page with the same settings always gives the same frames and
-the same report.
+paid services, no AI inside the product. Captures are designed to be deterministic: when FlashTrace controls the
+page's clock, the same page with the same settings is meant to give the same frames and the same report, and the
+benchmark measures whether it does (the Determinism line of [docs/RESULTS.md](docs/RESULTS.md)). Pages whose
+animation cannot be controlled are recorded in real time, marked non-deterministic, and a PASS on them is reported
+as INCONCLUSIVE.
 
 ## Why it matters
 
@@ -153,14 +156,22 @@ All accuracy, determinism and speed figures are in [docs/RESULTS.md](docs/RESULT
 
 ```yaml
 - uses: actions/checkout@v4
-- uses: ./action
+- name: Start the site to audit
+  run: |
+    npm ci && npm run build
+    npm start &
+    timeout 60 bash -c 'until curl -sf http://localhost:3000/ > /dev/null; do sleep 1; done'
+- uses: <owner>/flashtrace/action@main
   with:
     url: http://localhost:3000/
     duration: 10
 ```
 
-The job fails on FAIL (and on INCONCLUSIVE unless `fail-on-inconclusive: false`) and uploads the JSON and HTML
-reports. See [action/README.md](action/README.md).
+The page must be running before the audit step; the example starts a Node site on port 3000 in the same job (use
+whatever starts yours, or pass a path to an HTML file in the checkout instead of a URL). `<owner>` is the GitHub
+account that hosts your copy of FlashTrace; inside a checkout of FlashTrace itself, `uses: ./action` works too. The
+job fails on FAIL (and on INCONCLUSIVE unless `fail-on-inconclusive: false`) and uploads the JSON and HTML reports.
+See [action/README.md](action/README.md).
 
 ## Limitations
 

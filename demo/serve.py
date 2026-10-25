@@ -71,6 +71,7 @@ def serve(port: int = 8765, host: str = "127.0.0.1", open_browser: bool = False)
         print(f"  Flashing page: {site_url}")
         print(f"  Audit it with: flashtrace audit {site_url}")
         print(f"  {WARNING_LINE}")
+        print("  Analysis aid, not a compliance certification.")
         print("  Press Ctrl-C to stop.", flush=True)
 
         if open_browser:

@@ -16,9 +16,28 @@ interface Props {
   instant?: boolean;
 }
 
-/** The still to draw on: the first violation's first flash frame, else frame 0. */
+/**
+ * The worst violation: highest rate first, then the earliest, then general before red. This is the same
+ * choice the engine's reason sentence and the HTML export (cli/html_report.py worst_violation) make, so all
+ * three point at the same window.
+ */
+export function worstViolation(report: Report): { violation: Report["violations"][number]; number: number } | null {
+  let best: { violation: Report["violations"][number]; number: number } | null = null;
+  report.violations.forEach((v, i) => {
+    if (!best) { best = { violation: v, number: i + 1 }; return; }
+    const b = best.violation;
+    const better =
+      v.maxRatePerSec !== b.maxRatePerSec ? v.maxRatePerSec > b.maxRatePerSec
+      : v.start !== b.start ? v.start < b.start
+      : v.type === "general" && b.type !== "general";
+    if (better) best = { violation: v, number: i + 1 };
+  });
+  return best;
+}
+
+/** The still to draw on: the worst violation's first flash frame, else frame 0. */
 export function worstFrameIndex(report: Report): number {
-  const v = report.violations[0];
+  const v = worstViolation(report)?.violation;
   if (!v) return 0;
   return v.frameIndices.length ? v.frameIndices[0] : v.start;
 }
@@ -184,10 +203,11 @@ export default function HeatmapView({ jobId, report, selected, instant = false }
   // one large-area gate. The canvas stays mounted and fades (160 ms), and the
   // stage's data-overlay attribute lets tests count the changes.
   const safe = useLargeAreaGate();
-  const { heatmap, settings, violations } = report;
+  const { heatmap, settings } = report;
   const frame = settings.viewport;
   const stillIndex = worstFrameIndex(report);
-  const worst = violations[0]?.window ?? null;
+  const worstEntry = worstViolation(report);
+  const worst = worstEntry?.violation.window ?? null;
   // Label the box with its own size (it can differ from settings.windowPx by
   // the 4 px cell rounding), so the label matches the box and the Violations list.
   const worstSize = worst ? `${worst.w} × ${worst.h}` : "";
@@ -265,7 +285,7 @@ export default function HeatmapView({ jobId, report, selected, instant = false }
           Still frame {stillIndex} (t = {frameTime(stillIndex, settings.fps)} s)
           {max > 0 ? ", with the flash heatmap as an overlay you can turn off" : ""}.{" "}
           {worst
-            ? `The dashed box marks the worst ${worstSize} px window of violation 1, at x ${worst.x}, y ${worst.y}.`
+            ? `The dashed box marks the worst ${worstSize} px window of violation ${worstEntry?.number ?? 1}, at x ${worst.x}, y ${worst.y}.`
             : "No violation window to mark."}
           {report.culprits.length > 0 ? " Select a culprit below to outline it with a solid box." : ""}
           <span className="visually-hidden" aria-live="polite">

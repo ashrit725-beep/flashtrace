@@ -55,11 +55,16 @@ SPEC_LIMITATIONS: tuple[str, ...] = (
     "Headless sRGB rendering is not a physical display; brightness, gamma and viewing distance differ per user.",
     "Canvas/WebGL attribution is element-level only (what is drawn inside cannot be attributed).",
     "Cross-origin iframes are unattributable and cannot be clock-controlled.",
-    "Animated GIF/WebP/APNG force non-deterministic capture (strategy C) and a PASS becomes INCONCLUSIVE.",
+    "Animated GIF/WebP/APNG, animated SVG images and Web Workers force non-deterministic capture (strategy C) "
+    "and a PASS becomes INCONCLUSIVE.",
+    "Under realtime capture (strategy C) a measured rate can be one flash per second higher or lower than the "
+    "page's, because a compositor frame drawn late or dropped moves a transition by one frame.",
     "The fine-pattern exception (T6) and spatial-pattern hazards are not evaluated.",
     "Only the captured viewport and duration are analysed; content revealed by scrolling or interaction is "
     "analysed only if an interaction script drives it.",
     "Window size for viewports other than 1024 px wide is scaled by the width ratio (an assumption).",
+    "The 341×256 px window is scored in whole 4×4 px cells and slides in 4 px steps, so a flashing area wider or "
+    "taller than the window can be under-measured by up to 3 px along such an edge.",
     "No numbers in this repository are estimates: accuracy, agreement and runtime figures exist only in "
     "`docs/RESULTS.md`, produced by `flashtrace bench`, with date and commit hash.",
 )

@@ -17,15 +17,17 @@ that single question.
 
 ```
 frame (bytes)  ->  linear light  ->  4x4 px cell averages  ->  per-cell signals (L, redness, u'v')
-   -> peaks & valleys per cell  ->  transitions (big enough changes)  ->  flashes (opposing pairs)
-   -> per-frame "which cells flashed" masks  ->  biggest 341x256 window share  ->  qualifying events
+   -> peaks & valleys per cell  ->  transitions (big enough changes, judged pixel by pixel)
+   -> flashes (opposing pairs, per pixel)  ->  per-frame "how many pixels of each cell flashed" masks
+   -> biggest 341x256 window share  ->  qualifying events
    -> sliding one-second counts  ->  verdict, violations, advisories, timeline, heatmap
 ```
 
 Frames are processed one at a time (streaming): a frame is dropped as soon as its cell signals have been read,
 so the frames of a 10-second capture never sit in memory together. What the engine does keep is, for the
-whole capture, one true/false per cell per frame for each flash type ("did this cell complete a flash at this
-frame?", needed by the area step after the last frame), plus a few numbers per cell for the run trackers.
+whole capture, one small count per cell per frame for each flash type ("how many of this cell's pixels
+completed a flash at this frame?", needed by the area step after the last frame), plus a few numbers per cell
+and the cell's pixels at the two ends of its current run for the run trackers.
 Every number is a 64-bit float or integer and every step runs in a fixed order, so the same frames always
 produce byte-identical output.
 
@@ -73,10 +75,16 @@ For the red rule the module also computes, per colour:
 * the **CIE 1976 (u', v') chromaticity**, "which hue, ignoring brightness", via the XYZ matrix printed in
   the Understanding document. Pure black would divide 0 by 0, so it is given the white point, which the code
   computes from the same matrix (about (0.1978, 0.4683)), so black and white get exactly the same numbers:
-  black counts as colourless, like white and grey (ADR-011). Example: sRGB red has (u', v') = (0.4508,
+  black counts as colourless, like white and grey (ADR-011). Every **near-black** colour, one whose three
+  whole values are all below 16 such as (6, 0, 0) or (15, 15, 15), gets the white point too: it looks black,
+  and the same floor already says its red shows no hue (ADR-043). Without this, a red fading
+  smoothly to black would keep red chromaticity on its near-black frames, where its ratio is already 0, and
+  the fade would measure as no colour change at all, while the same two colours as a square wave fail.
+  Example: sRGB red has (u', v') = (0.4508,
   0.5229); its distance to the white point is 0.259, which is more than the 0.2 that WCAG requires, so
   red <-> black, red <-> white and red <-> grey all count as a colour change. (204, 51, 0) is 0.214 from the
-  white point, so it too makes a red transition against black, white or grey;
+  white point, so it too makes a red transition against black, white or grey. One consequence of a hard
+  floor: (16, 0, 0) <-> (15, 0, 0) is a red transition, exactly as (16, 0, 0) <-> black already was;
 * the **legacy red value** (comparison mode only): max(0, R8 - G8 - B8) / 255 x 320, on the same whole
   values.
 
@@ -91,7 +99,14 @@ linearising (ADR-002) because luminance is linear in light: a cell's L is then e
 pixels' L. Pixels beyond the last whole cell (at most 3 per edge) are dropped.
 
 From each cell's mean colour the module reads the five per-cell signals: `L`, `ratio`, `u`, `v` and the
-legacy red value `rv` (used only in the comparison mode). It also sizes the WCAG window: 341x256 CSS px at a
+legacy red value `rv` (used only in the comparison mode). These cell signals decide *when* a cell's runs
+start and end (next section). Whether a run is a transition is then asked pixel by pixel, so the module also
+hands over each cell's 16 pixels as they are (`pixel_blocks`) and computes the same signals for single
+pixels (`measure_general`, `measure_red_wcag22`, `measure_red_legacy`). Averaging alone would get the area
+wrong for anything that does not line up with the 4 px grid: a black/white element covering only 2 of a
+cell's 16 pixels still changes the cell mean by 0.125 and would count the whole cell, while a low-contrast
+element (L change 0.124) covering half a cell changes the mean by only 0.062 and would count none of it
+(ADR-044). It also sizes the WCAG window: 341x256 CSS px at a
 1024 px wide viewport is 85 x 64 cells (341 / 4 = 85.25 rounds to 85); other widths scale proportionally
 (ADR-007), and halves round up (64.5 becomes 65). Two sizes come out of this: `window_cells_full` is the
 whole window (85 x 64 = 5 440 cells at 1024 px wide), and `window_cells` is that window clamped to the grid,
@@ -117,6 +132,18 @@ frame the run will be stamped with (plus whether the signal has settled there). 
 * a flat stretch, or a wobble no larger than the tolerance, changes nothing. A wobble that small could never
   be a transition itself; ignoring it stops anti-aliasing noise from cutting a slow fade into pieces.
 
+The tracker also keeps each cell's 16 pixels as they were at the start of the run and at its extremum. When
+the run ends, the rule is applied to **each pixel's** two end colours, and the cell makes a transition if at
+least one pixel does; the transition records which pixels those are (ADR-044). Most cells are one
+flat colour at both ends, so the rule is asked once for them. A balanced fine pattern (half the pixels go
+up while the other half go down) leaves the cell mean still, starts no run and is not counted, as before.
+
+After the last frame, a run that is still open is closed only if its signal has **arrived** (stood still or
+wobbled back since its stamp). A run still moving at the last frame, such as a fade cut off part-way or a
+step shown by the last frame alone, has not reached its extremum inside the capture, so it is dropped: its
+real end is after the capture. Stamping it at the last frame would put the flash up to a few frames before it
+happens, and a smooth 3 Hz pulse could then count 4 in the last second (ADR-042).
+
 Rules (each comparison in the code sits beside the W3C sentence it implements):
 
 * **general:** |L_end - L_start| >= 0.10 **and** the darker of the two < 0.80;
@@ -129,10 +156,11 @@ showing the new state, not the last frame of a plateau (ADR-018). While the sign
 follows each new extremum, so a smooth fade is stamped at the bottom of its valley. Once the signal stands
 still or wobbles back, it has arrived: from then on a further gain moves the stamp only if it goes more than
 the tolerance beyond the stamped value. Without that, noise of a fraction of a byte on a flat colour would move
-the stamp to wherever the noise happened to peak, and one flash would be spread over several frames.
-`FlashPairer` then pairs each cell's transitions in
+the stamp to wherever the noise happened to peak, and one flash would be spread over several frames (ADR-038).
+`FlashPairer` then pairs each pixel's transitions in
 order, first with second, third with fourth, and only a rise with a fall; a flash is counted at the frame of
-its second (completing) transition (ADR-005). Two rises in a row can happen when a change too small to be a
+its second (completing) transition (ADR-005), and a cell reports how many of its pixels completed one. Two
+rises in a row can happen when a change too small to be a
 transition sits between them (rise, small dip, rise); the newer rise then replaces the waiting one, so a
 flash is always one rise and one fall (ADR-018). The engine does all of this for all 49 152 cells at once
 with a handful of array operations per frame rather than a loop over cells. (`detect_transitions_1d` and
@@ -146,29 +174,35 @@ with fall 15 completes a flash at frame 15; the next at 30, then 45, 60, 75. Fou
 
 ## `engine/area.py` - is the flash big enough?
 
-**In:** per-frame masks "cell completed a flash at t". **Out:** per frame, the largest window share and
-whether a qualifying event is counted at that frame.
+**In:** per-frame masks "how many pixels of cell c completed a flash at t" (0 to 16). **Out:** per frame,
+the largest window share and whether a qualifying event is counted at that frame.
 
 WCAG lets small flashes through: content passes when the flashing area "occupies no more than ... 25% of
 any 10 degree visual field", and a "341 x 256 pixel rectangle anywhere on the displayed screen area"
 stands in for that field. "Anywhere" means every position of that rectangle must be tried. The engine
-does this with an *integral image*: a running total so that "how many flashing cells are in this window?"
+does this with an *integral image*: a running total so that "how many flashing pixels are in this window?"
 is answered with four look-ups for every possible position. The best position is recorded (ties go to the
-top-left-most). Steps per frame (SPEC 5.6, ADR-019):
+top-left-most). Counting pixels, not whole cells, makes the share the same wherever an element sits: a
+172 x 120 px rectangle measures its 20 640 pixels at (100, 100) and at (102, 102) alike (ADR-044).
+Windows still slide in whole cells, so an element wider or taller than the window can lose at most 3 px
+along such an edge (the lenient direction). Steps per frame (SPEC 5.6, ADR-019, ADR-038):
 
 1. cells completing a flash one frame apart are treated as one event, looking backwards:
-   `E[t] = M[t-1] or M[t]` (frame 0 has nothing before it);
-2. `area_max[t]` = flashing cells in the best window / cells in the **full** window (85 x 64 = 5 440 at
-   1024 px wide). On a viewport too short for the window, only the part that fits is slid over the frame,
+   `E[t] = M[t-1] or M[t]` (frame 0 has nothing before it). In pixel counts the union is the sum, capped at
+   16: a pixel cannot complete two flashes one frame apart, so the two frames' pixels are different ones;
+2. `area_max[t]` = flashing pixels in the best window / pixels in the **full** window (85 x 64 = 5 440 cells,
+   87 040 px, at 1024 px wide). On a viewport too short for the window, only the part that fits is slid over the frame,
    but the share is still taken of 5 440 cells, because WCAG's 25 % is an absolute area (21 824 px), not a
    quarter of whatever happens to be on screen;
-3. the frame qualifies if `area_max > 0.25` (strictly greater: exactly 25 % passes);
+3. the frame qualifies if `area_max > 0.25` (strictly greater: exactly 25 % passes), which at 1024 px wide means
+   more than 21 760 flashing pixels in one window position;
 4. counting: an event counted at frame `t` *claims* the completions of frames `t` and `t+1` (step 1's
    tolerance). Going forward through the frames, a qualifying frame that is not claimed is scored again
    using only the completions of `t-1` and `t` that no earlier event has claimed; if that share is still over
    25 %, an event is counted at `t`. So one flash is counted once even when its cells finish on two
    neighbouring frames (a smooth fade over dim and bright cells does this: they reach their extreme byte one
-   frame apart). The price: two separate regions that qualify one frame apart are also counted once.
+   frame apart). The price: two separate regions that qualify one frame apart are also counted once, while
+   two frames apart they count twice (ADR-038 records this trade-off).
 
 **Example continued.** Every cell completes a flash at frame 15, so every window is 100 % full on frames 15
 and 16 (step 1 carries frame 15 into frame 16). Frame 15 counts an event, which claims frames 15 and 16, so
@@ -224,7 +258,9 @@ reason (the `reason()` method; a PASS reads "No 2.3.1 violation detected under t
 violations (each with the CSS-pixel rectangle of the largest event's window and the event frames inside
 it), advisories, the per-second timeline, per-frame statistics, and a heatmap counting completed flashes per
 cell (stored as base64 little-endian 16-bit integers so it is compact and reproducible). Key names match
-`engine/schema/report.schema.json` and are always written in the same order.
+`engine/schema/report.schema.json` and are always written in the same order. In the per-frame statistics,
+`generalCells` / `redCells` count the cells with at least one pixel completing a flash at that frame, and
+`generalAreaMax` / `redAreaMax` are the best window's share measured in pixels (SPEC 5.8, ADR-044).
 
 Two sizes appear in the output and they differ by design: `windowPx` is the nominal WCAG window (341 x 256
 CSS px at a 1024 px wide viewport), while each violation's `window` rectangle is the window that was actually
@@ -252,13 +288,15 @@ Same input, same output, every time: float64 throughout, no randomness, no threa
 and a lookup table instead of per-pixel arithmetic. The acceptance tests (SPEC 5.10 item 9) analyse the
 same scene twice and compare the JSON byte for byte. Runtime figures are deliberately not quoted on this
 page: SPEC section 10 reserves them for `docs/RESULTS.md`, which `flashtrace bench` produces with a date and
-commit hash. The 4x4 cell averaging and the tracker's array operations both do a fixed amount of work per
-cell, whatever the page shows.
+commit hash. The 4x4 cell averaging and the tracker's array operations do a fixed amount of work per cell on
+every frame; the pixel-by-pixel rule adds work only where runs end, so a page that changes everywhere on every
+frame (a full-screen strobe) costs the most.
 
 ## What the engine deliberately does not do
 
-* It does not evaluate the "fine, balanced, pattern" exception (white noise, tiny checkerboards); 4x4
-  averaging already smooths such patterns towards grey, which makes the engine lenient, not strict, there.
+* It does not evaluate the "fine, balanced, pattern" exception (white noise, tiny checkerboards). A balanced
+  pattern keeps each 4x4 cell's mean still, so no run starts and nothing is counted, which makes the engine
+  lenient, not strict, there; an unbalanced fine pattern moves the cell mean and its pixels are judged.
 * It does not model a physical display, viewing distance or HDR; it measures what headless Chromium drew.
 * It does not sum general and red flashes together; WCAG counts them separately and so does the engine.
 * It cannot see flashing faster than half the frame rate (30 Hz at 60 fps): such content is not in the frames.

@@ -6,19 +6,28 @@ How it works, in plain words:
    the wall-clock time at which it was shown. Every frame is acknowledged (``Page.screencastFrameAck``)
    or Chromium stops sending. The page runs on its ordinary real-time clocks; nothing is seeked.
 2. Recording lasts ``duration_s`` real seconds plus a small settle so the last frames arrive.
-3. The recording is resampled to the capture grid ``t_i = i / fps``: frame ``i`` is the latest screencast
-   frame shown at or before ``t_i`` (time 0 is the first screencast frame; before the first timestamp
-   the first frame is repeated). Chromium only draws when something changes, so a static page produces
-   one screencast frame that is simply held.
-4. ``deterministic`` is always ``False``: real time jitters, frames can be dropped, and a page that is
+3. The recording is resampled to the capture grid ``t_i = origin + i / fps``: frame ``i`` is the latest
+   screencast frame shown at or before ``t_i`` (before the first timestamp the first frame is repeated).
+   Chromium only draws when something changes, so a static page produces one screencast frame that is
+   simply held.
+4. Where the grid starts. Chromium's compositor draws on the ticks of a 60 Hz clock, so every screencast
+   timestamp lies on one 1/60 s lattice, give or take a millisecond or two of jitter (measured: three 4 s
+   recordings of a 4 Hz page, 35-41 frames each, all within 0.15 of a tick of one common phase). A grid
+   that started exactly at the first frame put every sample on a lattice point, so that jitter decided
+   whether a sample showed the frame before or after a change: a 4 Hz strobe measured 5 per second and a
+   2.999 Hz one failed. ``sample_origin`` therefore starts the grid half a tick away from the lattice
+   (``lattice_phase``), where a timestamp would have to be 8 ms off to change the result.
+5. ``deterministic`` is always ``False``: real time jitters, frames can be dropped, and a page that is
    idle between two flashes may be sampled on the wrong side of a change. The report shows the warning
    banner and a PASS becomes INCONCLUSIVE (SPEC 6.4). The notes record how many frames arrived and
-   the effective source rate so a reader can judge what the recording could have missed.
+   the effective source rate so a reader can judge what the recording could have missed, and say that
+   a dropped compositor frame can still move one transition by a frame (a rate one higher or lower).
 """
 
 from __future__ import annotations
 
 import base64
+import math
 import time
 from collections.abc import Sequence
 from typing import Any, ClassVar
@@ -27,6 +36,7 @@ from playwright.sync_api import CDPSession, Page
 
 from capture.frames import png_to_rgb
 from capture.strategies.base import (
+    SAMPLE_PHASE,
     CaptureSettings,
     CaptureStrategy,
     FrameSink,
@@ -39,6 +49,47 @@ SETTLE_S = 0.25
 
 #: Real seconds to wait for the first screencast frame before giving up on the screencast.
 FIRST_FRAME_CAP_S = 5.0
+
+#: Rate of the clock Chromium's compositor draws on (headless Chromium's default begin-frame interval).
+COMPOSITOR_HZ = 60
+
+#: How tightly the timestamps must agree on one lattice phase (1 = all on the same phase, 0 = spread
+#: evenly) before ``sample_origin`` trusts it. Below this (for example arrival times used because Chromium
+#: sent no swap timestamps) the grid starts a quarter of a sample in, as strategies A and B do (ADR-029).
+MIN_LATTICE_AGREEMENT = 0.5
+
+
+def lattice_phase(timestamps: Sequence[float], hz: int = COMPOSITOR_HZ) -> tuple[float, float]:
+    """Where the source frames sit on the compositor's ``1/hz`` s lattice, counted from the first frame.
+
+    Returns ``(phase, agreement)``: ``phase`` in ``[0, 1)`` of a tick is the circular mean of every
+    frame's position within its tick (circular, so 0.98 and 0.02 average to 0, not 0.5); ``agreement``
+    in ``[0, 1]`` is the length of that mean (1 when every frame has the same phase). Pure.
+    """
+    if not timestamps:
+        raise ValueError("lattice_phase needs at least one timestamp")
+    angles = [2 * math.pi * (((t - timestamps[0]) * hz) % 1.0) for t in timestamps]
+    x = sum(math.cos(a) for a in angles) / len(angles)
+    y = sum(math.sin(a) for a in angles) / len(angles)
+    return (math.atan2(y, x) / (2 * math.pi)) % 1.0, math.hypot(x, y)
+
+
+def sample_origin(timestamps: Sequence[float], fps: int) -> tuple[float, str]:
+    """Time of sample 0 (seconds, same clock as ``timestamps``) and a note saying how it was chosen.
+
+    Half a compositor tick after the lattice the frames sit on, so jitter of up to half a tick cannot
+    move a sample across a frame (module docstring, step 4). Pure.
+    """
+    phase, agreement = lattice_phase(timestamps)
+    if agreement < MIN_LATTICE_AGREEMENT:
+        offset = SAMPLE_PHASE / fps
+        how = (f"source frames agree on no {COMPOSITOR_HZ} Hz lattice phase (agreement {agreement:.2f}); "
+               f"samples sit {offset * 1000:.1f} ms after the first frame plus whole sample periods")
+        return timestamps[0] + offset, how
+    offset = ((phase + 0.5) % 1.0) / COMPOSITOR_HZ
+    how = (f"source frames sit at phase {phase:.2f} of a {COMPOSITOR_HZ} Hz compositor tick (agreement {agreement:.2f}); "
+           f"samples sit {offset * 1000:.1f} ms after the first frame plus whole sample periods, half a tick away from them")
+    return timestamps[0] + offset, how
 
 
 def resample_indices(timestamps: Sequence[float], origin: float, fps: int, count: int) -> list[int]:
@@ -69,6 +120,7 @@ class RealtimeStrategy(CaptureStrategy):
     requires_controllable_content: ClassVar[bool] = False
 
     def __init__(self) -> None:
+        super().__init__()
         self._cdp: CDPSession | None = None
         self._received: list[tuple[float, bytes]] = []
 
@@ -128,9 +180,9 @@ class RealtimeStrategy(CaptureStrategy):
 
         received = sorted(self._received, key=lambda item: item[0])
         timestamps = [item[0] for item in received]
-        origin = timestamps[0]
+        origin, origin_note = sample_origin(timestamps, settings.fps)
         indices = resample_indices(timestamps, origin, settings.fps, total)
-        notes = self._describe(received, timestamps, indices, settings)
+        notes = self._describe(received, timestamps, indices, settings) + [origin_note]
 
         failure: str | None = None
         first_shape = png_to_rgb(received[0][1]).shape
@@ -155,6 +207,8 @@ class RealtimeStrategy(CaptureStrategy):
         span = timestamps[-1] - timestamps[0]
         notes = [
             "realtime screencast: frames are wall-clock samples, not seeked states; frames may have been missed",
+            "a compositor frame drawn late moves a transition by one frame, so a measured rate can be one flash "
+            "per second higher or lower than the page's",
             f"{len(received)} screencast frame(s) received over {span:.3f} s of real time",
         ]
         if len(received) >= 2 and span > 0:

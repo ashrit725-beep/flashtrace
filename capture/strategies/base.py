@@ -14,15 +14,76 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from playwright.sync_api import Browser, BrowserContext, Page
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from capture.frames import FrameSequence, png_to_rgb
 from capture.hashing import frame_hash
 
+if TYPE_CHECKING:  # type hints only: detect.py does not import the strategies
+    from capture.detect import ContentWatch
+
 # progress(frames_done, frames_total); called once per stored frame.
 ProgressCallback = Callable[[int, int], None]
+
+#: Real milliseconds the page's ``load`` event may take once its HTML has arrived. One subresource that
+#: never answers (a stalled tracking pixel, a font host that hangs) holds ``load`` back for ever, so after
+#: this long the capture goes on without it and says so. What that request could still change is then
+#: the strategy's business: strategy A's network wait gives up on it and marks the capture
+#: ``deterministic=False`` (``network_wait.py``); strategy C is never deterministic.
+LOAD_WAIT_MS = 10_000
+
+#: Real milliseconds to wait for ``document.fonts.ready`` before frame 0. A font whose server never
+#: answers would otherwise block the capture for ever (no timeout applies to ``page.evaluate``). As long
+#: as the load event's, so a slow but working font host still gets a deterministic capture.
+FONT_WAIT_MS = 10_000
+
+# Settles with 'loaded' once every web font is ready, or with document.fonts.status after limitMs of real
+# time. Strategy A's setTimeout is the frozen fake clock, so the browser's original timer, which
+# Playwright keeps at __pwClock.builtins, bounds the wait there.
+WAIT_FOR_FONTS_JS = r"""
+(limitMs) => {
+  const builtins = window.__pwClock && window.__pwClock.builtins;
+  const realSetTimeout = builtins && typeof builtins.setTimeout === 'function' ? builtins.setTimeout : setTimeout;
+  return Promise.race([
+    document.fonts.ready.then(() => 'loaded'),
+    new Promise((resolve) => realSetTimeout(() => resolve(document.fonts.status), limitMs)),
+  ]);
+}
+"""
+
+
+class PageLoadError(Exception):
+    """The page cannot be audited at all, whichever strategy loads it (for example its server answered
+    with an HTTP error status). ``capturer`` does not fall through on it: every strategy would load the
+    same answer. The audit layer reports it as a capture error (SPEC 6.4)."""
+
+
+def check_main_response(response: Any, url: str) -> None:
+    """Raise ``PageLoadError`` when the main document came back with an HTTP error status (>= 400).
+
+    Without this check a mistyped URL or a broken deploy is audited as the server's error page and can
+    PASS. ``response`` is what ``page.goto`` returned; it is ``None`` for ``data:`` and ``about:`` URLs,
+    and a ``file:`` URL has no HTTP status to check.
+    """
+    status = getattr(response, "status", None)
+    if isinstance(status, int) and status >= 400:
+        text = str(getattr(response, "status_text", "") or "").strip()
+        raise PageLoadError(f"the page answered HTTP {status}{' ' + text if text else ''}: {url}")
+
+
+def wait_for_load_event(page: Page) -> list[str]:
+    """Wait at most ``LOAD_WAIT_MS`` of real time for the ``load`` event; a note when it did not come."""
+    try:
+        page.wait_for_load_state("load", timeout=LOAD_WAIT_MS)
+    except PlaywrightTimeoutError:
+        return [
+            f"the page's load event had not fired after {LOAD_WAIT_MS / 1000:g} s of real time "
+            "(a request it waits for never finished); the capture went on without it"
+        ]
+    return []
 
 #: Real milliseconds between the two screenshots of the double-shot check (SPEC 6.2, ADR-022). The
 #: virtual clocks stand still during the wait, so only content that animates on the real clock can
@@ -79,6 +140,9 @@ class StrategyOutcome:
     # Set when the capture should fall through to the next strategy (for example a failed
     # double-shot check); ``None`` means the frames are good.
     failure_reason: str | None = None
+    # Uncontrollable content the strategy found during the frame loop (it appeared after frame 0),
+    # in the same form as ``detect.find_uncontrollable``'s entries; added to ``meta.uncontrollable``.
+    uncontrollable: list[str] = field(default_factory=list)
 
 
 class FrameSink:
@@ -149,6 +213,24 @@ class CaptureStrategy(ABC):
     #: True when the strategy re-applies an ablation's suppression on every frame (strategy A). The
     #: others apply it once, before frame 0 (``capturer``), which the capture notes say.
     reapplies_suppression: ClassVar[bool] = False
+    #: True when the strategy's pictures come from ``page.screenshot``, which waits for
+    #: ``document.fonts.ready`` before every picture (Playwright 1.63, ``Screenshotter._preparePageForScreenshot``).
+    #: Such a strategy cannot capture a page whose web font is still loading after ``FONT_WAIT_MS``: each
+    #: picture would wait for its 30 s timeout. ``capturer`` then gives the attempt up.
+    pictures_wait_for_fonts: ClassVar[bool] = False
+
+    def __init__(self) -> None:
+        #: Notes about how the page loaded (for example a ``load`` event that never came), which
+        #: ``capturer`` copies into the capture notes after navigation.
+        self.load_notes: list[str] = []
+        #: Set by ``capturer`` after its scan for uncontrollable content, before ``run``: the scan's state,
+        #: so a strategy can look again for content that appears after frame 0 (strategy A does).
+        self.content_watch: ContentWatch | None = None
+
+    def needs_controllable_content(self) -> bool:
+        """Whether this attempt must step aside for uncontrollable content (``requires_controllable_content``
+        unless the strategy knows better once its page exists; strategy B decides by its picture source)."""
+        return self.requires_controllable_content
 
     def needs_launch_args(self, browser: Browser) -> bool:
         """Whether this attempt should run in a dedicated browser launched with ``launch_args``.
@@ -177,18 +259,30 @@ class CaptureStrategy(ABC):
 
         A returned reason means the strategy cannot capture this page at all (for example its time
         source stalled the load). In "auto" mode the capturer then moves on to the next strategy.
+        An HTTP error status of the page itself raises ``PageLoadError`` instead (no strategy can help).
+
+        The navigation itself waits for the HTML (``domcontentloaded``); the ``load`` event, which also
+        waits for every image, font and frame, is then given ``LOAD_WAIT_MS`` of real time.
         """
-        page.goto(settings.url, wait_until="load")
+        response = page.goto(settings.url, wait_until="domcontentloaded")
+        check_main_response(response, settings.url)
+        self.load_notes.extend(wait_for_load_event(page))
         return None
 
-    def wait_for_fonts(self, page: Page) -> list[str]:
-        """Block until web fonts are ready, so text pixels do not change mid-capture; returns notes.
+    def wait_for_fonts(self, page: Page) -> str | None:
+        """Wait, at most ``FONT_WAIT_MS`` of real time, until web fonts are ready, so text pixels do not
+        change mid-capture. Returns ``None`` when they are, else a note saying they were not.
 
+        A font still loading after that is a request that has not finished; its text may change when it
+        arrives, at a moment real time decides. ``capturer`` records the note and gives up an attempt whose
+        pictures wait for fonts (``pictures_wait_for_fonts``); strategy C is never deterministic anyway.
         Strategies that freeze the page's task queues override this, because awaiting
         ``document.fonts.ready`` on a frozen page would never return.
         """
-        page.evaluate("() => document.fonts.ready.then(() => undefined)")
-        return []
+        status = page.evaluate(WAIT_FOR_FONTS_JS, FONT_WAIT_MS)
+        if status == "loaded":
+            return None
+        return f"web fonts were still '{status}' after {FONT_WAIT_MS / 1000:g} s of real time; text drawn in them may change when they arrive"
 
     def run_interaction(self, page: Page, script: str) -> list[str]:
         """Run the interaction script after load and before frame 0; returns notes.

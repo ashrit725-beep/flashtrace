@@ -7,6 +7,7 @@ platform lacks BeginFrameControl is skipped with the measured reason, never pass
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Iterable
 from pathlib import Path
@@ -20,7 +21,7 @@ from playwright.sync_api import Error as PlaywrightError
 from capture import CaptureResult, capture
 from capture.strategies import network_wait
 from capture.strategies import virtual_time as vt
-from capture.strategies.realtime import resample_indices
+from capture.strategies.realtime import lattice_phase, resample_indices, sample_origin
 
 FPS = 60
 # Every synthetic page puts its flashing element's centre at (300, 250) in (x, y).
@@ -68,6 +69,60 @@ def test_resample_sample_exactly_on_a_timestamp_takes_that_frame() -> None:
 def test_resample_rejects_an_empty_recording() -> None:
     with pytest.raises(ValueError):
         resample_indices([], origin=0.0, fps=60, count=1)
+
+
+def test_lattice_phase_is_a_circular_mean() -> None:
+    """0.98 and 0.02 of a tick average to 0, not to 0.5; frames spread evenly agree on nothing."""
+    tick = 1 / 60
+    phase, agreement = lattice_phase([0.0, 1.98 * tick, 3.02 * tick, 5.98 * tick, 7.02 * tick])
+    assert min(phase, 1 - phase) < 0.01 and agreement > 0.99
+    _phase, spread = lattice_phase([0.0, 1.25 * tick, 2.5 * tick, 3.75 * tick])
+    assert spread < 0.01
+
+
+def jittered_square_wave(seed: int, hz: float, seconds: float, jitter_s: float) -> tuple[list[float], list[str]]:
+    """Screencast-like source frames: a full-screen square wave of ``hz`` whose changes the compositor
+    shows at its next 60 Hz tick, each timestamp off by up to ``jitter_s``; frames only on change."""
+    import random
+
+    rng = random.Random(seed)
+    stamps, states = [0.0], ["black"]
+    for k in range(1, int(seconds * hz * 2)):
+        tick = math.ceil(k / (2 * hz) * 60 - 1e-9)  # first compositor tick at or after the change
+        stamps.append(tick / 60 + rng.uniform(-jitter_s, jitter_s))
+        states.append("white" if k % 2 else "black")
+    return stamps, states
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_samples_half_a_tick_away_from_the_lattice_ignore_jitter(seed: int) -> None:
+    """Source frames sit on the compositor lattice, as measured: a 4 Hz wave must give exactly 7/8-frame
+    gaps (4 flashes per second), however each timestamp jitters by up to 2 ms."""
+    stamps, states = jittered_square_wave(seed, hz=4, seconds=4, jitter_s=0.002)
+    origin, note = sample_origin(stamps, 60)
+    assert note.startswith("source frames sit at phase ")
+    sampled = [states[i] for i in resample_indices(stamps, origin, 60, 230)]
+    changes = [i for i in range(1, len(sampled)) if sampled[i] != sampled[i - 1]]
+    gaps = [b - a for a, b in zip(changes, changes[1:], strict=False)]
+    assert set(gaps) <= {7, 8} and all(a + b == 15 for a, b in zip(gaps, gaps[1:], strict=False)), gaps
+    # Every sample is at least 6 ms (half a tick less the jitter) away from every source frame.
+    samples = [origin + i / 60 for i in range(230)]
+    assert min(abs(s - t) for s in samples for t in stamps) > 0.006
+
+
+def test_samples_fall_back_to_a_quarter_frame_without_a_lattice() -> None:
+    tick = 1 / 60
+    origin, note = sample_origin([10.0, 10 + 1.25 * tick, 10 + 2.5 * tick, 10 + 3.75 * tick], 60)
+    assert origin == pytest.approx(10.0 + 0.25 / 60)
+    assert note.startswith("source frames agree on no 60 Hz lattice phase")
+
+
+def test_strategy_a_checks_every_captured_second() -> None:
+    """Frame 0, the first frame of each second and the last frame (waapi_step.py, step 7)."""
+    from capture.strategies.waapi_step import is_checkpoint
+
+    assert [i for i in range(150) if is_checkpoint(i, 150, 60)] == [0, 60, 120, 149]
+    assert [i for i in range(30) if is_checkpoint(i, 30, 60)] == [0, 29]
 
 
 def test_unknown_strategy_name_is_rejected_before_any_browser_work() -> None:
@@ -282,8 +337,10 @@ def test_gif_page_under_auto_skips_strategy_a(pages_dir: Path, tmp_path: Path, b
     print(f"[measured] gif.html under {meta.strategy}: the GIF advances between frames = {gif_advances}")
     if meta.strategy == "realtime":
         assert meta.deterministic is False
-        assert "virtual_time failed: " in meta.fallback_reason
-        note_matching(meta.notes, r"^virtual_time failed: ")
+        # B either cannot take budget-only pictures here (self-test) or, in budget-only mode, steps aside
+        # for the uncontrollable GIF like strategy A does.
+        assert re.search(r"virtual_time (failed|skipped): ", meta.fallback_reason), meta.fallback_reason
+        note_matching(meta.notes, r"^virtual_time (failed|skipped): ")
         assert gif_advances  # a real-time recording of a 4.17 Hz GIF must show both of its frames
     else:
         # Strategy B stood behind its frames (BeginFrameControl platform): report whether the GIF

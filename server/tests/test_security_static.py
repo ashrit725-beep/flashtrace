@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from cli.report import DISCLAIMER
 from server import app as server_app
 from server.app import DEV_CORS_VARIABLE, serve
+from server.validation import host_allowed
 
 DEV_UI = "http://localhost:3000"
 
@@ -63,8 +64,47 @@ def test_serve_treats_the_ctrl_c_uvicorn_raises_again_after_shutdown_as_handled(
 # ------------------------------------------------------------------------------------ Host / Origin
 def test_foreign_host_header_is_refused(client: TestClient) -> None:
     """A DNS-rebinding page reaches 127.0.0.1 under its own name; the Host header gives it away."""
-    assert client.get("/health", headers={"host": "attacker.example:8001"}).status_code == 400
+    refused = client.get("/health", headers={"host": "attacker.example:8001"})
+    assert refused.status_code == 400
+    assert refused.json() == {"detail": "The Host header must be 127.0.0.1 or localhost."}  # docs/API.md error shape
+    assert client.post("/jobs", json={"url": "https://example.test/"}, headers={"host": "attacker.example"}).status_code == 400
     assert client.get("/health", headers={"host": "localhost:8001"}).status_code == 200
+    assert client.get("/health", headers={"host": "127.0.0.1"}).status_code == 200
+
+
+@pytest.mark.parametrize("host, allowed", [
+    ("127.0.0.1:8001", True), ("localhost", True), ("localhost:3000", True),
+    ("attacker.example", False), ("127.0.0.1.attacker.example:8001", False), ("", False), (None, False),
+])
+def test_host_allowed(host: str | None, allowed: bool) -> None:
+    assert host_allowed(host) is allowed
+
+
+FRAMING_HEADERS = {"content-security-policy": "frame-ancestors 'none'", "x-frame-options": "DENY",
+                   "x-content-type-options": "nosniff"}
+
+
+def test_every_response_forbids_framing_and_sniffing(make_client, ui_build: Path) -> None:
+    """Another site must not show the UI in a frame and trick a click on Verify or Ablate (clickjacking)."""
+    client = make_client(static_dir=ui_build)
+    responses = [
+        client.get("/"), client.get("/report/?id=20261024-153012-a1b2c3"), client.get("/health"),
+        client.get("/jobs"), client.get("/jobs/20261024-153012-a1b2c3"), client.get("/jobs/not-an-id"),
+        client.get("/health", headers={"host": "attacker.example"}),
+        client.post("/jobs", json={"url": "https://example.test/"}, headers={"origin": "http://attacker.example"}),
+    ]
+    assert [response.status_code for response in responses] == [200, 200, 200, 200, 404, 422, 400, 403]
+    for response in responses:
+        assert {name: response.headers.get(name) for name in FRAMING_HEADERS} == FRAMING_HEADERS
+
+
+def test_the_ui_scripts_are_served_as_javascript(make_client, ui_build: Path) -> None:
+    """With nosniff a browser runs a script only when it is served with a JavaScript type."""
+    (ui_build / "app.js").write_text("console.log(1);", encoding="utf-8")
+    (ui_build / "app.css").write_text("body{}", encoding="utf-8")
+    client = make_client(static_dir=ui_build)
+    assert client.get("/app.js").headers["content-type"].startswith("text/javascript")
+    assert client.get("/app.css").headers["content-type"].startswith("text/css")
 
 
 def test_post_and_delete_from_another_origin_are_refused(client: TestClient) -> None:

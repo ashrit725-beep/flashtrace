@@ -19,9 +19,12 @@ How it works, in plain words:
    animation's clock from that time. When an animation reaches its end it is finished through the API
    (a paused animation never finishes by itself), so the page's ``finished`` promise callbacks and
    ``finish`` handlers run, and an animation they start is driven from that frame.
-4. ``<video>`` elements are paused, muted and seeked per frame. SVG SMIL timelines (one per outermost
-   ``<svg>``) are paused with ``pauseAnimations()`` and set with ``setCurrentTime``; one the page
-   paused itself stands still.
+4. ``<video>`` elements are driven like animations: paused, muted and seeked per frame to
+   ``phase + playbackRate * (t - start)`` seconds of media time, from the pass in which the page started
+   them (``autoplay`` or ``play()``). A video the page never started keeps its picture; the page's
+   ``pause()``, ``play()``, current-time and ``playbackRate`` changes are honoured as for animations.
+   SVG SMIL timelines (one per outermost ``<svg>``) are paused with ``pauseAnimations()`` and set with
+   ``setCurrentTime``; one the page paused itself stands still.
 5. Real-time work is allowed to finish while virtual time stands still: the page's network requests
    (``network_wait.py``), and every ``<video>``/``<img>`` in the viewport that is still loading. In
    virtual time they therefore arrive at the frame in which the page asked for them. A wait that runs
@@ -32,10 +35,16 @@ How it works, in plain words:
    steps as "seek, then ``run_for``, then screenshot"; both orders show every clock at ``t_i`` in the
    picture. The clock is advanced first so that an animation created by a timer or rAF callback during
    that step is found and seeked before the picture instead of one frame later.
-7. Double-shot check at frame 0 and the last frame: a second screenshot 100 ms of real time later, at
-   the same virtual time, must be identical, otherwise something animates on a clock we do not control
-   and the capture is marked ``deterministic=False``. A timed-out ``<video>`` seek or animation-ready
-   wait also marks it ``deterministic=False`` (SPEC 6.2).
+7. Checks at frame 0, at the first frame of every captured second and at the last frame
+   (``is_checkpoint``): the page clock must read the virtual time, and a second screenshot 100 ms of real
+   time later, at the same virtual time, must be identical (double-shot), otherwise something animates
+   on a clock we do not control. SPEC 6.2 names only the first and last frames; content that runs on the
+   real clock only in between (a GIF shown from 1 s to 3 s) slipped through those two. Every frame also
+   asks ``detect.ContentWatch`` for uncontrollable content that appeared since the first scan (new
+   images, WebGL canvases, cross-origin frames, workers, image requests), with the costly CSS-image walk
+   at the checkpoints. A failed check or such content sends "auto" on to the next strategy (the loop
+   stops there, since its frames would be discarded) and makes a forced capture non-deterministic. A
+   timed-out ``<video>`` seek or animation-ready wait marks the capture ``deterministic=False`` (SPEC 6.2).
 8. ``Math.random`` is replaced by a fixed-seed generator before any page script runs (ADR-022).
 9. Ablation (ADR-013): animations on elements matching ``settings.suppress_selectors`` are held at
    their frame-0 state; ones created on them after frame 0 are cancelled; media and elements that only
@@ -156,11 +165,12 @@ MAX_FINISH_ROUNDS = 8
 # screenshot shows the seeked state. Returns counters for the capture notes.
 _SEEK_FRAME_BODY = r"""
   const W = window;
-  const registry = W.__ftRegistry || (W.__ftRegistry = { nextId: 1, videos: new WeakSet() });
+  const registry = W.__ftRegistry || (W.__ftRegistry = { nextId: 1 });
   const stats = { animations: 0, newAnimations: 0, pagePaused: 0, pageHeld: 0, pageSeeks: 0, readopted: 0,
                   unseekable: 0, finished: 0, finishTimeouts: 0, readyTimeouts: 0, suppressedHeld: 0,
                   suppressedCancelled: 0, shadowRoots: 0, svgTimelines: 0, svgPagePaused: 0, svgHeld: 0,
                   svgResumed: 0, videos: 0, videosNotReady: 0, videosResumed: 0, videoSeeks: 0,
+                  videosPagePaused: 0, videosStarted: 0, videosHeld: 0, videoPageSeeks: 0, videoRateChanges: 0,
                   videoSeekTimeouts: 0, videoWaitSkipped: 0, mediaWaits: 0, mediaTimeouts: 0, perfNow: 0,
                   rebase: W.__ftClockRebase || 'missing' };
   const late = stage === 'later';  // after frame 0
@@ -465,33 +475,90 @@ _SEEK_FRAME_BODY = r"""
     }
   };
 
-  // Pass 5: videos are paused (again, if the page started them), muted and seeked to the pass time.
+  // ---- <video> (SPEC 6.2) ----
+  // A video is driven like an animation: from the pass in which the page started it, its media time is
+  // phase + playbackRate x local time (wrapped for a looping video, held at the end otherwise). Its
+  // phase is the media time the page gave it (currentTime, fastSeek, or where its play() found it); a
+  // video already playing on the real clock when first seen is not read, because where real time took
+  // it differs between runs. What the page asks is honoured (ANIMATION_RECORDER_JS records it):
+  //  - a video the page never started (no autoplay, no play()) keeps the picture the page left it at,
+  //    until the page calls play();
+  //  - pause() holds a driven video where it stands, and play() lets it continue from there;
+  //  - a current time the page assigns restarts its clock from that time;
+  //  - a new playbackRate applies from the pass that first sees it, continuing from where it stood.
+  const takeMediaSeek = (video) => {  // in ms, or null; reading it clears it
+    const seconds = video.__ftPageSeek;
+    video.__ftPageSeek = undefined;
+    return typeof seconds === 'number' && Number.isFinite(seconds) ? seconds * 1000 : null;
+  };
+  const mediaRate = (video) => {
+    const rate = video.playbackRate;
+    return typeof rate === 'number' && Number.isFinite(rate) && rate >= 0 ? rate : 1;
+  };
+  const pauseVideo = (video) => { try { ftOwnCall(video, () => video.pause()); } catch (e) {} };
+
+  // First sighting: take the video off the real clock. It runs from this pass if the page started it.
+  const registerVideo = (video) => {
+    const started = video.autoplay || !video.paused || video.__ftPageWantsPaused === false;
+    const seek = takeMediaSeek(video);
+    video.__ft = { offset: anchorMs, phase: seek === null ? 0 : seek, rate: mediaRate(video), held: null, pagePaused: !started };
+    pauseVideo(video);
+    try { video.muted = true; video.autoplay = false; } catch (e) {}
+  };
+
+  // The page called play() on a video it had never started: it runs from this pass, from where play()
+  // found it. A current time assigned after play() is still pending and is applied by videoTime.
+  const startVideo = (video, ft) => {
+    const from = typeof video.__ftPlayFrom === 'number' && Number.isFinite(video.__ftPlayFrom) ? video.__ftPlayFrom : video.currentTime;
+    Object.assign(ft, { pagePaused: false, offset: anchorMs, phase: from * 1000, held: null, rate: mediaRate(video) });
+    stats.videosStarted++;
+  };
+
+  // Media time (ms, before wrapping) a driven video shows at this pass.
+  const videoTime = (video, ft) => {
+    const seek = takeMediaSeek(video);
+    if (seek !== null) {  // the page moved it: its clock restarts here, from that time (a held one stays held)
+      Object.assign(ft, { offset: anchorMs, phase: seek, held: ft.held === null ? null : 0 });
+      stats.videoPageSeeks++;
+    }
+    const rate = mediaRate(video);
+    if (rate !== ft.rate) {  // continue from where it stood at the start of this slot, at the new rate
+      const local = ft.held !== null ? ft.held : Math.max(0, anchorMs - ft.offset);
+      Object.assign(ft, { phase: ft.phase + ft.rate * local, offset: anchorMs, held: ft.held === null ? null : 0, rate });
+      stats.videoRateChanges++;
+    }
+    const hold = video.__ftPageWantsPaused === true;
+    if (hold) stats.videosHeld++;
+    return ft.phase + ft.rate * localTime(ft, hold);
+  };
+
+  // Pass 5: every video is paused (again, if the page set it playing), muted and seeked to its media time.
   const seekVideos = () => {
     const pending = [];
     for (const { root } of scopes) {
       for (const video of root.querySelectorAll('video')) {
         stats.videos++;
         if (video.hasAttribute('data-ft-suppressed-media')) continue;  // hidden for an ablation
-        if (!registry.videos.has(video)) {
-          registry.videos.add(video);
-          try { video.pause(); video.muted = true; video.autoplay = false; } catch (e) {}
-        } else if (!video.paused) {
-          try { video.pause(); } catch (e) {}
-          stats.videosResumed++;
+        if (!video.__ft) registerVideo(video);
+        const ft = video.__ft;
+        if (ft.pagePaused) {
+          if (video.__ftPageWantsPaused !== false) { stats.videosPagePaused++; continue; }  // still never started
+          startVideo(video, ft);
         }
+        if (!video.paused) { pauseVideo(video); stats.videosResumed++; }
+        const ms = videoTime(video, ft);
         // readyState 1 = HAVE_METADATA: duration is known and seeking is possible.
         if (!(video.readyState >= 1) || !Number.isFinite(video.duration) || video.duration <= 0) {
           stats.videosNotReady++;
           continue;
         }
-        let target = tMs / 1000;
-        target = video.loop ? target % video.duration : Math.min(target, video.duration);
+        const target = video.loop ? (ms / 1000) % video.duration : Math.min(ms / 1000, video.duration);
         if (Math.abs(video.currentTime - target) < 1e-4) continue;   // 'seeked' never fires for a no-op
         stats.videoSeeks++;
         pending.push(new Promise((resolve) => {
           const done = () => { video.removeEventListener('seeked', done); resolve(true); };
           video.addEventListener('seeked', done);
-          video.currentTime = target;
+          ftOwnCall(video, () => { video.currentTime = target; });
         }));
       }
     }
@@ -548,6 +615,12 @@ def _frames_text(frames: list[int]) -> str:
     return f"{len(frames)} frame(s), first at frame {frames[0]}"
 
 
+def is_checkpoint(index: int, total: int, fps: int) -> bool:
+    """Whether frame ``index`` of ``total`` gets the clock check, the double-shot check and the full content
+    scan: frame 0, the first frame of every captured second and the last frame (module docstring, step 7)."""
+    return index == 0 or index == total - 1 or index % fps == 0
+
+
 def _uncertainty_texts() -> dict[str, str]:
     """Per-pass counters that each make the capture non-deterministic when non-zero (SPEC 6.2: a wait
     that runs out means the picture may show a state that depends on real time), with what they mean.
@@ -567,8 +640,9 @@ def _uncertainty_texts() -> dict[str, str]:
 
 
 # Counters summed over every frame, and counters for which the frames where they were non-zero are kept.
-_SUMMED = ("newAnimations", "unseekable", "suppressedCancelled", "svgResumed", "videosResumed", "finished", "pageSeeks")
-_PER_FRAME = ("readopted", "pageHeld", "svgHeld")
+_SUMMED = ("newAnimations", "unseekable", "suppressedCancelled", "svgResumed", "videosResumed", "finished", "pageSeeks",
+           "videosStarted", "videoPageSeeks", "videoRateChanges")
+_PER_FRAME = ("readopted", "pageHeld", "svgHeld", "videosHeld")
 
 
 @dataclass
@@ -619,7 +693,10 @@ class _Tally:
             (first.get("pagePaused"), f"{first.get('pagePaused')} animation(s) were already paused by the page and were left paused"),
             (first.get("svgPagePaused"), f"{first.get('svgPagePaused')} SVG timeline(s) were already paused by the page and were left paused"),
             (first.get("suppressedHeld"), f"{first.get('suppressedHeld')} animation(s) on suppressed elements held at their frame-0 state"),
-            (first.get("videos"), f"{first.get('videos')} video element(s) paused, muted and seeked per frame"),
+            (first.get("videos"), f"{first.get('videos')} video element(s) paused, muted and seeked per frame to the media time "
+                                  "they would show (from when the page started each one, at its playbackRate)"),
+            (first.get("videosPagePaused"), f"{first.get('videosPagePaused')} video element(s) not started by the page "
+                                            "(no autoplay, no play()) kept the picture the page left them at"),
             (first.get("videosNotReady"), f"{first.get('videosNotReady')} video element(s) had no metadata and could not be seeked"),
         ]
 
@@ -631,7 +708,11 @@ class _Tally:
             ("readopted" in at, f"animation(s) set running again by the page were re-adopted (paused and seeked) at {at.get('readopted')}"),
             ("pageHeld" in at, f"animation(s) paused by the page (pause() or CSS animation-play-state) were held still at {at.get('pageHeld')}"),
             ("svgHeld" in at, f"SVG timeline(s) paused by the page were held still at {at.get('svgHeld')}"),
+            ("videosHeld" in at, f"video(s) paused by the page were held still at {at.get('videosHeld')}"),
             (sums.get("pageSeeks"), f"{sums.get('pageSeeks')} current time(s) assigned by the page were applied"),
+            (sums.get("videosStarted"), f"{sums.get('videosStarted')} video(s) started later by the page's play() were driven from that frame"),
+            (sums.get("videoPageSeeks"), f"{sums.get('videoPageSeeks')} video current time(s) assigned by the page were applied"),
+            (sums.get("videoRateChanges"), f"{sums.get('videoRateChanges')} video playbackRate change(s) by the page were applied"),
             (sums.get("finished"), f"{sums.get('finished')} animation(s) reached their end and were finished, so the page's finish handlers ran"),
             (sums.get("svgResumed"), f"{sums.get('svgResumed')} SVG timeline un-pause(s) by the page were undone"),
             (sums.get("videosResumed"), f"{sums.get('videosResumed')} video play() call(s) by the page were undone (paused again before seeking)"),
@@ -658,14 +739,17 @@ class WaapiStepStrategy(CaptureStrategy):
     deterministic_by_design: ClassVar[bool] = True
     requires_controllable_content: ClassVar[bool] = True
     reapplies_suppression: ClassVar[bool] = True
+    pictures_wait_for_fonts: ClassVar[bool] = True  # take_screenshot is page.screenshot
 
     def __init__(self) -> None:
+        super().__init__()
         # Virtual milliseconds already consumed before frame 0 (by the interaction script).
         self._preroll_ms = 0
         self._context: BrowserContext | None = None
         self._settings: CaptureSettings | None = None
         self._network = NetworkTracker()
         self._tally = _Tally()
+        self._late_notes: list[str] = []  # notes of the content checks made during the frame loop
 
     # ------------------------------------------------------------------ setup
     def prepare_context(self, context: BrowserContext, settings: CaptureSettings) -> None:
@@ -784,7 +868,10 @@ class WaapiStepStrategy(CaptureStrategy):
     ) -> StrategyOutcome:
         total = settings.frame_count
         failures: list[str] = []
+        late: list[str] = []  # uncontrollable content that appeared after the first scan
         clock_ms = 0  # virtual ms advanced since frame-loop start (excludes the pre-roll)
+        # Images requested while the page loaded were either in the first scan or not shown (preloads).
+        self._network.take_image_requests()
 
         for index in range(total):
             target_ms = int(round(settings.frame_time_ms(index)))
@@ -795,7 +882,7 @@ class WaapiStepStrategy(CaptureStrategy):
             pass_ms = self._preroll_ms + settings.frame_time_ms(index)  # virtual time since load
             stats, abandoned = self._seek_pass(page, pass_ms, "frame0" if index == 0 else "later", walk=index == 0)
             self._tally.add(index, stats, abandoned)
-            checked = index in (0, total - 1)  # SPEC 6.2: the checks run at frame 0 and the last frame
+            checked = is_checkpoint(index, total, settings.fps)
             if checked:
                 failures.extend(self._clock_failure(stats, index, target_ms))
             digest = sink.add(take_screenshot(page))
@@ -804,16 +891,32 @@ class WaapiStepStrategy(CaptureStrategy):
                     f"double-shot check failed at frame {index}: two screenshots at the same virtual time, "
                     f"{DOUBLE_SHOT_REAL_GAP_MS} ms of real time apart, differ"
                 )
+            failures.extend(self._late_content(page, index, checked, late))
             if progress is not None:
                 progress(index + 1, total)
+            if failures and not settings.forced:
+                break  # "auto" moves on to the next strategy, which discards these frames: stop here
 
-        return self._outcome(failures, settings.fps)
+        return self._outcome(failures, settings.fps, late, checks_ran=True)
 
-    def _outcome(self, failures: list[str], fps: int) -> StrategyOutcome:
+    def _late_content(self, page: Page, index: int, full: bool, late: list[str]) -> list[str]:
+        """Content that became uncontrollable since the last look (``detect.ContentWatch``); failure texts.
+
+        Every frame: new image elements, WebGL canvases, cross-origin frames, workers and the images the
+        page requested; with ``full`` also CSS images. New entries are added to ``late``.
+        """
+        if self.content_watch is None:
+            return []
+        found, notes = self.content_watch.recheck(page, full, self._network.take_image_requests())
+        self._late_notes.extend(f"at frame {index}: {note}" for note in notes)
+        late.extend(found)
+        return [f"uncontrollable content appeared after the first scan, at frame {index}: {entry}" for entry in found]
+
+    def _outcome(self, failures: list[str], fps: int, late: list[str] | None = None, checks_ran: bool = False) -> StrategyOutcome:
         """Turn the per-frame counters and check failures into the strategy's verdict and notes.
 
-        A failure (clock, double-shot) sends "auto" on to the next strategy; a wait that ran out only
-        makes this capture non-deterministic (SPEC 6.2).
+        A failure (clock, double-shot, content that became uncontrollable) sends "auto" on to the next
+        strategy; a wait that ran out only makes this capture non-deterministic (SPEC 6.2).
         """
         tally = self._tally
         failures = failures + tally.failures()
@@ -825,8 +928,14 @@ class WaapiStepStrategy(CaptureStrategy):
             f"fake clock stepped in whole ms: frame i sits at round((i + {SAMPLE_PHASE})*1000/{fps}) ms, "
             "animations seeked to the exact time (ADR-029)",
         ]
+        if checks_ran:
+            notes.append(
+                f"clock and double-shot checks at frame 0, every {fps}th frame and the last frame; uncontrollable "
+                "content looked for again at every frame (CSS images at those checkpoints)"
+            )
         return StrategyOutcome(
             deterministic=not failures and not uncertain,
-            notes=notes + uncertain + failures,
+            notes=notes + self._late_notes + uncertain + failures,
             failure_reason="; ".join(failures) if failures else None,
+            uncontrollable=list(late or []),
         )

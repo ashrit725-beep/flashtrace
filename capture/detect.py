@@ -1,20 +1,32 @@
 """Detection of page content that strategy A cannot control (SPEC.md section 6.2).
 
-Strategy A drives time through the Web Animations API and Playwright's fake clock. Three kinds of
+Strategy A drives time through the Web Animations API and Playwright's fake clock. Five kinds of
 content ignore both and keep animating on the browser's own clock:
 
-* animated images (GIF, APNG, animated WebP), which the browser animates internally;
-* WebGL canvases, whose pixels come from GPU programs we cannot pause or seek;
-* cross-origin iframes, whose documents our scripts are not allowed to touch.
+* animated images (GIF, APNG, animated WebP, and SVG images with SMIL or CSS animations), which the
+  browser animates internally;
+* WebGL canvases, whose pixels come from GPU programs we cannot pause or seek, and canvases handed to
+  an ``OffscreenCanvas``;
+* cross-origin iframes, whose documents our scripts are not allowed to touch;
+* Web Workers and shared workers, whose timers run on the real clock and whose messages can change the
+  page at any real moment (``WORKER_PROBE_JS`` records every one the page starts).
 
 Images are looked for wherever a page can show one: ``<img>``, SVG ``<image>``, ``<input type=image>``,
-``<object>``, ``<embed>``, ``<video poster>``, and every CSS property that paints an image (backgrounds,
+``<object>``, ``<embed>`` (unless it shows a same-origin document, whose animations strategy A drives
+like the page's own), ``<video poster>``, and every CSS property that paints an image (backgrounds,
 ``content``, list markers, border images, masks) on each element and on its ``::before``/``::after``
 boxes. Image formats are recognised from their bytes, never from the file extension, because a ``.png``
 URL can serve a GIF. Only the first ``SNIFF_LIMIT`` bytes are inspected, or up to ``GIF_SNIFF_LIMIT`` for
-a GIF whose first frame is larger than that. An image whose bytes cannot be read is reported as
-``image-unverified`` (uncontrollable): it could be animated, and a wrong "still" would let strategy A
-claim determinism for frames a GIF moved on the real clock.
+a GIF whose first frame, or an SVG whose markup, is larger than that. An image whose bytes cannot be
+read is reported as ``image-unverified`` (uncontrollable): it could be animated, and a wrong "still"
+would let strategy A claim determinism for frames a GIF moved on the real clock. For the same reason
+image URLs past the first ``MAX_IMAGE_URLS`` are reported as ``images-unverified``.
+
+Content can also arrive after the scan before frame 0: an ``<img>`` a timer inserts, a background a
+class change brings in, a worker a script starts. ``ContentWatch`` keeps what the first scan saw, and
+strategy A asks it at every frame for anything new (SPEC 6.2): the element scan without the costly
+computed-style walk every frame, the full scan once per captured second, plus every image URL the page
+requested since the last frame.
 
 The scan looks in the document, in every shadow root (open or closed, recorded by the init script in
 ``capture/page_scripts.py``; ADR-022) and in every same-origin frame. Elements an ablation hid
@@ -34,6 +46,8 @@ from __future__ import annotations
 import base64
 import re
 import struct
+import zlib
+from collections.abc import Iterable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import unquote, unquote_to_bytes, urlparse
@@ -49,11 +63,17 @@ if TYPE_CHECKING:  # imported for type hints only; the pure functions stay brows
 # frame starts only after all of the first frame's pixel data, so GIFs are read further (below).
 SNIFF_LIMIT = 64 * 1024
 
-# How far a GIF is read when its first frame does not end inside the first ``SNIFF_LIMIT`` bytes.
+# How far a GIF is read when its first frame does not end inside the first ``SNIFF_LIMIT`` bytes, and
+# an SVG when its markup goes on past them without an animation so far.
 GIF_SNIFF_LIMIT = 4 * 1024 * 1024
 
-# Reasonable cap so a page with thousands of icons does not turn detection into a crawl.
+# Most image URLs whose bytes are read for one page (scan and later checks together), so a page with
+# thousands of icons does not turn detection into a crawl. URLs past the cap are reported as
+# 'images-unverified' (uncontrollable), the same safe direction as an unreadable image.
 MAX_IMAGE_URLS = 200
+
+# Real milliseconds one image read over the network may take before the image counts as unreadable.
+IMAGE_READ_TIMEOUT_MS = 5000
 
 
 # ---------------------------------------------------------------------------------------- GIF
@@ -170,14 +190,60 @@ def is_animated_webp(data: bytes) -> bool:
     return False
 
 
+# ---------------------------------------------------------------------------------------- SVG
+# An SVG shown as an image (<img>, CSS background, SVG <image>) runs no script, but its SMIL elements and
+# CSS animations play on the browser's own clock, out of reach of strategy A. CSS animations need an
+# @keyframes rule inside the file, because an SVG image cannot load an outside stylesheet.
+_SVG_ROOT = re.compile(rb"<(?:[A-Za-z_][\w.-]*:)?svg[\s>/]", re.IGNORECASE)
+_HTML_START = re.compile(rb"<!doctype\s+html|<html[\s>]", re.IGNORECASE)
+_SVG_ANIMATION = re.compile(
+    rb"<(?:[A-Za-z_][\w.-]*:)?(?:animate|animateTransform|animateMotion|animateColor|set)[\s/>]"  # SMIL
+    rb"|@(?:-[a-z]+-)?keyframes[\s{]",                                                            # CSS
+    re.IGNORECASE,
+)
+
+
+def svg_markup(data: bytes) -> bytes | None:
+    """The markup of an SVG file (an ``.svgz`` file is gunzipped first), or ``None`` when ``data`` is not SVG.
+
+    Bytes count as SVG when they start with markup (after an optional byte-order mark and white space),
+    are not an HTML document and contain an ``<svg`` root. At most ``GIF_SNIFF_LIMIT`` bytes are unzipped.
+    """
+    if data[:2] == b"\x1f\x8b":  # gzip
+        try:
+            data = zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(data, GIF_SNIFF_LIMIT)
+        except zlib.error:
+            return None
+    start = data[:512].lstrip(b"\xef\xbb\xbf \t\r\n")
+    if not start.startswith(b"<") or _HTML_START.search(start):
+        return None
+    return data if _SVG_ROOT.search(data) else None
+
+
+def is_animated_svg(data: bytes) -> bool:
+    """True when ``data`` is an SVG file with a SMIL animation element or an ``@keyframes`` rule."""
+    markup = svg_markup(data[:GIF_SNIFF_LIMIT])
+    return markup is not None and _SVG_ANIMATION.search(markup) is not None
+
+
+def svg_needs_more_bytes(head: bytes, limit: int) -> bool:
+    """True when ``head`` (the first ``limit`` bytes of a file) is an SVG cut off before any animation.
+
+    The rest of the file could still hold one; a shorter ``head`` is the whole file.
+    """
+    return len(head) >= limit and svg_markup(head) is not None and not is_animated_svg(head)
+
+
 def sniff_animated_image(data: bytes) -> str | None:
-    """Return ``"animated-gif"``, ``"animated-png"``, ``"animated-webp"`` or ``None`` for ``data``."""
+    """``"animated-gif"``, ``"animated-png"``, ``"animated-webp"``, ``"animated-svg"`` or ``None`` for ``data``."""
     if is_animated_gif(data):
         return "animated-gif"
     if is_animated_png(data):
         return "animated-png"
     if is_animated_webp(data):
         return "animated-webp"
+    if is_animated_svg(data):
+        return "animated-svg"
     return None
 
 
@@ -209,13 +275,52 @@ CANVAS_PROBE_JS = r"""
 })();
 """
 
-# Runs after load (and after an ablation's set-up). Walks the document, every shadow root and every
-# same-origin frame (``ftScopes`` from page_scripts.py) and returns what detection needs. A frame
-# whose document throws on access is cross-origin, which is exactly how it is recognised.
+# Installed before any page script runs, in every document. A worker's timers run on the real clock (no
+# strategy's clock reaches inside it), so a message it posts can change the page at any real moment.
+# Every Worker and SharedWorker the page constructs is recorded with its script URL; the constructors
+# otherwise behave exactly as before (instanceof, subclasses and errors included).
+WORKER_PROBE_JS = r"""
+(() => {
+  const workers = [];
+  Object.defineProperty(window, '__ftWorkers', { value: workers, configurable: true });
+  for (const kind of ['Worker', 'SharedWorker']) {
+    const Original = window[kind];
+    if (typeof Original !== 'function') continue;
+    const Recorded = function (...args) {
+      if (!new.target) return Original(...args);  // called without new: throws the browser's own TypeError
+      const instance = Reflect.construct(Original, args, new.target);
+      let url = String(args[0]);
+      try { url = new URL(url, document.baseURI).href; } catch (e) { /* keep the text as given */ }
+      workers.push({ kind, url, reported: false });
+      return instance;
+    };
+    Recorded.prototype = Original.prototype;
+    Object.setPrototypeOf(Recorded, Original);
+    Object.defineProperty(Recorded, 'name', { value: kind });
+    window[kind] = Recorded;
+  }
+})();
+"""
+
+# Runs after load (and after an ablation's set-up), and again during strategy A's frame loop
+# (``ContentWatch``). Walks the document, every shadow root and every same-origin frame (``ftScopes``
+# from page_scripts.py) and returns what detection needs. A frame whose document throws on access is
+# cross-origin, which is exactly how it is recognised. Each image URL, canvas, frame and worker is
+# returned once per page: later calls return only what is new. Options:
+#   styles  also read the CSS image properties of every element (the costly part);
+#   walk    also walk every element for open shadow roots the init script could not see.
 _SCAN_PAGE_BODY = r"""
-  const result = { images: [], webglCanvases: [], offscreenCanvases: [], crossOriginFrames: [],
+  const { styles, walk } = options || { styles: true, walk: true };
+  const result = { images: [], webglCanvases: [], offscreenCanvases: [], crossOriginFrames: [], workers: [],
                    videos: 0, shadowRoots: 0 };
-  const seenUrls = new Set();
+  if (!window.__ftScannedUrls) Object.defineProperty(window, '__ftScannedUrls', { value: new Set(), configurable: true });
+  const seenUrls = window.__ftScannedUrls;  // image URLs an earlier call already returned
+  // True the first time it is asked about this element and key, false after.
+  const firstReport = (el, key) => {
+    if (el['__ftReported' + key]) return false;
+    el['__ftReported' + key] = true;
+    return true;
+  };
 
   // A short, human-readable selector: #id when there is one, else the tag path with :nth-of-type.
   // An element inside a shadow root is written as its host's path, '>>', then the path inside.
@@ -270,11 +375,21 @@ _SCAN_PAGE_BODY = r"""
     }
   };
 
+  // An <object> or <embed> showing a same-origin document (an SVG file, say) is not an image: that
+  // document is one of the scopes, so strategy A drives its animations like the page's own.
+  const showsDocument = (el) => {
+    if (el.localName !== 'object' && el.localName !== 'embed') return false;
+    try { return Boolean(el.contentDocument || (typeof el.getSVGDocument === 'function' && el.getSVGDocument())); } catch (e) { return false; }
+  };
+
   const scanImages = (win, root, base) => {
     for (const el of root.querySelectorAll(IMAGE_ELEMENTS)) {
       const src = elementImageUrl(el);
-      if (src && !ftIsHidden(el)) addImage(src, resolveUrl(src, base), el.localName, cssPath(el));
+      const resolved = src ? resolveUrl(src, base) : '';
+      if (!resolved || seenUrls.has(resolved) || ftIsHidden(el) || showsDocument(el)) continue;
+      addImage(src, resolved, el.localName, cssPath(el));
     }
+    if (!styles) return;
     for (const el of root.querySelectorAll('*')) {
       if (!ftIsHidden(el)) scanStyleImages(win, el, base);
     }
@@ -284,30 +399,45 @@ _SCAN_PAGE_BODY = r"""
     for (const canvas of root.querySelectorAll('canvas')) {
       if (ftIsHidden(canvas)) continue;
       const types = canvas.__ftContextTypes || [];
-      if (types.some(t => t === 'webgl' || t === 'webgl2' || t === 'experimental-webgl')) {
+      if (types.some(t => t === 'webgl' || t === 'webgl2' || t === 'experimental-webgl') && firstReport(canvas, 'Webgl')) {
         result.webglCanvases.push(cssPath(canvas));
       }
-      if (canvas.__ftOffscreen) result.offscreenCanvases.push(cssPath(canvas));
+      if (canvas.__ftOffscreen && firstReport(canvas, 'Offscreen')) result.offscreenCanvases.push(cssPath(canvas));
     }
     for (const frame of root.querySelectorAll('iframe, frame')) {
       if (ftIsHidden(frame)) continue;
       let accessible = false;
       try { accessible = !!frame.contentDocument; } catch (e) { accessible = false; }
-      if (!accessible) result.crossOriginFrames.push(frame.getAttribute('src') || frame.src || '(no src)');
+      if (!accessible && firstReport(frame, 'Frame')) result.crossOriginFrames.push(frame.getAttribute('src') || frame.src || '(no src)');
     }
   };
 
-  for (const { win, root } of ftScopes(window, true)) {
+  const scanWorkers = (win) => {
+    for (const worker of win.__ftWorkers || []) {
+      if (worker.reported) continue;
+      worker.reported = true;
+      result.workers.push({ kind: worker.kind, url: worker.url });
+    }
+  };
+
+  const scopes = ftScopes(window, walk);
+  for (const { win, root } of scopes) {
     if (root.nodeType === 11) result.shadowRoots++;  // 11: a shadow root
     const base = (root.nodeType === 9 ? root : root.ownerDocument).baseURI;  // 9: a document
     scanImages(win, root, base);
     scanCanvasesAndFrames(root);
     result.videos += root.querySelectorAll('video').length;
   }
+  for (const win of new Set(scopes.map((scope) => scope.win))) scanWorkers(win);
   return result;
 """
 
-SCAN_PAGE_JS = "() => {\n" + PAGE_HELPERS_JS + _SCAN_PAGE_BODY + "}\n"
+SCAN_PAGE_JS = "(options) => {\n" + PAGE_HELPERS_JS + _SCAN_PAGE_BODY + "}\n"
+
+#: Arguments of ``SCAN_PAGE_JS``: the first scan, the per-frame element scan and the once-a-second full scan.
+FIRST_SCAN = {"styles": True, "walk": True}
+ELEMENT_SCAN = {"styles": False, "walk": False}
+FULL_SCAN = {"styles": True, "walk": False}
 
 
 # ------------------------------------------------------------------------------- reading image bytes
@@ -378,7 +508,7 @@ def _read_image_head(page: Any, url: str, limit: int, local_ok: bool) -> bytes |
             # A Range header asks the server for the head only; servers that ignore it send the whole
             # body, which is sliced below, so the result is the same either way.
             response = page.request.get(
-                url, headers={"Range": f"bytes=0-{limit - 1}"}, timeout=5000, fail_on_status_code=False
+                url, headers={"Range": f"bytes=0-{limit - 1}"}, timeout=IMAGE_READ_TIMEOUT_MS, fail_on_status_code=False
             )
             return response.body()[:limit]
     except Exception:  # unreadable image: nothing to classify, reported by the caller as a note
@@ -395,44 +525,108 @@ def _classify_image(page: Any, image: dict[str, str], local_ok: bool) -> tuple[s
     if head is None:
         # Safe direction, as for large GIFs below: bytes we could not read could hold an animation.
         return f"image-unverified: {raw}", f"could not read image bytes to check for animation: {raw}"
-    if gif_needs_more_bytes(head, SNIFF_LIMIT):
-        # The first frame of this GIF does not end inside the first 64 KB: read up to 4 MB.
+    if gif_needs_more_bytes(head, SNIFF_LIMIT) or svg_needs_more_bytes(head, SNIFF_LIMIT):
+        # The first frame of this GIF, or this SVG's markup, goes on past the first 64 KB: read up to 4 MB.
         head = _read_image_head(page, url, GIF_SNIFF_LIMIT, local_ok) or head
         if gif_needs_more_bytes(head, GIF_SNIFF_LIMIT):
             # Safe direction: frames beyond 4 MB could animate, so the image counts as uncontrollable.
             return f"gif-unverified: {raw}", f"GIF frames beyond the first {GIF_SNIFF_LIMIT} bytes were not checked: {raw}"
+        if svg_needs_more_bytes(head, GIF_SNIFF_LIMIT):
+            return f"svg-unverified: {raw}", f"SVG markup beyond the first {GIF_SNIFF_LIMIT} bytes was not checked for animation: {raw}"
     kind = sniff_animated_image(head)
     return (f"{kind}: {raw}" if kind is not None else None), None
 
 
-# ------------------------------------------------------------------------------- entry point
+#: Classification results shared by the attempts of one capture, keyed by (URL as written, resolved
+#: URL): a strategy that falls through to the next one does not read the same images again.
+ImageVerdicts = dict[tuple[str, str], tuple[str | None, str | None]]
+
+
+# ------------------------------------------------------------------------------- entry points
+class ContentWatch:
+    """Uncontrollable content of one loaded page: the first scan before frame 0, then later checks.
+
+    ``first_scan`` is ``find_uncontrollable``. ``recheck`` looks again during the frame loop and returns
+    only what is new since the last look (the page remembers which URLs, canvases, frames and workers it
+    has already returned). ``verdicts`` is a classification cache that may be shared between the
+    attempts of one capture. At most ``MAX_IMAGE_URLS`` image URLs are read per page; any beyond count
+    as 'images-unverified'.
+    """
+
+    def __init__(self, allow_local_files: bool = False, verdicts: ImageVerdicts | None = None) -> None:
+        self.allow_local_files = allow_local_files
+        self.verdicts: ImageVerdicts = {} if verdicts is None else verdicts
+        self._seen: set[str] = set()  # resolved image URLs already judged on this page
+        self._read = 0                # how many of them were read (at most MAX_IMAGE_URLS)
+
+    def first_scan(self, page: "Page") -> tuple[list[str], list[str]]:
+        """Scan a freshly loaded page; ``(uncontrollable, notes)`` as for ``find_uncontrollable``."""
+        scan = page.evaluate(SCAN_PAGE_JS, FIRST_SCAN)
+        uncontrollable, notes = self._judge(page, scan)
+        if scan.get("shadowRoots"):
+            notes.append(f"detection searched {scan['shadowRoots']} shadow root(s) (open or closed)")
+        return uncontrollable, notes
+
+    def recheck(self, page: "Page", full: bool, requested_images: Iterable[str] = ()) -> tuple[list[str], list[str]]:
+        """What became uncontrollable since the last look: ``(new entries, notes)``.
+
+        ``full`` adds the computed-style walk for CSS images (costly: strategy A asks once per captured
+        second). ``requested_images`` are image URLs the page fetched meanwhile; they catch a CSS image
+        that comes and goes between two full scans.
+        """
+        scan = page.evaluate(SCAN_PAGE_JS, FULL_SCAN if full else ELEMENT_SCAN)
+        scan["images"] = list(scan["images"]) + [
+            {"raw": url, "resolved": url, "kind": "request", "selector": ""} for url in requested_images
+        ]
+        return self._judge(page, scan)
+
+    def _judge(self, page: "Page", scan: dict[str, Any]) -> tuple[list[str], list[str]]:
+        """Turn one scan result into uncontrollable entries and notes (images first, as the scan lists them)."""
+        uncontrollable, notes = self._judge_images(page, scan["images"])
+        uncontrollable.extend(f"webgl-canvas: {selector}" for selector in scan["webglCanvases"])
+        uncontrollable.extend(f"offscreen-canvas: {selector}" for selector in scan["offscreenCanvases"])
+        uncontrollable.extend(f"cross-origin-iframe: {src}" for src in scan["crossOriginFrames"])
+        uncontrollable.extend(
+            f"{'shared-worker' if worker['kind'] == 'SharedWorker' else 'worker'}: {worker['url']}" for worker in scan.get("workers", [])
+        )
+        return uncontrollable, notes
+
+    def _judge_images(self, page: "Page", images: list[dict[str, str]]) -> tuple[list[str], list[str]]:
+        """Read and classify each image URL not judged before, up to ``MAX_IMAGE_URLS`` per page."""
+        local_ok = local_reads_allowed(page.url, self.allow_local_files)
+        uncontrollable: list[str] = []
+        notes: list[str] = []
+        unread = 0
+        for image in images:
+            if image["resolved"] in self._seen:
+                continue
+            self._seen.add(image["resolved"])
+            if self._read >= MAX_IMAGE_URLS:
+                unread += 1
+                continue
+            self._read += 1
+            key = (image["raw"], image["resolved"])
+            if key not in self.verdicts:
+                self.verdicts[key] = _classify_image(page, image, local_ok)
+            entry, note = self.verdicts[key]
+            uncontrollable.extend([entry] if entry else [])
+            notes.extend([note] if note else [])
+        if unread:
+            # Safe direction, as for an unreadable image: any of them could be animated.
+            uncontrollable.append(f"images-unverified: {unread} image URL(s) beyond the first {MAX_IMAGE_URLS} were not checked for animation")
+            notes.append(f"only the first {MAX_IMAGE_URLS} of {len(self._seen)} image URLs were checked for animation")
+        return uncontrollable, notes
+
+
 def find_uncontrollable(page: "Page", allow_local_files: bool = False) -> tuple[list[str], list[str]]:
     """Scan a loaded page and return ``(uncontrollable, notes)``.
 
-    ``uncontrollable`` entries look like ``"animated-gif: /x.gif"``, ``"webgl-canvas: #c"`` or
-    ``"cross-origin-iframe: https://..."``; ``notes`` records anything the scan could not verify.
-    ``allow_local_files`` is the capture's switch; see ``local_reads_allowed`` for how it is used.
+    ``uncontrollable`` entries look like ``"animated-gif: /x.gif"``, ``"webgl-canvas: #c"``,
+    ``"cross-origin-iframe: https://..."`` or ``"worker: https://.../w.js"``; ``notes`` records anything
+    the scan could not verify. ``allow_local_files`` is the capture's switch; see ``local_reads_allowed``
+    for how it is used. A capture keeps the ``ContentWatch`` instead, to look again later.
     """
-    scan = page.evaluate(SCAN_PAGE_JS)
-    local_ok = local_reads_allowed(page.url, allow_local_files)
-    uncontrollable: list[str] = []
-    notes: list[str] = []
-
-    images = scan["images"]
-    if len(images) > MAX_IMAGE_URLS:
-        notes.append(f"only the first {MAX_IMAGE_URLS} of {len(images)} image URLs were checked for animation")
-        images = images[:MAX_IMAGE_URLS]
-    for image in images:
-        entry, note = _classify_image(page, image, local_ok)
-        uncontrollable.extend([entry] if entry else [])
-        notes.extend([note] if note else [])
-
-    uncontrollable.extend(f"webgl-canvas: {selector}" for selector in scan["webglCanvases"])
-    uncontrollable.extend(f"offscreen-canvas: {selector}" for selector in scan["offscreenCanvases"])
-    uncontrollable.extend(f"cross-origin-iframe: {src}" for src in scan["crossOriginFrames"])
-    if scan.get("shadowRoots"):
-        notes.append(f"detection searched {scan['shadowRoots']} shadow root(s) (open or closed)")
-    return uncontrollable, notes
+    return ContentWatch(allow_local_files).first_scan(page)
 
 
 def local_path_from_url(url: str) -> Path | None:

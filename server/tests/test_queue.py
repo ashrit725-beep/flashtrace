@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import signal
 import threading
 import time
@@ -13,10 +15,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 from cli import audit as cli_audit
-from cli.jobs import AuditSettings, new_job_dir, read_meta, update_meta, write_meta
+from cli.jobs import AuditSettings, jobs_root, list_jobs, new_job_dir, read_meta, update_meta, write_meta
 from cli.report import write_report
+from server import runner as runner_module
 from server.app import build_uvicorn_server, create_app
 from server.jobs import (
+    DELETED_MARKER_NAME,
     FOLLOW_UP_BACKUP_DIR_NAME,
     RUN_DIR_NAME,
     STATUS_WRITER_KEY,
@@ -25,6 +29,7 @@ from server.jobs import (
     JobStore,
     adopt_run,
     backup_follow_up_files,
+    delete_job_files,
     phase_for,
     queue_label,
     record_from_disk,
@@ -502,3 +507,111 @@ def test_record_from_disk_never_shows_done_with_phase_error(work_dir: Path) -> N
     update_meta(path, phase="error", error=STOPPED_DURING)  # what the old recovery left in a CLI job
     record = record_from_disk(path)
     assert record is not None and (record.status, record.phase) == ("done", "done")
+
+
+# ------------------------------------------------------------------------------------ deleting for good
+def test_delete_of_a_running_job_survives_a_server_stop(make_client, client: TestClient, work_dir: Path,
+                                                        monkeypatch: pytest.MonkeyPatch) -> None:
+    """The runner removes a running job's folder only after the task stops.  When the server stops
+    before that (a step that never calls back, then Ctrl-C), the next start must finish the deletion."""
+    started, release = threading.Event(), threading.Event()
+
+    def never_answers(target: str, settings: AuditSettings, work_dir: Path | None = None, **_ignored):
+        started.set()  # like page.goto on a server that accepts the connection and never answers
+        release.wait(30)
+        raise RuntimeError("page.goto: Timeout 30000ms exceeded")
+
+    monkeypatch.setattr(cli_audit, "run_audit", never_answers)
+    job_id = submit(client, url="https://example.test/never-answers")
+    assert started.wait(30)
+    assert client.delete(f"/jobs/{job_id}").status_code == 204
+    folder = job_dir(work_dir, job_id)
+    assert (folder / DELETED_MARKER_NAME).is_file()  # what a server stop at this moment leaves on disk
+    try:
+        restarted = make_client()  # reads the work directory as the stopped server left it
+        assert restarted.get(f"/jobs/{job_id}").status_code == 404
+        assert all(summary["id"] != job_id for summary in restarted.get("/jobs").json())
+        assert not folder.exists()
+    finally:
+        release.set()
+
+
+def test_deleting_a_folder_takes_it_out_of_every_listing_before_removing_its_files(
+        work_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    folder = interrupted_job(work_dir, "done", "done")
+    with monkeypatch.context() as patched:
+        patched.setattr(shutil, "rmtree", lambda *args, **kwargs: None)  # removing the files fails
+        delete_job_files(folder)
+    assert not folder.exists()
+    assert list_jobs(work_dir) == []  # neither the server nor `flashtrace` lists it any more
+    assert JobStore(work_dir).newest_first() == []  # and the next start removes the leftover
+    assert list(jobs_root(work_dir).iterdir()) == []
+
+
+# ------------------------------------------------------------------------------------ the runner survives
+def test_a_status_that_cannot_be_written_does_not_stop_the_runner(work_dir: Path, pipeline: FakePipeline,
+                                                                  monkeypatch: pytest.MonkeyPatch) -> None:
+    """The audit fails with a full disk, and the job folder cannot take meta.json any more either."""
+    def full_disk(target: str, settings: AuditSettings, work_dir: Path | None = None, **_ignored):
+        if target.endswith("/first"):
+            os.chmod(Path(work_dir).parent, 0o555)  # work_dir is <job>/run; <job> becomes read-only
+            raise OSError(28, "No space left on device")
+        return pipeline.run_audit(target, settings, work_dir=work_dir)
+
+    monkeypatch.setattr(cli_audit, "run_audit", full_disk)
+    store = JobStore(work_dir)
+    runner = Runner(store)
+    first = store.create("https://example.test/first", AuditSettings(duration_s=2.0))
+    second = store.create("https://example.test/second", AuditSettings(duration_s=2.0))
+    try:
+        runner.submit(Task(first, "audit"))
+        runner.submit(Task(second, "audit"))
+        wait_until(lambda: second.status == "done")
+    finally:
+        os.chmod(first.job_dir, 0o755)
+        runner.stop()
+    assert (first.status, first.error) == ("error", "The audit failed (OSError: [Errno 28] No space left on device).")
+    assert read_meta(first.job_dir)["status"] == "running"  # the disk could not take "error"; memory has it
+
+
+def test_the_runner_survives_a_failure_to_record_how_a_task_ended(work_dir: Path, pipeline: FakePipeline,
+                                                                  monkeypatch: pytest.MonkeyPatch) -> None:
+    real_run_task, calls = runner_module.run_task, []
+
+    def fails_once(store: JobStore, task: Task) -> None:
+        calls.append(task.record.id)
+        if len(calls) == 1:
+            raise RuntimeError("could not record the outcome")
+        real_run_task(store, task)
+
+    monkeypatch.setattr(runner_module, "run_task", fails_once)
+    store = JobStore(work_dir)
+    runner = Runner(store)
+    first = store.create("https://example.test/first", AuditSettings(duration_s=2.0))
+    second = store.create("https://example.test/second", AuditSettings(duration_s=2.0))
+    runner.submit(Task(first, "audit"))
+    runner.submit(Task(second, "audit"))
+    wait_until(lambda: second.status == "done")
+    runner.stop()
+    assert (first.status, first.error) == ("error", "The audit failed (RuntimeError: could not record the outcome).")
+
+
+def test_submit_starts_a_new_worker_when_the_old_one_has_ended(work_dir: Path, pipeline: FakePipeline) -> None:
+    store = JobStore(work_dir)
+    runner = Runner(store)
+    ended = threading.Thread(target=lambda: None)
+    ended.start()
+    ended.join()
+    runner._thread = ended  # as if an earlier worker thread had died
+    record = store.create("https://example.test/", AuditSettings(duration_s=2.0))
+    runner.submit(Task(record, "audit"))
+    wait_until(lambda: record.status == "done")
+    runner.stop()
+
+
+def test_a_damaged_meta_json_keeps_the_status_in_memory(work_dir: Path) -> None:
+    store = JobStore(work_dir)
+    record = store.create("https://example.test/", AuditSettings())
+    (record.job_dir / "meta.json").write_text("{not json", encoding="utf-8")
+    store.mark_error(record, "The audit failed (X).")  # must not raise
+    assert (record.status, record.error) == ("error", "The audit failed (X).")

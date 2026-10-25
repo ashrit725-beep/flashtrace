@@ -47,7 +47,7 @@ def test_exit_codes() -> None:
 def test_missing_file_is_one_line_exit_2(tmp_path: Path) -> None:
     result = flashtrace("audit", str(tmp_path / "missing.html"), work_dir=tmp_path)
     assert result.returncode == 2
-    assert len(stderr_lines(result)) == 1
+    assert stderr_lines(result)[1:] == [DISCLAIMER]  # one error line, then the disclaimer
     assert stderr_lines(result)[0].startswith("error: ") and "missing.html" in result.stderr
     assert "Traceback" not in result.stderr and result.stdout == ""
     assert not (tmp_path / "jobs").exists()
@@ -60,7 +60,7 @@ def test_unknown_attribute_value_exits_2(tmp_path: Path) -> None:
 
 def test_bad_viewport_exits_2(tmp_path: Path) -> None:
     result = flashtrace("audit", str(PAGES / "static.html"), "--viewport", "wide", work_dir=tmp_path)
-    assert result.returncode == 2 and len(stderr_lines(result)) == 1 and "viewport" in result.stderr
+    assert result.returncode == 2 and stderr_lines(result)[1:] == [DISCLAIMER] and "viewport" in result.stderr
 
 
 def test_huge_duration_exits_2_before_any_job(tmp_path: Path) -> None:
@@ -82,8 +82,46 @@ def test_find_attributor_is_capture_attribute() -> None:
 
 def test_fix_with_a_missing_report_is_one_line_exit_2(tmp_path: Path) -> None:
     fix = flashtrace("fix", str(tmp_path / "report.json"), "--apply", "1", "--verify", work_dir=tmp_path)
-    assert fix.returncode == 2 and len(stderr_lines(fix)) == 1
+    assert fix.returncode == 2 and stderr_lines(fix)[1:] == [DISCLAIMER]
     assert stderr_lines(fix)[0].startswith("error: cannot read report") and "Traceback" not in fix.stderr
+
+
+def test_every_error_exit_ends_with_the_disclaimer(tmp_path: Path) -> None:
+    # SPEC: every report and screen carries the disclaimer; an error screen is a screen.  fail() exits for
+    # audit, fix and bench; a bad option value is one of Click's own usage errors.
+    failures = [
+        flashtrace("audit", str(tmp_path / "missing.html"), work_dir=tmp_path),
+        flashtrace("fix", str(tmp_path / "missing.json"), work_dir=tmp_path),
+        flashtrace("bench", "--n", "0", "--quiet", work_dir=tmp_path),
+    ]
+    for result in failures:
+        assert result.returncode == 2, result.stderr
+        assert stderr_lines(result)[0].startswith("error: ") and stderr_lines(result)[1:] == [DISCLAIMER]
+    usage = flashtrace("audit", str(PAGES / "static.html"), "--attribute", "nonsense", work_dir=tmp_path)
+    assert usage.returncode == 2 and "nonsense" in usage.stderr and stderr_lines(usage)[-1] == DISCLAIMER
+    assert usage.stderr.count(DISCLAIMER) == 1
+
+
+def test_demo_prints_the_disclaimer_before_serving_and_after(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The demo runs until Ctrl-C: the disclaimer must be on screen while it serves, not only afterwards.
+    def fake_serve(port: int) -> None:
+        print(f"serving on {port}", file=sys.stderr)
+
+    monkeypatch.setattr("cli.main.load_demo_server", lambda: fake_serve)
+    result = CliRunner().invoke(app, ["demo", "--port", "9999"])
+    assert result.exit_code == 0, result.output
+    assert [line for line in result.output.splitlines() if line] == [DISCLAIMER, "serving on 9999", DISCLAIMER]
+
+
+def test_demo_start_error_is_one_line_then_the_disclaimer(monkeypatch: pytest.MonkeyPatch) -> None:
+    def busy_port(port: int) -> None:
+        raise OSError(48, "Address already in use")
+
+    monkeypatch.setattr("cli.main.load_demo_server", lambda: busy_port)
+    result = CliRunner().invoke(app, ["demo"])
+    assert result.exit_code == 2
+    lines = [line for line in result.output.splitlines() if line]
+    assert lines == [DISCLAIMER, "error: [Errno 48] Address already in use", DISCLAIMER]
 
 
 def test_serve_passes_its_options_to_server_app(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -95,6 +133,8 @@ def test_serve_passes_its_options_to_server_app(monkeypatch: pytest.MonkeyPatch,
     result = CliRunner().invoke(app, ["serve", "--port", "8123", "--work-dir", str(tmp_path), "--allow-local-files"])
     assert result.exit_code == 0, result.output
     assert calls == [{"port": 8123, "work_dir": tmp_path, "allow_local_files": True}]
+    # Printed when the server starts (it runs until Ctrl-C) and again when it stops.
+    assert [line for line in result.output.splitlines() if line] == [DISCLAIMER, DISCLAIMER]
     defaults = CliRunner().invoke(app, ["serve"])
     assert defaults.exit_code == 0 and calls[-1] == {"port": 8001, "work_dir": None, "allow_local_files": False}
 

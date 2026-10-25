@@ -36,6 +36,8 @@ class NetworkTracker:
         self._in_flight: dict[Any, tuple[str, float]] = {}
         # URLs given up on since the last call to take_abandoned()
         self._abandoned: list[str] = []
+        # URLs of image requests started since the last call to take_image_requests()
+        self._images: list[str] = []
 
     def attach(self, page: Any) -> None:
         """Start listening to ``page`` (call before it navigates, so load requests are seen too)."""
@@ -45,6 +47,8 @@ class NetworkTracker:
 
     def _started(self, request: Any) -> None:
         self._in_flight[request] = (request.url, time.monotonic())
+        if getattr(request, "resource_type", None) == "image":
+            self._images.append(request.url)
 
     def _ended(self, request: Any) -> None:
         self._in_flight.pop(request, None)
@@ -78,3 +82,8 @@ class NetworkTracker:
         """URLs given up on since the previous call (each URL is reported once)."""
         abandoned, self._abandoned = self._abandoned, []
         return abandoned
+
+    def take_image_requests(self) -> list[str]:
+        """URLs of the image requests (``<img>``, CSS images, ...) the page started since the previous call."""
+        images, self._images = self._images, []
+        return images

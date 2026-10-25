@@ -7,10 +7,11 @@ proven equal to the obvious definition.  The qualifying-event tests use the
 real 1024x768 grid (256x192 cells) and the real 341x256 px window (85x64
 cells = 5440 cells, so 25% is exactly 1360 cells).
 
-Event rule under test (SPEC 5.6, ADR-019): E[t] = M[t-1] | M[t] is scored for
-area_max; an event counted at frame t claims the completions of frames t and
-t+1, and a later frame is scored again using only the completions no earlier
-event has claimed.
+Event rule under test (SPEC 5.6, ADR-019, ADR-038): E[t] = M[t-1] | M[t] is
+scored for area_max; an event counted at frame t claims the completions of
+frames t and t+1, and a later frame is scored again using only the completions
+no earlier event has claimed (the claim rule, ADR-038).  Masks may also hold
+pixel counts per cell (ADR-002 as amended), tested at the end of this file.
 """
 from __future__ import annotations
 
@@ -334,7 +335,7 @@ def test_count_events_with_zero_tolerance_counts_every_qualifying_frame() -> Non
 
 
 def test_one_flash_completing_over_two_neighbouring_frames_is_one_event() -> None:
-    """ADR-019 as amended: a smooth flash whose cells reach their extreme byte one frame apart completes
+    """ADR-038 (claim rule): a smooth flash whose cells reach their extreme byte one frame apart completes
     1400 cells at frame 3 and 1400 other cells at frame 4.  Frames 3, 4 and 5 all exceed 25%, but it is
     one flash: counted once, at 3 (the old ceil(n/2) rule counted it twice, at 3 and 5)."""
     masks = _frames(8)
@@ -359,7 +360,7 @@ def test_claimed_completions_are_not_scored_again() -> None:
 
 
 def test_two_regions_qualifying_on_consecutive_frames_count_once() -> None:
-    """ADR-019 as amended, the recorded trade-off: two separate regions, each over 25% on its own, that
+    """ADR-038, the recorded trade-off: two separate regions, each over 25% on its own, that
     complete one frame apart are counted as one event, as under ADR-006."""
     masks = _frames(6)
     masks[2] = _region(1400, 0, 0)
@@ -530,3 +531,65 @@ def test_window_sizes_round_halves_up() -> None:
     assert window_cells_full(1032)[0] == 65
     # 256 * 1026 / 1024 = 256.5 px -> 257 px.
     assert window_px(1026)[1] == 257
+
+
+# ---------------------------------------------------------------------------
+# Pixel counts per cell (SPEC 5.6, ADR-002 as amended)
+# ---------------------------------------------------------------------------
+
+_P = 16  # pixels in a 4x4 cell
+
+
+def test_area_counts_pixels_not_whole_cells() -> None:
+    """ADR-002 as amended: 1360 full cells plus a column of 64 half-covered cells is 1360 + 32 cells of
+    pixels: 25.6% of the window, where counting every touched cell as whole would give 26.2%."""
+    masks = np.zeros((3, CY, CX), dtype=np.uint8)
+    masks[1, 0:64, 0:21] = _P          # 21 x 64 = 1344 full cells
+    masks[1, 0:16, 21] = _P            # + 16 full cells = 1360 (exactly 25%)
+    masks[1, 0:64, 22] = _P // 2       # + a column of half-covered cells (32 cells of pixels)
+    res = qualifying_events(masks, WY, WX, pixels_per_cell=_P)
+    assert res.area_max[1] == (1360 * _P + 64 * _P // 2) / (WINDOW_CELLS * _P)
+    assert np.flatnonzero(res.qualifying).tolist() == [1]
+
+
+def test_exactly_25_percent_of_the_pixels_does_not_qualify() -> None:
+    """SPEC T4 in pixels: 1359 full cells plus one cell's worth of pixels spread over two
+    half-covered cells is exactly 25% and passes; one more pixel qualifies."""
+    masks = np.zeros((2, CY, CX), dtype=np.uint8)
+    masks[0, 0:27, 0:50] = _P          # 1350 full cells
+    masks[0, 27, 0:9] = _P             # 1359
+    masks[0, 27, 9:11] = _P // 2       # + 16 pixels = 1360 cells of pixels
+    assert not qualifying_events(masks, WY, WX, pixels_per_cell=_P).qualifying_raw.any()
+    masks[0, 27, 11] = 1
+    assert qualifying_events(masks, WY, WX, pixels_per_cell=_P).qualifying_raw[0]
+
+
+def test_union_of_pixel_counts_adds_and_caps_at_the_cell_size() -> None:
+    """SPEC 5.6 step 1 in pixels: different pixels complete at t-1 and t, so the union is the sum,
+    capped at the 16 pixels of a cell; a bool mask stays a plain OR."""
+    masks = np.zeros((3, 1, 2), dtype=np.uint8)
+    masks[0, 0] = [5, 16]
+    masks[1, 0] = [6, 16]
+    events = union_with_previous_frames(masks, 1, pixels_per_cell=_P)
+    assert events[:, 0, :].tolist() == [[5, 16], [11, 16], [6, 16]]
+    bools = union_with_previous_frames(masks > 0, 1)
+    assert bools[:, 0, :].tolist() == [[1, 1], [1, 1], [1, 1]]
+
+
+def test_pixel_count_masks_are_checked() -> None:
+    """Contract: masks are bool or whole counts 0..pixels_per_cell."""
+    with pytest.raises(ValueError):
+        qualifying_events(np.full((1, CY, CX), 17, dtype=np.uint8), WY, WX, pixels_per_cell=_P)
+    with pytest.raises(ValueError):
+        qualifying_events(np.full((1, CY, CX), 0.5), WY, WX, pixels_per_cell=_P)
+
+
+def test_one_pixel_per_cell_counts_match_bool_masks() -> None:
+    """A bool mask is the special case of one pixel per cell: the same masks as 0/1 counts score alike."""
+    masks = _frames(8)
+    masks[3] = _region(1400, 0, 0)
+    masks[4] = _region(1400, 0, 40)
+    as_bool = qualifying_events(masks, WY, WX)
+    as_counts = qualifying_events(masks.astype(np.uint8), WY, WX, pixels_per_cell=1)
+    assert np.array_equal(as_bool.area_max, as_counts.area_max)
+    assert np.array_equal(as_bool.qualifying, as_counts.qualifying)

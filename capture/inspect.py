@@ -269,6 +269,9 @@ class InspectStrategy(WaapiStepStrategy):
     called before every step and frame and stops the walk by raising.
     """
 
+    # Inspection takes no screenshots, so a web font that never arrives does not stop it.
+    pictures_wait_for_fonts = False
+
     def __init__(self, targets: list[InspectTarget], lead_in_ms: int = 0,
                  cancel_check: Callable[[], None] | None = None) -> None:
         super().__init__()

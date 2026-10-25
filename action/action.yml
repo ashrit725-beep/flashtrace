@@ -51,7 +51,7 @@ outputs:
     description: "One-sentence reason from the report."
     value: ${{ steps.read.outputs.reason }}
   exit-code:
-    description: "FlashTrace exit code: 0 PASS, 1 FAIL/INCONCLUSIVE, 2 error."
+    description: "FlashTrace exit code: 0 PASS, 1 FAIL, 2 error; INCONCLUSIVE is 1, or 0 when fail-on-inconclusive is false."
     value: ${{ steps.audit.outputs.code }}
 
 runs:

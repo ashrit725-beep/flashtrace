@@ -7,10 +7,12 @@
                                              list a report's fixes, print fix N's CSS, or verify it
     flashtrace serve [--port 8001]           run the local web server (loopback only)
 
-Human-readable output goes to stderr and always ends with the disclaimer; stdout carries only the JSON
-report (audit --json) or the CSS of one fix (fix --apply N).  Exit codes (SPEC 6.4): 0 PASS, 1 FAIL,
+Human-readable output goes to stderr and always ends with the disclaimer: DisclaimerGroup.main prints it
+after every invocation, whatever happened (normal end, error exit, Click's own usage errors, --help,
+Ctrl-C); the long-running ``demo`` and ``serve`` also print it when they start.  stdout carries only the
+JSON report (audit --json) or the CSS of one fix (fix --apply N).  Exit codes (SPEC 6.4): 0 PASS, 1 FAIL,
 1 INCONCLUSIVE (0 with --no-fail), 2 error; ``fix --verify``: 0 verified, 1 not verified, 2 error.
-Errors are one line; --debug adds the traceback.
+Errors are one line (then the disclaimer); --debug adds the traceback.
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional, TextIO
 
 import typer
+from typer.core import TyperGroup
 
 from cli.jobs import AuditSettings, parse_viewport
 from cli.report import DISCLAIMER, FIX_NOTE_PREFIX
@@ -31,7 +34,30 @@ from cli.report import DISCLAIMER, FIX_NOTE_PREFIX
 EXIT_ERROR = 2
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+
+def say(text: str = "") -> None:
+    """One line of human output (stderr, so stdout stays clean for --json)."""
+    print(text, file=sys.stderr, flush=True)
+
+
+class DisclaimerGroup(TyperGroup):
+    """Typer's command group, plus one rule: every invocation's human output ends with the disclaimer.
+
+    Click finishes every invocation inside ``main``: a command's normal end, its error exit (fail()),
+    Click's own usage errors (printed before Click exits), --help and Ctrl-C all leave through the
+    ``finally`` below, so no command can forget the disclaimer on any path (SPEC: "Every report, HTML
+    export and screen carries the disclaimer").
+    """
+
+    def main(self, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return super().main(*args, **kwargs)
+        finally:
+            say(DISCLAIMER)
+
+
 app = typer.Typer(
+    cls=DisclaimerGroup,
     add_completion=False,
     no_args_is_help=True,
     pretty_exceptions_enable=False,
@@ -57,13 +83,11 @@ class Strategy(str, Enum):
     realtime = "realtime"
 
 
-def say(text: str = "") -> None:
-    """One line of human output (stderr, so stdout stays clean for --json)."""
-    print(text, file=sys.stderr, flush=True)
-
-
 def fail(exc: BaseException | str, debug: bool) -> typer.Exit:
-    """Print a one-line error (and the traceback with --debug); return the exit to raise."""
+    """Print a one-line error (and the traceback with --debug); return the exit to raise.
+
+    The disclaimer follows the error line: DisclaimerGroup.main prints it when the exit leaves Click.
+    """
     if debug and isinstance(exc, BaseException):
         traceback.print_exception(exc, file=sys.stderr)
     message = str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
@@ -152,7 +176,6 @@ def audit(
         sys.stdout.flush()
     for line in summary_lines(report, job_dir, out, html):
         say(line)
-    say(DISCLAIMER)
     raise typer.Exit(code=code)
 
 
@@ -168,12 +191,11 @@ def load_demo_server() -> Callable[..., None]:
 @app.command()
 def demo(port: int = typer.Option(8765, "--port", help="TCP port on 127.0.0.1.")) -> None:
     """Serve the demo site (it flashes on purpose; the start page is a warning)."""
+    say(DISCLAIMER)  # first, so it is on screen with the server's banner for as long as the server runs
     try:
         load_demo_server()(port=port)
     except Exception as exc:  # noqa: BLE001
         raise fail(exc, debug=False) from None
-    finally:
-        say(DISCLAIMER)
 
 
 @app.command()
@@ -213,7 +235,6 @@ def bench(
         raise fail(exc, debug) from None
     for line in results["summaryLines"]:
         say(line)
-    say(DISCLAIMER)
 
 
 def measurement_line(name: str, measured: dict[str, Any] | None) -> str:
@@ -322,7 +343,6 @@ def fix(
             code = verify_and_report(report, data, apply, work_dir)
     except Exception as exc:  # noqa: BLE001 - one line and exit 2
         raise fail(exc, debug) from None
-    say(DISCLAIMER)
     raise typer.Exit(code=code)
 
 
@@ -335,14 +355,13 @@ def serve(
     debug: bool = typer.Option(False, "--debug", help="Show tracebacks on errors."),
 ) -> None:
     """Run the local web server and viewer on 127.0.0.1 (one audit at a time)."""
+    say(DISCLAIMER)  # first, so it is on screen with the server's banner for as long as the server runs
     try:
         from server.app import serve as run_server  # imported here: FastAPI is not needed by the other commands
 
         run_server(port=port, work_dir=work_dir, allow_local_files=allow_local_files)
     except Exception as exc:  # noqa: BLE001
         raise fail(exc, debug) from None
-    finally:
-        say(DISCLAIMER)
 
 
 if __name__ == "__main__":

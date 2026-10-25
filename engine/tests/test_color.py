@@ -16,6 +16,7 @@ from hypothesis import strategies as st
 
 from engine.color import (
     SRGB8_TO_LINEAR,
+    is_near_black,
     legacy_red_value,
     linear_to_srgb,
     redness_ratio,
@@ -314,6 +315,33 @@ def test_uv_black_guard_is_elementwise() -> None:
     assert uv[1, 1] == pytest.approx(_RED_UV[1], abs=_UV_TOL)
 
 
+def test_near_black_colours_have_the_white_point_chromaticity() -> None:
+    """ADR-020 as amended: a colour whose channels are all below 16 looks black, so it gets the D65 white
+    point exactly like black (ADR-011).  (16, 0, 0) shows a red hue and keeps red chromaticity; a dark
+    colour with one channel at 16 or more keeps its own chromaticity too."""
+    for colour in [(1, 0, 0), (6, 0, 0), (15, 0, 0), (15, 15, 15), (0, 15, 9)]:
+        np.testing.assert_array_equal(uv_chromaticity(_lin(*colour)), np.array(D65_UV, dtype=np.float64))
+    assert uv_chromaticity(_lin(16, 0, 0))[0] == pytest.approx(_RED_UV[0], abs=_UV_TOL)
+    assert uv_chromaticity(_lin(16, 0, 0))[1] == pytest.approx(_RED_UV[1], abs=_UV_TOL)
+    assert not np.array_equal(uv_chromaticity(_lin(0, 16, 0)), np.array(D65_UV, dtype=np.float64))
+
+
+def test_is_near_black_needs_every_channel_below_the_floor() -> None:
+    """ADR-020 as amended: near-black means R8, G8 and B8 are ALL below RED_MIN_R8 (16)."""
+    rgb8 = np.array([[15, 15, 15], [16, 0, 0], [0, 0, 16], [0, 0, 0], [0, 15, 3]], dtype=np.float64)
+    assert is_near_black(rgb8).tolist() == [True, False, False, True, True]
+    assert RED_MIN_R8 == 16
+
+
+def test_uv_and_ratio_accept_precomputed_whole_values() -> None:
+    """cells.cell_signals passes the whole 0..255 values it already computed; results are identical."""
+    rgb = np.stack([_lin(6, 0, 0), _lin(150, 0, 0), _lin(0, 0, 0), _lin(20, 200, 90), _lin(204, 51, 0)])
+    rgb8 = srgb8_from_linear(rgb)
+    np.testing.assert_array_equal(uv_chromaticity(rgb, rgb8), uv_chromaticity(rgb))
+    np.testing.assert_array_equal(redness_ratio(rgb, rgb8), redness_ratio(rgb))
+    np.testing.assert_array_equal(legacy_red_value(rgb, rgb8), legacy_red_value(rgb))
+
+
 def test_red_to_black_uv_distance_exceeds_0_2_but_red_to_orange_does_not() -> None:
     """ADR-011: red<->black is 0.259 (> 0.2, a red transition); red<->orange (255,128,0) is 0.13."""
     red = uv_chromaticity(_lin(255, 0, 0))
@@ -481,3 +509,51 @@ def test_half_black_half_white_cell_is_l_0_5_not_the_byte_average() -> None:
     # three luminance coefficients add up to 1 for a grey.
     byte_average_l = ((0.5 + 0.055) / 1.055) ** 2.4
     assert byte_average_l == pytest.approx(0.214, abs=5e-4)
+
+
+# ---------------------------------------------------------------------------
+# Pixel blocks and per-pixel measures (SPEC 5.4, ADR-002 as amended)
+# ---------------------------------------------------------------------------
+
+
+def test_pixel_blocks_put_each_cells_pixels_in_one_row() -> None:
+    """Cell i = y * cells_x + x holds the pixels of rows 4y..4y+3, columns 4x..4x+3, row by row;
+    the pixels past the last whole cell (here column 8 and row 4) are dropped."""
+    from engine.cells import pixel_blocks
+
+    frame = np.zeros((5, 9, 3), dtype=np.uint8)
+    frame[..., 0] = np.arange(5)[:, None]   # red channel = pixel row
+    frame[..., 1] = np.arange(9)[None, :]   # green channel = pixel column
+    blocks = pixel_blocks(frame)
+    assert blocks.shape == (2, 16, 3) and blocks.dtype == np.uint8
+    for cell in range(2):
+        for j in range(16):
+            assert blocks[cell, j, 0] == j // 4
+            assert blocks[cell, j, 1] == cell * 4 + j % 4
+
+
+def test_pixel_measures_match_the_cell_signals_of_a_one_colour_cell() -> None:
+    """A cell of one colour measures the same per pixel as through its cell mean (SPEC 5.3)."""
+    from engine.cells import (
+        cell_signals,
+        frame_to_cells,
+        measure_general,
+        measure_red_legacy,
+        measure_red_wcag22,
+    )
+
+    colours = [(0, 0, 0), (255, 0, 0), (204, 51, 0), (6, 0, 0), (127, 127, 127), (30, 200, 90)]
+    frame = np.zeros((4, 4 * len(colours), 3), dtype=np.uint8)
+    for i, colour in enumerate(colours):
+        frame[:, 4 * i:4 * i + 4] = colour
+    cells = cell_signals(frame_to_cells(frame))
+    pixels = np.array(colours, dtype=np.uint8)
+    L, _ = measure_general(pixels)
+    ratio, uv = measure_red_wcag22(pixels)
+    rv, legacy_aux = measure_red_legacy(pixels)
+    np.testing.assert_allclose(L, cells.L, rtol=0, atol=1e-15)
+    np.testing.assert_array_equal(ratio, cells.ratio)
+    np.testing.assert_allclose(uv["u"], cells.u, rtol=0, atol=1e-12)
+    np.testing.assert_allclose(uv["v"], cells.v, rtol=0, atol=1e-12)
+    np.testing.assert_array_equal(rv, cells.rv)
+    np.testing.assert_array_equal(legacy_aux["ratio"], cells.ratio)

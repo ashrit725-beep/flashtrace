@@ -34,9 +34,9 @@ VIEWPORT_H: int = 768
 # Frames per second of animation time (SPEC 5.1 default).  Frame i is at t = i / FPS.
 FPS: int = 60
 
-# The engine averages 4x4 px cells (SPEC 5.2).  Regions are aligned to this grid so that no
-# cell is half covered: a half-covered cell would average two colours and produce an unplanned
-# third luminance along the region's edge.
+# The engine averages 4x4 px cells (SPEC 5.2).  Regions are aligned to this grid unless a test
+# asks otherwise (grid_aligned=False): an unaligned region half covers the cells along its
+# edges, which is exactly what the translation-invariance tests of the pixel-exact area need.
 CELL_PX: int = 4
 
 # ---------------------------------------------------------------------------------------------
@@ -148,20 +148,29 @@ class Region:
     w: int
     h: int
     colour_at: ColourAt
+    grid_aligned: bool = True  # False lets x, y, w, h fall anywhere, off the 4 px cell grid
 
     def __post_init__(self) -> None:
-        for name in ("x", "y", "w", "h"):
-            if getattr(self, name) % CELL_PX != 0:
-                raise ValueError(f"Region.{name} must be a multiple of {CELL_PX} px")
-        if self.w <= 0 or self.h <= 0:
-            raise ValueError("Region must have a positive width and height")
+        if self.grid_aligned:
+            for name in ("x", "y", "w", "h"):
+                if getattr(self, name) % CELL_PX != 0:
+                    raise ValueError(f"Region.{name} must be a multiple of {CELL_PX} px")
+        if self.x < 0 or self.y < 0 or self.w <= 0 or self.h <= 0:
+            raise ValueError("Region must start inside the page and have a positive width and height")
         if self.x + self.w > VIEWPORT_W or self.y + self.h > VIEWPORT_H:
             raise ValueError("Region does not fit inside the 1024x768 viewport")
 
     @property
     def cells(self) -> int:
-        """How many 4x4 px cells the region covers (exact, because it is grid aligned)."""
+        """How many 4x4 px cells the region covers (exact only for a grid-aligned region)."""
+        if not self.grid_aligned:
+            raise ValueError("an unaligned region covers fractions of cells; use .pixels")
         return (self.w // CELL_PX) * (self.h // CELL_PX)
+
+    @property
+    def pixels(self) -> int:
+        """How many pixels the region covers."""
+        return self.w * self.h
 
 
 def full_screen(colour_at: ColourAt) -> Region:
@@ -226,6 +235,45 @@ def split_pulse_frames(
         frame = np.zeros((VIEWPORT_H, VIEWPORT_W, 3), dtype=np.uint8)
         frame[:, : VIEWPORT_W // 2] = round(peaks[0] * level)
         frame[:, VIEWPORT_W // 2 :] = round(peaks[1] * level)
+        yield frame
+
+
+# ADR-029: frame i shows the page a quarter of the way into its slot, at (i + 1/4) / fps seconds.
+SAMPLE_PHASE: float = 0.25
+
+
+def eased_pulse_level(t_seconds: float, hz: float, phase: float, easing: str) -> float:
+    """0..1 level of a smooth pulse: 0 at the start of each period, 1 half a period later.
+
+    ``phase`` shifts the pulse by that fraction of a period.  ``easing`` is "cosine"
+    (0.5 - 0.5 cos, CSS ease-in-out swinging back and forth) or "quadratic" (a triangle wave
+    0 -> 1 -> 0 passed through the quadratic ease-in-out 2x^2 / 1 - 2(1-x)^2).
+    """
+    x = (t_seconds * hz + phase) % 1.0
+    if easing == "cosine":
+        return 0.5 - 0.5 * math.cos(2 * math.pi * x)
+    if easing != "quadratic":
+        raise ValueError(f"unknown easing {easing!r}")
+    tri = 2 * x if x < 0.5 else 2 - 2 * x
+    return 2 * tri * tri if tri < 0.5 else 1 - 2 * (1 - tri) ** 2
+
+
+def eased_pulse_strip_frames(
+    hz: float, phase: float, n_frames: int, easing: str = "cosine", peak: RGB = (255, 255, 255),
+    size: tuple[int, int] = (VIEWPORT_W, 80), fps: int = FPS,
+) -> Iterator[np.ndarray]:
+    """Frames of a whole page pulsing smoothly between black and ``peak``, sampled as captures are.
+
+    Frame i is the page at (i + SAMPLE_PHASE) / fps (ADR-029), each channel rounded to whole
+    bytes.  The default page is 1024 x 80 px: 20 cell rows, so the clipped 85 x 20-cell window
+    holds 1700 cells, 31% of the full 5440-cell window, and the pulse qualifies on area while a
+    600-frame (10 s) capture stays quick to analyse.
+    """
+    width, height = size
+    for i in range(n_frames):
+        level = eased_pulse_level((i + SAMPLE_PHASE) / fps, hz, phase, easing)
+        frame = np.empty((height, width, 3), dtype=np.uint8)
+        frame[...] = tuple(round(c * level) for c in peak)
         yield frame
 
 

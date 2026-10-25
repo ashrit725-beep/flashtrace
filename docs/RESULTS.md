@@ -1,16 +1,16 @@
 # RESULTS
 
-Written by `flashtrace bench` from one run; nothing on this page is typed by hand. Full per-page results: `/private/tmp/claude-501/-Users-ashrittalluri-my-new-project/770b568b-56bd-49be-84a6-40989ae6934b/scratchpad/bench-wt/docs/RESULTS.json`, written by the same run (its sha256 is in the Run table).
+Written by `flashtrace bench` from one run; nothing on this page is typed by hand. Full per-page results: `docs/RESULTS.json`, written by the same run (its sha256 is in the Run table).
 
 ## Run
 
 | Field | Value |
 |---|---|
-| Date (UTC) | 2026-10-25 01:10:10 UTC |
-| Commit | 8674c95 |
-| Command | `flashtrace bench --n 200 --seed 1 --duration 10 --fps 60 --workers 4 --determinism-sample 20 --attribute none --out /private/tmp/claude-501/-Users-ashrittalluri-my-new-project/770b568b-56bd-49be-84a6-40989ae6934b/scratchpad/bench-wt/docs/RESULTS.md --work-dir /private/tmp/claude-501/-Users-ashrittalluri-my-new-project/770b568b-56bd-49be-84a6-40989ae6934b/scratchpad/bench-wt/.flashtrace/bench` |
+| Date (UTC) | 2026-10-25 23:05:53 UTC |
+| Commit | 808cd30 |
+| Command | `flashtrace bench --n 200 --seed 1 --duration 10 --fps 60 --workers 4 --determinism-sample 20 --attribute bbox --ablate-sample 20 --ablate-duration 4 --out docs/RESULTS.md --work-dir .flashtrace/bench` |
 | Machine | macOS-26.5.1-arm64-arm-64bit-Mach-O; Python 3.14.0; Chromium 153.0.8010.12; 11 CPUs |
-| Per-page results | `/private/tmp/claude-501/-Users-ashrittalluri-my-new-project/770b568b-56bd-49be-84a6-40989ae6934b/scratchpad/bench-wt/docs/RESULTS.json` (sha256 `3bbe7f0a285b076352ab0bc02f21f6351f35e9ef1d91c98c94462ac45e69f4e1`) |
+| Per-page results | `docs/RESULTS.json` (sha256 `bcefad34af797764dcdbdc4ab07503377fd05662e837708d2eab225db3793b70`) |
 
 ## Settings
 
@@ -23,7 +23,7 @@ Written by `flashtrace bench` from one run; nothing on this page is typed by han
 | Viewport | 1024x768 px |
 | Capture strategy | auto |
 | Red-flash rule | wcag22 |
-| Attribution | none |
+| Attribution | bbox |
 | Worker processes | 4 used (4 requested) |
 | Determinism sample | 20 |
 | Truth file | bench/truth.json |
@@ -43,17 +43,17 @@ Clear cases are audited pages that are not near any limit. INCONCLUSIVE counts a
 
 Pages within a small band of a limit (see bench/truth.py). Reported separately and not part of the accuracy above.
 
-Matching the expected verdict: 77/78 (98.7%)
+Matching the expected verdict: 78/78 (100.0%)
 
 |  | got PASS | got FAIL | got INCONCLUSIVE | got ERROR |
 |---|---|---|---|---|
-| expected PASS | 60 | 1 | 0 | 0 |
+| expected PASS | 61 | 0 | 0 | 0 |
 | expected FAIL | 0 | 17 | 0 | 0 |
 
 | Boundary reason | Pages | Matching expected |
 |---|---|---|
-| area fraction within 0.0125 of 0.25 | 55 | 54/55 (98.2%) |
-| flash rate within 0.15 Hz of 3 per second | 20 | 19/20 (95.0%) |
+| area fraction within 0.0125 of 0.25 | 55 | 55/55 (100.0%) |
+| flash rate within 0.15 Hz of 3 per second | 20 | 20/20 (100.0%) |
 | video at area 0.24 / 0.26 (chroma subsampling) | 15 | 15/15 (100.0%) |
 | video with a luminance step of 0.11 or less (lossy codec) | 25 | 25/25 (100.0%) |
 
@@ -77,15 +77,28 @@ Agreement: 56/56 (100.0%)
 
 Only clear pages expected to PASS are scored: the truth marks an advisory only for 2-3 flashes per second, which never fails, and on a failing page the advisory adds nothing.
 
-Agreement: 81/83 (97.6%) (clear pages expected to PASS only)
+Agreement: 83/83 (100.0%) (clear pages expected to PASS only)
 
 ## Attribution
 
-Not measured (attribution: none)
+Main pass, attribution mode bbox, scored on the 56 pages expected to FAIL that FlashTrace also failed.
+
+Top-1 culprit in the truth culprits: 56/56 (100.0%)
+Minimal culprit set: needs ablation (attribution: ablate)
+
+Ablation sample: the first 20 pages that FAILed in the main pass were audited again with attribute ablate at 4 s per capture. Sampled 20; scored 20 (the ones that FAILed again at that duration; 0 did not). This is a small sample, not the whole benchmark.
+
+Top-1 culprit in the truth culprits: 20/20 (100.0%)
+Minimal culprit set correct: 20/20 (100.0%)
+Re-captures per page: mean 3.2, min 1, max 5 (20 pages)
+Wall time per sampled audit, baseline and ablation together (s): mean 100.8, median 101.4, max 156.2 (20 pages)
+Sampled pages: bench-0003, bench-0005, bench-0006, bench-0008, bench-0014, bench-0025, bench-0026, bench-0030, bench-0033, bench-0039, bench-0040, bench-0050, bench-0055, bench-0058, bench-0062, bench-0068, bench-0072, bench-0075, bench-0076, bench-0079
+
+A minimal set counts as correct when every element marked as in the minimal set is a truth culprit, suppressing them leaves at most 1360 flashing cells of the truth elements (25% of the 85 x 64-cell window) or a rate of 3 per second or less, and putting back any one of them makes the page fail again. It is not compared with the truth list for equality: elements that flash in sync can be explained by more than one minimal set.
 
 ## Determinism
 
-Determinism: 9/20 compared pages identical on a second run (frame hashes 9/20, report fingerprints 9/20; a fingerprint is the sha256 of the report without capturedAt).
+Determinism: 20/20 compared pages identical on a second run (frame hashes 20/20, report fingerprints 20/20; a fingerprint is the sha256 of the report without capturedAt).
 
 Not compared: 0 of 20 sampled pages (one of the two runs raised an error or its capture produced fewer than two frames).
 
@@ -95,13 +108,11 @@ Wall time per page in seconds (time.perf_counter) for 10 s of animation at 60 fp
 
 | Stage | Pages | Mean | Median | Min | Max |
 |---|---|---|---|---|---|
-| Capture | 200 | 26.359 | 26.370 | 20.916 | 30.488 |
-| Analysis | 200 | 11.448 | 10.944 | 8.495 | 17.289 |
+| Capture | 200 | 40.249 | 38.324 | 28.664 | 66.002 |
+| Analysis | 200 | 30.281 | 23.604 | 13.848 | 194.761 |
 
 ## Mismatches
 
-| Page | Mechanism | Key parameters | Expected | Got | Reason |
-|---|---|---|---|---|---|
-| bench-0073 | raf | 3 Hz, area 0.259926, dL 0.302318, red yes, boundary | PASS | FAIL (general, red) | General flashes reached 4 per second in a 341x256 px window at frames 61-120 (red flashes also exceeded the limit); WCAG 2.3.1 allows at most 3. |
+None.
 
 Analysis aid, not a compliance certification.

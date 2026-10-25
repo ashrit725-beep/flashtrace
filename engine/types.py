@@ -102,15 +102,15 @@ class TimelineBin:
 class FrameStats:
     """Per-frame numbers, one entry per frame in every array (length T)."""
 
-    general_cells: np.ndarray        # int64: cells completing a general flash at t
-    red_cells: np.ndarray            # int64: cells completing a red flash at t
-    general_area_max: np.ndarray     # float64: best window's share of the full window, E[t] = M[t-1] | M[t]
+    general_cells: np.ndarray        # int64: cells with at least one pixel completing a general flash at t
+    red_cells: np.ndarray            # int64: cells with at least one pixel completing a red flash at t
+    general_area_max: np.ndarray     # float64: best window's share of the full window, in pixels, E[t] = M[t-1] | M[t]
     red_area_max: np.ndarray         # float64
     general_window_y: np.ndarray     # int64: top-left cell of that best window
     general_window_x: np.ndarray     # int64
     red_window_y: np.ndarray         # int64
     red_window_x: np.ndarray         # int64
-    general_qualifying: np.ndarray   # bool: a qualifying general event is counted at t (ADR-019)
+    general_qualifying: np.ndarray   # bool: a qualifying general event is counted at t (ADR-019, ADR-038)
     red_qualifying: np.ndarray       # bool
     general_trailing_1s: np.ndarray  # int64: qualifying general events in [t-fps+1, t]
     red_trailing_1s: np.ndarray      # int64
@@ -175,8 +175,8 @@ class AnalysisResult:
     red_max_rate: int
     qualifying_general: list[int] = field(default_factory=list)  # frames of qualifying general events
     qualifying_red: list[int] = field(default_factory=list)      # frames of qualifying red events
-    # One bool [cells_y, cells_x] per entry of ``violations`` (same order): the cells that flashed in
-    # that violation's events, i.e. the union of the event masks E[t] = M[t-1] | M[t] over its
+    # One bool [cells_y, cells_x] per entry of ``violations`` (same order): the cells in which at least
+    # one pixel flashed in that violation's events, i.e. the union of the event masks E[t] = M[t-1] | M[t] over its
     # ``frame_indices`` (SPEC 5.6 step 1).  Attribution compares element boxes with these cells
     # (SPEC 7).  Not part of to_dict(): the report carries the heatmap instead.
     violation_cells: list[np.ndarray] = field(default_factory=list)

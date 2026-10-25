@@ -20,8 +20,23 @@ stopped from the inside: the capture calls our progress object once per frame (a
 ``phase`` hook between steps), and both raise ``JobCancelled`` as soon as the job has been cancelled.
 ``JobCancelled`` derives from BaseException (like KeyboardInterrupt), so the audit's own handler that
 turns a capture failure into an INCONCLUSIVE report (it catches Exception) lets it through, and the
-capture's ``finally`` blocks close the page and the browser on the way out.  A step that never calls
-back finishes first; the runner then deletes the job's directory.
+capture's ``finally`` blocks close the page and the browser on the way out.  The runner then deletes
+the job's directory.
+
+A page can hang a browser call so that it never calls back (a script that loops forever, a server that
+accepts the connection and never answers).  A ``Watchdog`` thread watches every running task for that:
+
+* a cancelled task (DELETE or server stop) still running ``CANCEL_GRACE_S`` later gets its Chromium
+  processes killed (server/processes.py), and again on every later check while it runs.  The hung call
+  then raises at once, and since the job was cancelled, that failure ends it as cancelled;
+* a task that has not called back for ``STALL_LIMIT_S`` while a browser of its own is running is hung:
+  the watchdog cancels it and kills that browser, and the job ends with ``stall_sentence``.  Work
+  without a browser (the engine's analysis) is computation that always ends, so it is never timed out.
+
+So one hostile page can no longer hold the single runner, and every later job, for ever.
+
+The worker thread itself must never die: if even recording how a task ended fails, ``_work`` still
+ends the job as "error" and goes on, and ``submit`` starts a new worker if the old one is gone.
 
 Stopping the server (Ctrl-C): ``begin_shutdown`` runs the moment the signal arrives (app.serve hooks it
 into uvicorn's signal handler).  A terminal's Ctrl-C also reaches Chromium, which dies at once; the
@@ -32,9 +47,12 @@ after the stop began is not a result, and the job ends as "The server stopped du
 
 from __future__ import annotations
 
+import contextlib
 import inspect
+import logging
 import shutil
 import threading
+import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -42,6 +60,7 @@ from typing import Any
 
 from cli import audit as cli_audit
 from cli.jobs import REPORT_JSON_NAME
+from server.processes import browser_processes, kill_processes
 from server.jobs import (
     RUN_DIR_NAME,
     STOPPED_DURING,
@@ -59,7 +78,19 @@ TASK_KINDS: tuple[str, ...] = ("audit", "ablate", "verify")
 FOLLOW_UP_KINDS: tuple[str, ...] = ("ablate", "verify")  # tasks on a job that is already done
 FAILURE_PREFIX = {"audit": "The audit failed", "ablate": "Ablation failed", "verify": "Fix verification failed"}
 MAX_DETAIL_CHARS = 300  # error messages are cut here so the UI shows one short sentence
-STOP_TIMEOUT_S = 10.0  # how long shutdown waits for the running job to reach its next frame
+STOP_TIMEOUT_S = 10.0  # how long shutdown waits for the running job to stop (the watchdog acts within it)
+
+# A cancelled task normally stops at its next frame, a few hundredths of a second later; one still
+# running after this long waits in a call that does not call back, so its browser is killed.
+CANCEL_GRACE_S = 2.0
+# The longest stretches without a progress callback while a browser runs are page loads (at most 30 s
+# each, capture.capturer.NAVIGATION_TIMEOUT_MS, for each of the three strategies A -> B -> C) and the
+# realtime strategy's recording (the duration, at most 60 s): 3 x 30 + 60 = 150 s.  Twice that, for a
+# slow machine, is the limit after which a task with a running browser counts as hung.
+STALL_LIMIT_S = 300.0
+WATCH_INTERVAL_S = 0.5  # how often the watchdog looks at the running task
+
+log = logging.getLogger(__name__)
 
 
 class JobCancelled(BaseException):
@@ -91,6 +122,11 @@ def failure_sentence(kind: str, exc: BaseException) -> str:
     return f"{FAILURE_PREFIX[kind]} ({detail})."
 
 
+def stall_sentence(limit_s: float) -> str:
+    """The error of a job the watchdog stopped because its page hung."""
+    return f"The page stopped responding (no progress for {limit_s:g} s), so its browser was stopped."
+
+
 def audit_function(name: str) -> Callable[..., Any]:
     """``cli.audit.<name>``, looked up at call time (so tests can replace it) and checked to exist."""
     function = getattr(cli_audit, name, None)
@@ -116,7 +152,7 @@ class JobProgress:
         self.store, self.record, self.fixed_phase = store, record, fixed_phase
 
     def __call__(self, done: int, total: int) -> None:
-        self._stop_if_cancelled()
+        self._check_in()
         if self.fixed_phase is not None:  # the re-capture of a verification
             phase, label = self.fixed_phase, f"frames {done}/{total}"
         elif done >= total:  # every frame is in; run_audit analyses them next
@@ -126,7 +162,7 @@ class JobProgress:
         self.store.set_progress(self.record, phase, Progress(done, total, label))
 
     def phase(self, label: str, done: int | None = None, total: int | None = None) -> None:
-        self._stop_if_cancelled()
+        self._check_in()
         counted = done is not None and total is not None
         phase = self.fixed_phase or self._later_audit_phase(counted)
         # A step without counts reports total 0; the UI then shows no progress bar for it.
@@ -137,7 +173,9 @@ class JobProgress:
         """In a new audit, attribution's counted steps are ablation re-captures when the mode is "ablate"."""
         return "ablating" if counted and self.record.settings.attribute == "ablate" else "attributing"
 
-    def _stop_if_cancelled(self) -> None:
+    def _check_in(self) -> None:
+        """Every callback: tell the watchdog the task is alive, then stop it if it was cancelled."""
+        self.record.last_callback = time.monotonic()
         stop_if_cancelled(self.record)
 
 
@@ -203,17 +241,28 @@ def run_task(store: JobStore, task: Task) -> None:
             backup_follow_up_files(record.job_dir)  # put back by end_unfinished_task if it does not finish
         TASK_FUNCTIONS[task.kind](store, task)
     except JobCancelled:
-        if record.stopped_by_shutdown:
-            end_unfinished_task(store, task, STOPPED_DURING)
-        else:
-            store.mark_cancelled(record)  # the user deleted the job; the runner removes its folder next
+        end_stopped_task(store, task)
     except Exception as exc:  # noqa: BLE001 - every failure must end the task, never stop the thread
-        # While the server is stopping, a failure is a symptom of the stop (Chromium was killed too).
-        message = STOPPED_DURING if record.stopped_by_shutdown else failure_sentence(task.kind, exc)
-        end_unfinished_task(store, task, message)
+        # A failure after the job was stopped is a symptom of the stop: its Chromium was killed (by a
+        # terminal's Ctrl-C or by the watchdog), so the call that waited for it raised.
+        if record.cancel.is_set():
+            end_stopped_task(store, task)
+        else:
+            end_unfinished_task(store, task, failure_sentence(task.kind, exc))
     finally:
         if follow_up:
             discard_follow_up_backup(record.job_dir)
+
+
+def end_stopped_task(store: JobStore, task: Task) -> None:
+    """Record a task that was stopped from outside: by the server stopping, the watchdog, or DELETE."""
+    record = task.record
+    if record.stopped_by_shutdown:
+        end_unfinished_task(store, task, STOPPED_DURING)
+    elif record.timed_out_after is not None:
+        end_unfinished_task(store, task, stall_sentence(record.timed_out_after))
+    else:
+        store.mark_cancelled(record)  # the user deleted the job; the runner removes its folder next
 
 
 def end_unfinished_task(store: JobStore, task: Task, message: str) -> None:
@@ -230,12 +279,74 @@ def end_unfinished_task(store: JobStore, task: Task, message: str) -> None:
         store.mark_error(record, message)
 
 
+# --------------------------------------------------------------------------------------- watchdog
+class Watchdog:
+    """Watches one running task from a second thread and kills its browser when the task cannot stop.
+
+    Used as ``with Watchdog(record): run_task(...)``.  ``check(now)`` holds the rules of the module
+    docstring; it only ever kills browser processes that appeared after the task started (its own).
+    """
+
+    def __init__(self, record: JobRecord, stall_limit_s: float = STALL_LIMIT_S,
+                 grace_s: float = CANCEL_GRACE_S) -> None:
+        self.record, self.stall_limit_s, self.grace_s = record, stall_limit_s, grace_s
+        self.earlier_browsers: set[int] = set()  # running before the task started, so not the task's
+        self.cancel_seen_at: float | None = None
+        self.stall_checked_at = 0.0
+        self._done = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self) -> Watchdog:
+        self.earlier_browsers = browser_processes()
+        self.record.last_callback = self.stall_checked_at = time.monotonic()
+        self._thread = threading.Thread(target=self._watch, name="flashtrace-watchdog", daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self._done.set()
+        if self._thread is not None:
+            self._thread.join()
+
+    def _watch(self) -> None:
+        while not self._done.wait(WATCH_INTERVAL_S):
+            self.check(time.monotonic())
+
+    def own_browsers(self) -> set[int]:
+        return browser_processes() - self.earlier_browsers
+
+    def check(self, now: float) -> None:
+        """One look at the task: stop a cancelled task that is stuck, or a hung one (module docstring)."""
+        if self.record.cancel.is_set():
+            self._stop_cancelled(now)
+        elif now - max(self.record.last_callback, self.stall_checked_at) >= self.stall_limit_s:
+            self._stop_if_hung(now)
+
+    def _stop_cancelled(self, now: float) -> None:
+        if self.cancel_seen_at is None:
+            self.cancel_seen_at = now
+        if now - self.cancel_seen_at >= self.grace_s:
+            kill_processes(self.own_browsers())  # again on every check: a fall-through may start another
+
+    def _stop_if_hung(self, now: float) -> None:
+        self.stall_checked_at = now  # without a browser of its own, look again after another full limit
+        browsers = self.own_browsers()
+        if not browsers:
+            return
+        log.warning("job %s: no progress for %g s; stopping its browser", self.record.id, self.stall_limit_s)
+        self.record.timed_out_after = self.stall_limit_s  # set before the kill, so the failure is read as this stop
+        self.record.cancel.set()
+        kill_processes(browsers)
+
+
 # --------------------------------------------------------------------------------------- runner
 class Runner:
     """One worker thread and its FIFO queue of tasks.  The thread starts with the first task."""
 
-    def __init__(self, store: JobStore) -> None:
+    def __init__(self, store: JobStore, stall_limit_s: float = STALL_LIMIT_S,
+                 cancel_grace_s: float = CANCEL_GRACE_S) -> None:
         self.store = store
+        self.stall_limit_s, self.cancel_grace_s = stall_limit_s, cancel_grace_s
         self._queue: deque[Task] = deque()
         self._condition = threading.Condition()  # guards the queue, _current and _stopping
         self._current: Task | None = None
@@ -243,12 +354,12 @@ class Runner:
         self._thread: threading.Thread | None = None
 
     def submit(self, task: Task) -> None:
-        """Add a task at the back of the queue."""
+        """Add a task at the back of the queue (and start the worker thread if it is not running)."""
         if task.kind not in TASK_KINDS:
             raise ValueError(f"unknown task kind {task.kind!r}")
         with self._condition:
             self._queue.append(task)
-            if self._thread is None:
+            if self._thread is None or not self._thread.is_alive():
                 self._thread = threading.Thread(target=self._work, name="flashtrace-runner", daemon=True)
                 self._thread.start()
             self._condition.notify()
@@ -297,16 +408,31 @@ class Runner:
             thread.join(timeout)
 
     def _work(self) -> None:
-        """Thread body: take the oldest task, run it, repeat until stop()."""
+        """Thread body: take the oldest task, run it under a watchdog, repeat until stop()."""
         while True:
             task = self._next_task()
             if task is None:
                 return
-            run_task(self.store, task)
-            with self._condition:
-                self._current = None
+            try:
+                with Watchdog(task.record, self.stall_limit_s, self.cancel_grace_s):
+                    run_task(self.store, task)
+            except (Exception, JobCancelled) as exc:  # noqa: BLE001 - see _end_after_crash
+                self._end_after_crash(task, exc)
+            finally:
+                with self._condition:
+                    self._current = None
             if task.record.delete_when_stopped:
                 delete_job_files(task.record.job_dir)
+
+    def _end_after_crash(self, task: Task, exc: BaseException) -> None:
+        """run_task records every ending itself; this runs only if recording it failed as well.
+
+        The job must still end, and the thread must go on with the next task.
+        """
+        log.error("job %s: the %s task ended without its outcome being recorded", task.record.id, task.kind,
+                  exc_info=exc)
+        with contextlib.suppress(Exception):
+            self.store.mark_error(task.record, failure_sentence(task.kind, exc))
 
     def _next_task(self) -> Task | None:
         """Wait for a task and mark it as the current one; None once the runner is stopping."""
@@ -315,5 +441,9 @@ class Runner:
                 self._condition.wait()
             if self._stopping:
                 return None
-            self._current = self._queue.popleft()
-            return self._current
+            task = self._queue.popleft()
+            # A job the watchdog stopped stays in the index; a later follow-up on it starts afresh.
+            task.record.cancel.clear()
+            task.record.timed_out_after = None
+            self._current = task
+            return task

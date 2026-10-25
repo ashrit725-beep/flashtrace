@@ -237,3 +237,17 @@ test("culprits at 390 px: Outline does not scroll the element's name away", asyn
   await expect(page.locator(".table-wrap #culprits-help")).toHaveCount(0);
   await expect(page.locator("#culprits-help")).toBeVisible();
 });
+
+test("heatmap: the outline marks the worst violation (highest rate), not the first", async ({ page }) => {
+  await mockApi(page);
+  // A mild early violation and a worse later one (TEST FIXTURE DATA): the box, its caption and the
+  // still must follow the worse one, as the reason sentence and the HTML export do.
+  await serveReport(page, (r) => {
+    const first = (r.violations as Json[])[0] as Json & { frameIndices: number[] };
+    const worse = { ...first, start: 300, end: 420, maxRatePerSec: 8, frameIndices: [310, 318],
+                    window: { x: 500, y: 300, w: 340, h: 256 } };
+    r.violations = [first, worse];
+  });
+  await page.goto(`/report/?id=${IDS.FAIL}`);
+  await expect(page.getByText(/The dashed box marks the worst 340 × 256 px window of violation 2, at x 500, y 300\./)).toBeVisible();
+});

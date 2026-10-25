@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 from playwright.sync_api import Browser, BrowserContext, Page, sync_playwright
 from playwright.sync_api import Error as PlaywrightError
 
-from capture.detect import CANVAS_PROBE_JS, find_uncontrollable
+from capture.detect import CANVAS_PROBE_JS, WORKER_PROBE_JS, ContentWatch, ImageVerdicts
 from capture.frames import FrameSequence
 from capture.hashing import sequence_hash
 from capture.page_scripts import APPLY_SUPPRESSION_JS, RECORD_SHADOW_ROOT_FN, SHADOW_ROOT_RECORDER_JS
@@ -225,10 +225,18 @@ def _new_context(browser: Browser, viewport: tuple[int, int]) -> BrowserContext:
     )
 
 
-def _settle_page(page: Page, attempt: _Attempt, settings: CaptureSettings) -> None:
-    """After load: fonts ready, extra CSS in place, interaction script finished."""
+def _settle_page(page: Page, attempt: _Attempt, settings: CaptureSettings) -> str | None:
+    """After load: fonts ready, extra CSS in place, interaction script finished.
+
+    Returns a reason the strategy cannot capture this page (web fonts that never became ready, for a
+    strategy whose pictures wait for them), else ``None``.
+    """
     # Fonts arriving after frame 0 would change text pixels mid-capture for no page-authored reason.
-    attempt.notes.extend(attempt.strategy.wait_for_fonts(page))
+    fonts = attempt.strategy.wait_for_fonts(page)
+    if fonts is not None:
+        attempt.notes.append(fonts)
+        if attempt.strategy.pictures_wait_for_fonts:
+            return f"{fonts}; page.screenshot waits for web fonts before every picture, so {attempt.name} cannot take its frames"
     if settings.extra_css:
         # A <style> element, exactly like a page-authored stylesheet, so ablation and fix overrides
         # take part in the normal cascade (they rely on !important to win).
@@ -236,6 +244,7 @@ def _settle_page(page: Page, attempt: _Attempt, settings: CaptureSettings) -> No
         attempt.notes.append("extra CSS injected as a <style> element before frame 0")
     if settings.interaction_script:
         attempt.notes.extend(attempt.strategy.run_interaction(page, settings.interaction_script))
+    return None
 
 
 def _suppression_note(selectors: tuple[str, ...], counts: dict[str, Any], every_frame: bool) -> str:
@@ -411,12 +420,15 @@ def _capture_with_browser(
     """Try the strategies in ``names`` in order until one produces frames it stands behind.
 
     SPEC 6.2 fall-through A -> B -> C. A strategy is given up ("abandoned") when the page holds content
-    it cannot control, when it rejects its own frames (double-shot or page-clock check), when it cannot
-    load the page under its time source, or when it raises; every reason is kept in the chain and
-    written to ``meta.fallbackReason`` and ``meta.notes``. The last strategy (or a forced one) is never
-    abandoned: its result is returned as it is, and its exceptions propagate.
+    it cannot control, when it rejects its own frames (double-shot or page-clock check, content that
+    became uncontrollable after frame 0), when it cannot load the page under its time source, or when
+    it raises; every reason is kept in the chain and written to ``meta.fallbackReason`` and
+    ``meta.notes``. The last strategy (or a forced one) is never abandoned: its result is returned as it
+    is, and its exceptions propagate. ``PageLoadError`` (the page itself answered with an HTTP error)
+    always propagates: every strategy would load the same answer.
     """
     chain = _Chain()
+    verdicts: ImageVerdicts = {}  # image classifications, reused by later attempts on the same page
     for position, name in enumerate(names):
         strategy_class = REGISTRY.get(name)
         if strategy_class is None:
@@ -424,7 +436,7 @@ def _capture_with_browser(
             raise NotImplementedError(f"capture strategy '{name}' is not implemented yet{reason}")
         attempt = _Attempt(name=name, strategy=strategy_class(), may_fall_through=auto and position < len(names) - 1)
         try:
-            _run_attempt(browser, attempt, settings, target_dir, progress)
+            _run_attempt(browser, attempt, settings, target_dir, progress, image_verdicts=verdicts)
         except (PlaywrightError, RuntimeError, OSError) as exc:
             if not attempt.may_fall_through:
                 raise
@@ -462,13 +474,17 @@ def _run_attempt(
     settings: CaptureSettings,
     target_dir: Path,
     progress: ProgressCallback | None,
+    image_verdicts: ImageVerdicts | None = None,
 ) -> None:
-    """Run one strategy end to end in a fresh context; fills ``attempt`` (or abandons it)."""
+    """Run one strategy end to end in a fresh context; fills ``attempt`` (or abandons it).
+
+    ``image_verdicts`` is the image-classification cache of the capture this attempt belongs to.
+    """
     attempt_browser, owned = _browser_for(attempt, browser)
     try:
         context = _new_context(attempt_browser, settings.viewport)
         try:
-            _load_and_capture(context, attempt, settings, target_dir, progress)
+            _load_and_capture(context, attempt, settings, target_dir, progress, image_verdicts)
         finally:
             context.close()
     finally:
@@ -482,12 +498,15 @@ def _load_and_capture(
     settings: CaptureSettings,
     target_dir: Path,
     progress: ProgressCallback | None,
+    image_verdicts: ImageVerdicts | None = None,
 ) -> None:
     """Prepare, load, scan and capture inside ``context`` (the per-attempt steps of SPEC 6.2)."""
     strategy = attempt.strategy
-    # Both probes must be in place before any page script runs: the canvas probe before a WebGL
-    # context is requested, the shadow-root recorder before a closed shadow root is created (ADR-022).
+    # The probes must be in place before any page script runs: the canvas probe before a WebGL context
+    # is requested, the worker probe before a worker is started, the shadow-root recorder before a
+    # closed shadow root is created (ADR-022).
     context.add_init_script(CANVAS_PROBE_JS)
+    context.add_init_script(WORKER_PROBE_JS)
     context.add_init_script(SHADOW_ROOT_RECORDER_JS)
     strategy.prepare_context(context, settings)
     page = strategy.create_page(context, settings)
@@ -498,13 +517,17 @@ def _load_and_capture(
     if load_failure is not None:
         _record_load_failure(attempt, load_failure, target_dir)
         return
+    attempt.notes.extend(strategy.load_notes)
 
     _register_declarative_shadow_roots(page, attempt)
-    _settle_page(page, attempt, settings)
+    settle_failure = _settle_page(page, attempt, settings)
+    if settle_failure is not None:
+        _record_load_failure(attempt, settle_failure, target_dir)
+        return
     if settings.suppress_selectors:
         # Before detection, so a suppressed (hidden) animated image no longer counts as uncontrollable.
         _apply_suppression(page, attempt, settings)
-    if not _scan_page(page, attempt, settings):
+    if not _scan_page(page, attempt, settings, image_verdicts):
         return
 
     attempt.sink = FrameSink(FrameSequence.new_in_dir(target_dir))
@@ -528,11 +551,16 @@ def _record_load_failure(attempt: _Attempt, reason: str, target_dir: Path) -> No
     attempt.outcome = StrategyOutcome(deterministic=False, notes=notes, failure_reason=reason)
 
 
-def _scan_page(page: Page, attempt: _Attempt, settings: CaptureSettings) -> bool:
-    """Look for uncontrollable content (SPEC 6.2); False when the attempt was abandoned because of it."""
-    attempt.uncontrollable, detect_notes = find_uncontrollable(page, settings.allow_local_files)
+def _scan_page(page: Page, attempt: _Attempt, settings: CaptureSettings, image_verdicts: ImageVerdicts | None = None) -> bool:
+    """Look for uncontrollable content (SPEC 6.2); False when the attempt was abandoned because of it.
+
+    The scan's ``ContentWatch`` is handed to the strategy, which may look again during its frame loop.
+    """
+    watch = ContentWatch(settings.allow_local_files, image_verdicts)
+    attempt.uncontrollable, detect_notes = watch.first_scan(page)
+    attempt.strategy.content_watch = watch
     attempt.notes.extend(detect_notes)
-    if not attempt.uncontrollable or not attempt.strategy.requires_controllable_content:
+    if not attempt.uncontrollable or not attempt.strategy.needs_controllable_content():
         return True
     reason = "uncontrollable content: " + "; ".join(attempt.uncontrollable)
     if attempt.may_fall_through:
@@ -555,13 +583,14 @@ def _build_result(attempt: _Attempt, chain: _Chain, settings: CaptureSettings, s
     sink, outcome = attempt.sink, attempt.outcome
     notes = chain.notes(attempt.name) + attempt.notes + outcome.notes
     notes.append(f"frame loop took {attempt.loop_seconds:.2f} s for {len(sink.hashes)} frames")
-    forced_over_uncontrollable = bool(attempt.uncontrollable) and attempt.strategy.requires_controllable_content
+    uncontrollable = attempt.uncontrollable + [entry for entry in outcome.uncontrollable if entry not in attempt.uncontrollable]
+    forced_over_uncontrollable = bool(uncontrollable) and attempt.strategy.needs_controllable_content()
     meta = CaptureMeta(
         strategy=attempt.strategy.name,
         deterministic=outcome.deterministic and attempt.strategy.deterministic_by_design and not forced_over_uncontrollable,
         frame_hashes=list(sink.hashes),
         hash=sequence_hash(sink.hashes),
-        uncontrollable=list(attempt.uncontrollable),
+        uncontrollable=uncontrollable,
         fallback_reason=chain.fallback_reason,
         notes=notes,
         viewport=settings.viewport,

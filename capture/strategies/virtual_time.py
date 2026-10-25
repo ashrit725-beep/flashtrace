@@ -66,6 +66,7 @@ from capture.strategies.base import (
     FrameSink,
     ProgressCallback,
     StrategyOutcome,
+    check_main_response,
 )
 
 #: Chromium switches that make BeginFrameControl rendering reproducible (the parts of Chromium's own
@@ -271,6 +272,7 @@ class VirtualTimeStrategy(CaptureStrategy):
     launch_args: ClassVar[tuple[str, ...]] = LAUNCH_ARGS
 
     def __init__(self, self_test: bool = False) -> None:
+        super().__init__()
         self._self_test = self_test        # True for the instance ``budget_mode_unusable`` drives
         self._cdp: CDPSession | None = None
         self._browser_key: str | None = None
@@ -328,6 +330,17 @@ class VirtualTimeStrategy(CaptureStrategy):
 
     def describe_setup(self) -> list[str]:
         return list(self._setup_notes)
+
+    def needs_controllable_content(self) -> bool:
+        """Budget-only pictures (no BeginFrameControl) step aside for uncontrollable content.
+
+        The self-test (``budget_mode_unusable``) only shows that a CSS animation stands still with the
+        virtual clock. Animated images, SVG images, workers and cross-origin frames run on clocks it
+        does not measure; measured on an animated SVG image that passed both double-shots: 5 flashes per
+        second for a 4 Hz animation, reported as deterministic. With BeginFrameControl the compositor only
+        draws when told to, and B keeps the role SPEC 6.2 gives it.
+        """
+        return not self._begin_frame
 
     def prepare_context(self, context: BrowserContext, settings: CaptureSettings) -> None:
         """Seed ``Math.random`` in every document before any page script runs (ADR-022)."""
@@ -418,7 +431,7 @@ class VirtualTimeStrategy(CaptureStrategy):
         )
         self._ticks_base = float(result.get("virtualTimeTicksBase", 0.0))
         self._virtual_ms = 0.0
-        page.goto(settings.url, wait_until="commit")
+        check_main_response(page.goto(settings.url, wait_until="commit"), settings.url)
         if not self._wait_for_budget_expiry(page):
             return "virtual time never reported its first budget expiry after navigation"
         self._virtual_ms = float(LOAD_STEP_MS)
@@ -440,10 +453,10 @@ class VirtualTimeStrategy(CaptureStrategy):
         )
         return None
 
-    def wait_for_fonts(self, page: Page) -> list[str]:
+    def wait_for_fonts(self, page: Page) -> str | None:
         """Read font status through DevTools instead of awaiting a promise the paused page cannot settle."""
         status = self._evaluate("document.fonts.status")
-        return [] if status == "loaded" else [f"web fonts were still '{status}' at frame 0 (virtual clock paused)"]
+        return None if status == "loaded" else f"web fonts were still '{status}' at frame 0 (virtual clock paused)"
 
     # ------------------------------------------------------------------ interaction script
     def run_interaction(self, page: Page, script: str) -> list[str]:

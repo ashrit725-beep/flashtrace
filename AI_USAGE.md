@@ -77,3 +77,22 @@ student. No AI/LLM is used *inside* FlashTrace; the product is fully offline and
   delete at phone width counted as flashing) which were fixed before the work was kept (ADR-024 amendment).
 * **What the AI did not do.** It did not type any number into docs/RESULTS.md; that file is written by
   `flashtrace bench`. It did not change a WCAG threshold; corrections to the brief's working values are ADRs.
+
+## 2026-10-25 — Documentation review fixes and benchmark re-run
+
+* AI reviewers compared the docs with the code and the brief. The confirmed findings were fixed in the docs only:
+  * SPEC §5.4, §5.6 step 4, §5.8 and §5.10 (items 15–16), §6.4 and §7 now say what the code does. ADR-038 to
+    ADR-041 record the decisions, and ADR-008, 013, 019, 025, 027, 029, 030, 031 and 032 carry dated corrections.
+  * docs/API.md lists the 400 (bad Host) and 403 (foreign Origin) responses.
+  * docs/STATUS.md has the missing M4–M8 entries.
+  * README.md describes determinism as measured and has a CI example that starts the site first.
+  * action/README.md lists the inputs and the exit code for INCONCLUSIVE.
+  * demo/README.md no longer says the CLI is still to come.
+* The AI ran `flashtrace bench` in a clean git worktree of commit 808cd30 and copied the generated docs/RESULTS.md and
+  docs/RESULTS.json into the repository unchanged. It typed no number into either file. It also ran the Python test
+  suite in that worktree for the STATUS entry.
+* Correction to the entry "M3 to M8, motion pass, determinism investigations" above: the parenthesised
+  benchmark-scale count after the ADR-025 fix came from a development re-run that `flashtrace bench` did not
+  produce, so it is not a figure of record (ADR-041). The count before the fix is the Determinism line of the M3
+  docs/RESULTS.md (commit 0761f45). The determinism figure of record is the Determinism line of the current
+  docs/RESULTS.md. That entry stays as written because this file is append-only.

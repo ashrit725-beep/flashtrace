@@ -153,6 +153,46 @@ def test_webp_requires_riff_and_webp_markers() -> None:
     assert is_animated_webp(b"") is False
 
 
+# ----------------------------------------------------------------------------- tests: SVG
+STILL_SVG = b'<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10"><rect width="10" height="10"/></svg>'
+SMIL_SVG = (b'<?xml version="1.0"?>\n<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10">'
+            b'<animate attributeName="fill" values="#000;#fff" dur="0.25s" begin="1.5s" repeatCount="10"/></rect></svg>')
+CSS_SVG = (b'<svg xmlns="http://www.w3.org/2000/svg"><style>#r{animation:s .25s steps(1,end) 1.5s 10}'
+           b'@keyframes s{50%{fill:#000}}</style><rect id="r" width="10" height="10"/></svg>')
+
+
+@pytest.mark.parametrize("markup", [SMIL_SVG, CSS_SVG, SMIL_SVG.replace(b"<animate ", b"<set "), b"\xef\xbb\xbf  " + CSS_SVG])
+def test_svg_with_smil_or_keyframes_is_animated(markup: bytes) -> None:
+    """An SVG image's SMIL and CSS animations run on the browser's own clock (even one that starts late)."""
+    assert detect.is_animated_svg(markup) is True
+    assert sniff_animated_image(markup) == "animated-svg"
+
+
+def test_gzipped_svg_is_unzipped_first() -> None:
+    packer = zlib.compressobj(wbits=16 + zlib.MAX_WBITS)
+    assert detect.is_animated_svg(packer.compress(SMIL_SVG) + packer.flush()) is True
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        STILL_SVG,
+        b"<!doctype html><html><body><svg><animate/></svg></body></html>",  # HTML with inline SVG is not an SVG image
+        b"<svg><settings-panel/></svg>",                                     # '<set' must be the whole element name
+        b"GIF89a<svg><animate/>",                                            # not markup at all
+    ],
+)
+def test_still_or_non_svg_bytes_are_not_animated_svg(data: bytes) -> None:
+    assert detect.is_animated_svg(data) is False
+
+
+def test_long_svg_without_animation_so_far_asks_for_more_bytes() -> None:
+    head = (STILL_SVG[:-6] + b"<!--" + b"x" * SNIFF_LIMIT)[:SNIFF_LIMIT]
+    assert detect.svg_needs_more_bytes(head, SNIFF_LIMIT) is True
+    assert detect.svg_needs_more_bytes(STILL_SVG, SNIFF_LIMIT) is False   # the whole file
+    assert detect.svg_needs_more_bytes((SMIL_SVG + b" " * SNIFF_LIMIT)[:SNIFF_LIMIT], SNIFF_LIMIT) is False  # decided
+
+
 # ----------------------------------------------------------------------------- tests: dispatcher
 def test_sniff_labels() -> None:
     assert sniff_animated_image(build_gif(frames=2)) == "animated-gif"
@@ -263,22 +303,36 @@ def test_unreadable_image_counts_as_unverified() -> None:
 
 # ----------------------------------------------------------------------------- where bytes may come from
 class StandInPage:
-    """Replaces a Playwright page: a fixed URL and a fixed scan result. Any network use fails the test."""
+    """Replaces a Playwright page: a fixed URL and a fixed scan result. Any network use fails the test.
 
-    def __init__(self, url: str, image_urls: list[str]) -> None:
+    ``later`` lists the results of later scans (``ContentWatch.recheck``), one per call; when they run
+    out, a later scan finds nothing new. ``options`` records the options each scan was called with.
+    """
+
+    def __init__(self, url: str, image_urls: list[str], workers: list[dict[str, str]] | None = None) -> None:
         self.url = url
         self.request_object: Any = None  # a test may plug in a stand-in for page.request
-        self._scan = {
+        self._scan = self.scan_result(image_urls, workers)
+        self.later: list[dict[str, Any]] = []
+        self.options: list[Any] = []
+
+    @staticmethod
+    def scan_result(image_urls: list[str], workers: list[dict[str, str]] | None = None) -> dict[str, Any]:
+        return {
             "images": [{"raw": u, "resolved": u, "kind": "img", "selector": "img"} for u in image_urls],
             "webglCanvases": [],
             "offscreenCanvases": [],
             "crossOriginFrames": [],
+            "workers": workers or [],
             "videos": 0,
             "shadowRoots": 0,
         }
 
-    def evaluate(self, _script: str) -> dict[str, Any]:
-        return self._scan
+    def evaluate(self, _script: str, options: Any = None) -> dict[str, Any]:
+        self.options.append(options)
+        if len(self.options) == 1:
+            return self._scan
+        return self.later.pop(0) if self.later else self.scan_result([])
 
     @property
     def request(self) -> Any:
@@ -315,6 +369,53 @@ def test_file_image_is_never_touched_without_local_permission(
         uncontrollable, notes = find_uncontrollable(StandInPage(page_url, [gif_path.as_uri()]), allow)
     assert uncontrollable == []
     assert any(note.startswith("animation check skipped for a local image URL") for note in notes), notes
+
+
+# ----------------------------------------------------------------------------- image cap, workers, later checks
+def data_gif(frames: int, tag: int = 0) -> str:
+    """A data: URL carrying a GIF with ``frames`` frames (no network needed to read it); ``tag`` makes
+    URLs with the same bytes distinct (a media-type parameter, which decoding ignores)."""
+    import base64
+
+    return f"data:image/gif;n={tag};base64," + base64.b64encode(build_gif(frames=frames)).decode("ascii")
+
+
+def test_images_past_the_cap_count_as_unverified() -> None:
+    """An animated GIF at position 201 is never read: the capture must not call itself deterministic."""
+    stills = [data_gif(1, tag=i) for i in range(1, detect.MAX_IMAGE_URLS + 1)]
+    page = StandInPage("https://example.test/page.html", stills + [data_gif(2)])
+    uncontrollable, notes = find_uncontrollable(page, allow_local_files=False)
+    assert uncontrollable == [f"images-unverified: 1 image URL(s) beyond the first {detect.MAX_IMAGE_URLS} were not checked for animation"]
+    assert notes == [f"only the first {detect.MAX_IMAGE_URLS} of {detect.MAX_IMAGE_URLS + 1} image URLs were checked for animation"]
+
+
+def test_workers_are_uncontrollable() -> None:
+    workers = [{"kind": "Worker", "url": "https://example.test/w.js"}, {"kind": "SharedWorker", "url": "blob:https://example.test/1"}]
+    uncontrollable, _notes = find_uncontrollable(StandInPage("https://example.test/", [], workers), allow_local_files=False)
+    assert uncontrollable == ["worker: https://example.test/w.js", "shared-worker: blob:https://example.test/1"]
+
+
+def test_content_watch_reports_only_what_is_new_and_reuses_verdicts() -> None:
+    """Later looks classify new URLs once (requested images included); a shared cache spares re-reading."""
+    animated, still = data_gif(2), data_gif(1)
+    page = StandInPage("https://example.test/", [still])
+    verdicts: detect.ImageVerdicts = {}
+    watch = detect.ContentWatch(False, verdicts)
+    assert watch.first_scan(page) == ([], [])
+    page.later = [StandInPage.scan_result([still, animated])]  # the page scan returns the GIF; the still is old news
+    assert watch.recheck(page, full=False) == ([f"animated-gif: {animated}"], [])
+    assert watch.recheck(page, full=True, requested_images=[animated]) == ([], [])  # already judged on this page
+    assert page.options == [detect.FIRST_SCAN, detect.ELEMENT_SCAN, detect.FULL_SCAN]
+    assert (animated, animated) in verdicts and len(verdicts) == 2
+
+    # A later attempt on the same page (a new ContentWatch) takes the verdict from the cache.
+    def unreadable(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("a cached image must not be read again")
+
+    second = StandInPage("https://example.test/", [animated])
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(detect, "_read_image_head", unreadable)
+        assert detect.ContentWatch(False, verdicts).first_scan(second) == ([f"animated-gif: {animated}"], [])
 
 
 def test_local_page_with_permission_reads_a_large_gif_up_to_4_mb(tmp_path: Path) -> None:

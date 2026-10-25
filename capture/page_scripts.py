@@ -14,8 +14,9 @@ Two kinds of script live here.
   - ``TIMELINE_CLOCK_JS`` (strategy A only) makes ``document.timeline.currentTime`` read the fake clock,
     so a script that times itself from the animation timeline follows virtual time like one that reads
     ``performance.now()``.
-  - ``ANIMATION_RECORDER_JS`` (strategy A only) records what the page itself asks of its animations and
-    SVG timelines (pause, play, a new current time), so strategy A can honour it while it drives them.
+  - ``ANIMATION_RECORDER_JS`` (strategy A only) records what the page itself asks of its animations, SVG
+    timelines and media elements (pause, play, a new current time), so strategy A can honour it while it
+    drives them.
 
 * **Page helpers.** ``PAGE_HELPERS_JS`` is a block of small JavaScript functions that is pasted at the
   top of every function FlashTrace evaluates in the page (strategy A's per-frame seek, detection's scan
@@ -159,22 +160,25 @@ RAF_SYNC_JS = r"""
 #: Note added by strategy A, which installs ``RAF_SYNC_JS``.
 RAF_SYNC_NOTE = "requestAnimationFrame callbacks run once per captured frame, at that frame's clock time"
 
-# Strategy A pauses every animation and SVG timeline and seeks it per frame, so the browser's own record
-# of what the page asked for is lost: a page's pause() on an animation we already paused changes nothing
-# we can see. These wrappers write the page's requests onto the object instead:
+# Strategy A pauses every animation, SVG timeline and <video> and seeks it per frame, so the browser's own
+# record of what the page asked for is lost: a page's pause() on an animation we already paused changes
+# nothing we can see. These wrappers write the page's requests onto the object instead:
 #   __ftPageWantsPaused  true after the page's pause() / pauseAnimations(), false after play(),
 #                        reverse() or unpauseAnimations();
-#   __ftPageSeek         the current time (ms) the page assigned through currentTime or startTime.
+#   __ftPageSeek         the current time the page assigned: ms through an animation's currentTime or
+#                        startTime, seconds through a media element's currentTime or fastSeek();
+#   __ftPlayFrom         a media element's currentTime (s) when the page called play(), read before
+#                        playback starts, so that where the page started it does not depend on real time.
 # FlashTrace's own calls are made through ftOwnCall (PAGE_HELPERS_JS), which sets __ftOwnCall on the
 # object for the duration of the call, so they are not recorded.
 ANIMATION_RECORDER_JS = r"""
 (() => {
-  // Replaces proto[name] by a function that, for the page's calls only, runs note(object) first.
+  // Replaces proto[name] by a function that, for the page's calls only, runs note(object, ...args) first.
   const wrapMethod = (proto, name, note) => {
     const original = proto && proto[name];
     if (typeof original !== 'function') return;
     Object.defineProperty(proto, name, { configurable: true, writable: true, value: function (...args) {
-      if (!this.__ftOwnCall) note(this);
+      if (!this.__ftOwnCall) note(this, ...args);
       return original.apply(this, args);
     } });
   };
@@ -203,6 +207,13 @@ ANIMATION_RECORDER_JS = r"""
   if (typeof SVGSVGElement !== 'undefined') {
     wrapMethod(SVGSVGElement.prototype, 'pauseAnimations', (svg) => { svg.__ftPageWantsPaused = true; });
     wrapMethod(SVGSVGElement.prototype, 'unpauseAnimations', (svg) => { svg.__ftPageWantsPaused = false; });
+  }
+  if (typeof HTMLMediaElement !== 'undefined') {
+    const proto = HTMLMediaElement.prototype;
+    wrapMethod(proto, 'pause', (media) => { media.__ftPageWantsPaused = true; });
+    wrapMethod(proto, 'play', (media) => { media.__ftPageWantsPaused = false; media.__ftPlayFrom = media.currentTime; });
+    wrapMethod(proto, 'fastSeek', (media, seconds) => { media.__ftPageSeek = seconds; });
+    wrapSetter(proto, 'currentTime', (media, seconds) => { media.__ftPageSeek = seconds; });
   }
 })();
 """

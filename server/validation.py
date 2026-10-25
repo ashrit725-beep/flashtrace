@@ -155,6 +155,12 @@ def is_job_id(text: str) -> bool:
     return JOB_ID_PATTERN.fullmatch(text) is not None
 
 
+def host_allowed(host: str | None) -> bool:
+    """True when the Host header names this computer: 127.0.0.1 or localhost, with any port."""
+    name = (host or "").split(":")[0]
+    return name in ALLOWED_HOST_NAMES
+
+
 def origin_allowed(origin: str | None, host: str | None, extra_origins: tuple[str, ...] = ()) -> bool:
     """True when a request that changes something (POST, DELETE) may go ahead.
 

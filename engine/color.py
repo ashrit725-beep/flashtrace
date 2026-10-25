@@ -5,7 +5,8 @@ serves one pixel, a whole frame or a grid of cells.  The formulas are the ones
 WCAG 2.2 prints (docs/SPEC.md 3.4 and 3.6).  The only additions are the reverse
 transfer function (needed to re-encode a cell's mean colour as whole 0..255
 values, ADR-003 and ADR-020), the floor below which a red has no hue (ADR-020)
-and the black special case for chromaticity (ADR-011).
+and the white-point chromaticity of black and of every near-black colour, whose
+channels are all below that floor (ADR-011, ADR-020 as amended).
 
 Why "linear" matters: the bytes in a screenshot are gamma-encoded, so byte 128
 is not half as bright as byte 255.  WCAG's thresholds are about physical light,
@@ -94,6 +95,15 @@ def srgb8_from_linear(linear_rgb: np.ndarray) -> np.ndarray:
     return np.clip(np.floor(scaled + 0.5), 0.0, 255.0)
 
 
+def is_near_black(rgb8: np.ndarray) -> np.ndarray:
+    """Whole 0..255 values [..., 3] -> True where EVERY channel is below RED_MIN_R8 [...].
+
+    ADR-020 sets the floor below which a red shows no visible hue; a colour whose
+    three channels are all below it shows no hue of any kind: it looks black.
+    """
+    return np.all(np.asarray(rgb8) < RED_MIN_R8, axis=-1)
+
+
 def relative_luminance(linear_rgb: np.ndarray) -> np.ndarray:
     """Relative luminance L of linear RGB [..., 3] -> [...] in 0..1.
 
@@ -121,7 +131,7 @@ def xyz_from_linear(linear_rgb: np.ndarray) -> np.ndarray:
     return np.stack([x, y, z], axis=-1)
 
 
-def uv_chromaticity(linear_rgb: np.ndarray) -> np.ndarray:
+def uv_chromaticity(linear_rgb: np.ndarray, rgb8: np.ndarray | None = None) -> np.ndarray:
     """Linear RGB [..., 3] -> CIE 1976 UCS (u', v') [..., 2].
 
     Chromaticity is "which colour, ignoring brightness".  Pure black has no
@@ -129,13 +139,22 @@ def uv_chromaticity(linear_rgb: np.ndarray) -> np.ndarray:
     the D65 white point so it counts as colourless, like white and grey
     (ADR-011).  Red <-> black then measures as a chromaticity change of 0.259,
     which is why a red strobe on black is still a red flash under WCAG 2.2.
+
+    A near-black colour (every whole 0..255 channel below RED_MIN_R8, e.g.
+    (6, 0, 0)) looks black and gets the white point too (ADR-020 as amended):
+    otherwise a red fading smoothly to black would keep red chromaticity on the
+    near-black frames where its redness ratio is already 0, and the fade's
+    valley would measure as no colour change at all.  ``rgb8`` is the colour's
+    whole 0..255 values if the caller already has them (srgb8_from_linear()).
     """
     xyz = xyz_from_linear(linear_rgb)
     x, y, z = xyz[..., 0], xyz[..., 1], xyz[..., 2]
+    if rgb8 is None:
+        rgb8 = srgb8_from_linear(linear_rgb)
     # Understanding 2.3.1: "u' = 4 * X / (X + 15 * Y + 3 * Z)"
     #                      "v' = 9 * Y / (X + 15 * Y + 3 * Z)"
     denominator = x + 15.0 * y + 3.0 * z
-    defined = denominator != 0.0
+    defined = (denominator != 0.0) & ~is_near_black(rgb8)
     u = np.full(denominator.shape, D65_UV[0], dtype=np.float64)
     v = np.full(denominator.shape, D65_UV[1], dtype=np.float64)
     np.divide(4.0 * x, denominator, out=u, where=defined)
@@ -143,15 +162,17 @@ def uv_chromaticity(linear_rgb: np.ndarray) -> np.ndarray:
     return np.stack([u, v], axis=-1)
 
 
-def redness_ratio(linear_rgb: np.ndarray) -> np.ndarray:
+def redness_ratio(linear_rgb: np.ndarray, rgb8: np.ndarray | None = None) -> np.ndarray:
     """Linear RGB [..., 3] -> R8 / (R8 + G8 + B8) on whole 0..255 encoded values [...].
 
     WCAG does not say which scale R, G, B are on; the build brief fixes the
     0..255 sRGB-encoded scale (ADR-003), taken literally as whole numbers
     (ADR-020).  The ratio is 0 for black (the sum is 0) and for any colour
     with R8 below RED_MIN_R8, whose red is too dark to show a hue (ADR-020).
+    ``rgb8`` is the colour's whole 0..255 values if the caller already has them.
     """
-    rgb8 = srgb8_from_linear(linear_rgb)
+    if rgb8 is None:
+        rgb8 = srgb8_from_linear(linear_rgb)
     r8, g8, b8 = rgb8[..., 0], rgb8[..., 1], rgb8[..., 2]
     total = r8 + g8 + b8
     # ADR-020: below R8 = 16 there is no visible red, so the ratio stays 0.
@@ -162,14 +183,16 @@ def redness_ratio(linear_rgb: np.ndarray) -> np.ndarray:
     return ratio
 
 
-def legacy_red_value(linear_rgb: np.ndarray) -> np.ndarray:
+def legacy_red_value(linear_rgb: np.ndarray, rgb8: np.ndarray | None = None) -> np.ndarray:
     """Linear RGB [..., 3] -> pre-2022 red value max(0, R8 - G8 - B8) / 255 x 320 [...].
 
     Computed on the same whole 0..255 encoded values as redness_ratio(), then
     put back on the 0..1 scale the working value was written for (ADR-020).
-    Only the "wcag21-legacy" comparison mode uses it (ADR-001).
+    Only the "wcag21-legacy" comparison mode uses it (ADR-001).  ``rgb8`` is
+    the colour's whole 0..255 values if the caller already has them.
     """
-    rgb8 = srgb8_from_linear(linear_rgb)
+    if rgb8 is None:
+        rgb8 = srgb8_from_linear(linear_rgb)
     r8, g8, b8 = rgb8[..., 0], rgb8[..., 1], rgb8[..., 2]
     # Build brief / WCAG 2.0-2.1 era working value: "(R - G - B) x 320", floored at 0
     return np.maximum(r8 - g8 - b8, 0.0) / 255.0 * LEGACY_RED_VALUE_SCALE

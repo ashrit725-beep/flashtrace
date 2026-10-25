@@ -82,7 +82,9 @@ def _white_point_uv(matrix: tuple[tuple[float, float, float], ...]) -> tuple[flo
 # CIE 1976 (u', v') of the D65 white point, about (0.1978, 0.4683), computed
 # here from SRGB_TO_XYZ rather than typed in.  Pure black has X = Y = Z = 0, so
 # its chromaticity is 0/0; FlashTrace gives black the white point so that it
-# counts as "no colour", exactly like white and grey (ADR-011).
+# counts as "no colour", exactly like white and grey (ADR-011).  Every
+# near-black colour (all three channels below RED_MIN_R8, below) gets it too,
+# because it looks black (ADR-020 as amended).
 D65_UV: tuple[float, float] = _white_point_uv(SRGB_TO_XYZ)
 
 # --------------------------------------------------------------------------- #
@@ -117,6 +119,11 @@ RED_MIN_DELTA_UV: float = 0.2
 # working definition could ever count against black, because a change in
 # "(R - G - B) x 320" that is "greater than 20" needs R - G - B > 20/320 of
 # full scale, i.e. more than 15.94 on the 0-255 scale.  INCLUSIVE: R = 16 counts.
+# The same floor decides when a colour shows no hue at all: if R, G and B are
+# all below 16 it looks black, so its chromaticity is the D65 white point, the
+# same as black's (ADR-011, ADR-020 as amended).  A red fading smoothly to black
+# then keeps its colour change: its near-black frames such as (6, 0, 0) measure
+# like black instead of keeping red chromaticity.
 RED_MIN_R8: int = 16
 
 # --------------------------------------------------------------------------- #
@@ -176,9 +183,10 @@ ADVISORY_MIN_DURATION_SECONDS: float = 5.0  # EXCLUSIVE: the span must be LONGER
 # --------------------------------------------------------------------------- #
 
 # Cells whose flash completions are within this many frames of each other are
-# treated as one event (docs/SPEC.md 5.6 steps 1 and 4, ADR-019): an event
-# counted at frame t claims the completions of frames t .. t +
-# EVENT_FRAME_TOLERANCE, and later frames are scored without them.
+# treated as one event (docs/SPEC.md 5.6 steps 1 and 4, ADR-019, ADR-038): an
+# event counted at frame t claims the completions of frames t .. t +
+# EVENT_FRAME_TOLERANCE, and later frames are scored without them (the claim
+# rule of ADR-038, which replaced ADR-019's ceil(n/2) count).
 EVENT_FRAME_TOLERANCE: int = 1
 
 # A reversal of a cell's signal no larger than this is treated as a plateau,
@@ -196,4 +204,7 @@ RUN_REVERSAL_TOLERANCE: dict[str, float] = {"L": 0.005, "ratio": 0.005, "rv": 1.
 RED_RULES: tuple[str, str] = ("wcag22", "wcag21-legacy")
 
 # Written into every report so a result can be traced to the code that made it.
-ENGINE_VERSION: str = "1.0.0"
+# 1.1.0: runs still moving at the last frame are dropped (ADR-004 as amended),
+# near-black colours have the white-point chromaticity (ADR-020 as amended) and
+# flashes and areas are counted in pixels, not whole cells (ADR-002 as amended).
+ENGINE_VERSION: str = "1.1.0"

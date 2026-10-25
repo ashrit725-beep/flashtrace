@@ -1,4 +1,5 @@
-"""Acceptance tests for docs/SPEC.md section 5.10 (items 1-14), plus the input-validation and
+"""Acceptance tests for docs/SPEC.md section 5.10 (items 1-19; items 17-19 pin the end-of-capture,
+near-black and pixel-area rules of ADR-042, ADR-043 and ADR-044), plus the input-validation and
 report-shape checks of the engine contract.
 
 Black box: only ``engine.analyze`` and the result object it returns are used (item 12 also
@@ -463,10 +464,10 @@ def test_14_short_viewport_still_fails_a_large_enough_flash() -> None:
 
 
 # ---------------------------------------------------------------------------------------------
-# SPEC 5.10 items 15-16 (proposed with the ADR-018 / ADR-019 amendments)
+# SPEC 5.10 items 15-16 (ADR-038: claim rule and settled stamps)
 # ---------------------------------------------------------------------------------------------
 def test_15_smooth_flash_completing_over_two_frames_is_counted_once() -> None:
-    """Proposed SPEC 5.10 item 15: a smooth 3 Hz pulse whose left half peaks at byte 120 and right half
+    """SPEC 5.10 item 15: a smooth 3 Hz pulse whose left half peaks at byte 120 and right half
     at byte 255 => PASS, maxRatePerSec == 3.
 
     The two halves reach their extreme byte on neighbouring frames, so each flash keeps more than 25%
@@ -485,7 +486,7 @@ def test_15_smooth_flash_completing_over_two_frames_is_counted_once() -> None:
 
 
 def test_16_sub_tolerance_noise_does_not_scatter_a_flash() -> None:
-    """Proposed SPEC 5.10 item 16: a 4 Hz grey 60 <-> 200 square wave over 1680 cells (30.9% of a
+    """SPEC 5.10 item 16: a 4 Hz grey 60 <-> 200 square wave over 1680 cells (30.9% of a
     window), with +0/+1 byte of noise per cell per frame => FAIL, maxRatePerSec == 4, exactly as clean.
 
     One byte at grey 60 changes L by far less than the 0.005 reversal tolerance.  When every new
@@ -501,6 +502,128 @@ def test_16_sub_tolerance_noise_does_not_scatter_a_flash() -> None:
     assert noisy.general_max_rate == 4
     assert noisy.frame_stats.general_area_max.max() == clean.frame_stats.general_area_max.max()
     assert clean.frame_stats.general_area_max.max() == 1680 / WINDOW_CELLS
+
+
+# ---------------------------------------------------------------------------------------------
+# SPEC 5.10 item 17 (ADR-042, amending ADR-004: runs cut off by the end of the capture)
+# ---------------------------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("hz", "phase", "easing"),
+    [(3.0, 0.0, "cosine"), (3.0, 0.5, "cosine"), (3.0, 0.0, "quadratic"), (3.0, 11 / 12, "quadratic"),
+     (2.9, 10 / 12, "cosine")],
+)
+def test_17_smooth_pulse_at_or_below_3_hz_over_a_10_s_capture_passes(hz: float, phase: float, easing: str) -> None:
+    """SPEC 5.10 item 17: a smooth black <-> white page pulse at 3 Hz (and 2.9 Hz), 600 frames
+    sampled at (i + 1/4) / 60 => PASS, maxRatePerSec == 3.
+
+    SC 2.3.1 fails only "more than three times in any one second period"; a 3 Hz pulse has 3.
+    At these phases the capture ends part-way down a fall.  Closing that run at the last frame
+    stamped a flash there, up to a few frames before the valley it never reached inside the
+    capture, and the last second counted 4.  A run still moving at the last frame is now dropped.
+    """
+    frames = synth.eased_pulse_strip_frames(hz, phase, 600, easing)
+    r = analyze(frames, fps=synth.FPS, viewport=(synth.VIEWPORT_W, 80))
+    assert r.verdict == "PASS"
+    assert r.general_max_rate == 3
+    assert r.violations == []
+    # One flash per period (20 frames at 3 Hz, 20.7 at 2.9 Hz), never closer.
+    assert int(np.diff(r.qualifying_general).min()) >= 20
+
+
+def test_17_flash_completed_before_the_last_frame_still_counts() -> None:
+    """SPEC 5.10 item 17 counterpart: a run that has arrived before the end is still closed by
+    finish().  A 4 Hz square wave that ends on a held black state: its last flash completes at frame
+    75 and the black is held to frame 79, so the 80-frame capture keeps all five flashes."""
+    r = run([full_screen(square_wave(FOUR_HZ, BLACK, WHITE))], duration_s=80 / synth.FPS)
+    assert r.qualifying_general == [15, 30, 45, 60, 75]
+    assert r.general_max_rate == 4
+
+
+# ---------------------------------------------------------------------------------------------
+# SPEC 5.10 item 18 (ADR-043, amending ADR-020: near-black colours have no hue)
+# ---------------------------------------------------------------------------------------------
+STRIP: tuple[int, int] = (synth.VIEWPORT_W, 80)  # 20 cell rows: a full-width flash covers 31% of a window
+DIM_RED: RGB = (150, 0, 0)  # L = 0.0648: against black Delta L < 0.10, so only the red rule can fire
+
+
+def run_strip(regions: Sequence[Region]) -> AnalysisResult:
+    """Analyse a scene on a 1024 x 80 page (quick, and a full-width flash still qualifies on area)."""
+    frames = synth.scene_frames(BLACK, regions, DURATION_S, size=STRIP)
+    return analyze(frames, fps=synth.FPS, viewport=STRIP)
+
+
+def test_18_red_fading_smoothly_to_black_is_a_red_flash() -> None:
+    """SPEC 5.10 item 18: a (150,0,0) <-> black cosine pulse at 4 Hz => FAIL via the red rule,
+    red maxRatePerSec == 4, exactly like the square wave between the same colours.
+
+    The fade passes through near-black reds such as (10,0,0): ratio 0 (ADR-020) but, before the
+    amendment, still red chromaticity.  The valley of the ratio signal was taken from that first
+    near-black frame, so the fall measured no colour change and the page passed."""
+    smooth = analyze(synth.eased_pulse_strip_frames(FOUR_HZ, 0.0, 90, "cosine", peak=DIM_RED),
+                     fps=synth.FPS, viewport=STRIP)
+    square = run_strip([Region(0, 0, STRIP[0], STRIP[1], square_wave(FOUR_HZ, BLACK, DIM_RED))])
+    for r in (smooth, square):
+        assert r.verdict == "FAIL"
+        assert r.red_max_rate == 4
+        assert r.general_max_rate == 0
+        assert violation_types(r) == ["red"]
+
+
+def test_18_red_against_near_black_is_judged_like_red_against_black() -> None:
+    """SPEC 5.10 item 18: (150,0,0) <-> (1,0,0) and <-> (2,2,2) give the same verdict as <-> (0,0,0):
+    one-step noise in the black cannot decide whether a red strobe is a red flash."""
+    rates = []
+    for dark in [BLACK, (1, 0, 0), (2, 2, 2), (15, 0, 0)]:
+        r = run_strip([Region(0, 0, STRIP[0], STRIP[1], square_wave(FOUR_HZ, dark, DIM_RED))])
+        rates.append((r.verdict, r.red_max_rate, r.general_max_rate))
+    assert rates == [("FAIL", 4, 0)] * 4
+
+
+# ---------------------------------------------------------------------------------------------
+# SPEC 5.10 item 19 (ADR-044, amending ADR-002: area measured in pixels, not whole cells)
+# ---------------------------------------------------------------------------------------------
+MID_PAGE: tuple[int, int] = (synth.VIEWPORT_W, 400)  # 100 cell rows: room for a 256 px tall region
+SUB_CELL_OFFSETS: list[tuple[int, int]] = [(0, 0), (1, 0), (2, 2), (3, 1)]  # px added to (100, 100)
+GREY_118: RGB = (118, 118, 118)
+GREY_150: RGB = (150, 150, 150)  # Delta L to GREY_118 = 0.124: a cell half covered changes by only 0.062
+
+
+def run_offset_region(x: int, y: int, w: int, h: int, dark: RGB, light: RGB) -> AnalysisResult:
+    """A 4 Hz dark <-> light rectangle at (x, y), anywhere on the pixel grid, on a dark 1024 x 400 page."""
+    region = Region(x, y, w, h, square_wave(FOUR_HZ, dark, light), grid_aligned=False)
+    frames = synth.scene_frames(dark, [region], DURATION_S, size=MID_PAGE)
+    return analyze(frames, fps=synth.FPS, viewport=MID_PAGE)
+
+
+@pytest.mark.parametrize(
+    ("w", "h", "dark", "light", "verdict"),
+    [
+        (172, 120, BLACK, WHITE, "PASS"),       # 20 640 px = 23.6% of 341 x 256
+        (340, 64, BLACK, WHITE, "PASS"),        # 21 760 px = 24.9%
+        (88, 256, GREY_118, GREY_150, "FAIL"),  # 22 528 px = 25.8%, low contrast
+    ],
+)
+def test_19_area_verdict_does_not_depend_on_sub_cell_offsets(
+    w: int, h: int, dark: RGB, light: RGB, verdict: str
+) -> None:
+    """SPEC 5.10 item 19: the same 4 Hz rectangle moved by 1-3 px off the 4 px cell grid keeps its
+    verdict.  Counting every touched cell as whole made the first two FAIL at (102, 102) (a 2-pixel
+    sliver flags a black/white cell); dropping half-covered cells whose mean changes by less than 0.10
+    made the low-contrast one PASS there.  Each cell now counts the pixels that flashed."""
+    for dx, dy in SUB_CELL_OFFSETS:
+        r = run_offset_region(100 + dx, 100 + dy, w, h, dark, light)
+        assert r.verdict == verdict, (dx, dy)
+        assert r.general_max_rate == (4 if verdict == "FAIL" else 0), (dx, dy)
+
+
+def test_19_area_of_a_region_inside_one_window_is_its_pixel_area_at_any_offset() -> None:
+    """SPEC 5.10 item 19: a 172 x 120 px rectangle fits inside one window wherever it sits, so its
+    measured area is exactly its 20 640 pixels over the 85 x 64-cell window (87 040 px) at every offset."""
+    areas = {
+        (dx, dy): float(run_offset_region(100 + dx, 100 + dy, 172, 120, BLACK, WHITE).frame_stats.general_area_max.max())
+        for dx, dy in SUB_CELL_OFFSETS
+    }
+    assert set(areas.values()) == {172 * 120 / (WINDOW_CELLS * synth.CELL_PX ** 2)}
 
 
 # ---------------------------------------------------------------------------------------------
