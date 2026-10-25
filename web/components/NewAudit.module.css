@@ -12,7 +12,7 @@
   border-left: 1px solid var(--rule);
   padding-left: 28px;
 }
-.explainer h2 { font-size: 21px; }
+.explainer h2 { font-size: var(--fs-h3); }
 .explainer ol { padding-left: 22px; margin: 0 0 16px; }
 .explainer li { margin-bottom: 8px; }
 
@@ -22,17 +22,28 @@
   margin: 0 0 20px;
 }
 
+/* Always present, so choosing a size never moves the blocks below it (SAFETY,
+   MOTION.md 8). Its inputs are disabled, showing the preset's size, until
+   Custom size is chosen. */
 .sizeRow {
   display: flex;
   flex-wrap: wrap;
   align-items: flex-end;
   gap: 8px 12px;
-  margin: 6px 0 0 28px;
+  margin: var(--s3) 0 0;
+  padding: var(--s3);
+  border: 1px dashed var(--rule-strong);
+  border-radius: var(--radius-card);
 }
+.sizeHint { flex-basis: 100%; margin: 0; }
+.sizeMessages { flex-basis: 100%; }
+.sizeMessages :global(.field-msg) { margin-top: 0; }
 .sizeRow label { display: block; font-weight: 600; font-size: 14px; margin-bottom: 4px; }
 .times { padding-bottom: 10px; color: var(--muted); }
 
 .submitError { margin: 0 0 16px; }
+/* Fixed width: "Run audit" and "Starting…" crossfade without the button changing size. */
+.runButton { min-width: 9.5em; }
 
 @media (max-width: 860px) {
   .layout { grid-template-columns: minmax(0, 1fr); gap: 24px; }

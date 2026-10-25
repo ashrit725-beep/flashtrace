@@ -2,7 +2,15 @@
 // the states reached by an action (verify running/failed/finished, a failed
 // submit, cancel, delete or ablation, lost contact, a failed reload), the
 // open frame dialog, a selected culprit and the phone layouts, in light AND
-// dark. Pass condition: 0 violations for WCAG 2.0/2.1/2.2 A and AA rules.
+// dark, and once more under reduced motion. Pass condition: 0 violations for
+// WCAG 2.0/2.1/2.2 A and AA rules.
+//
+// Contrast is measured on settled frames (web/MOTION.md section 6): before
+// every run the page is scrolled through in viewport steps (so in-view
+// entrances play; axe skips opacity-0 content), every Web Animation (CSS
+// transitions) is awaited, and then 700 ms pass, because Motion's fades,
+// springs, layout animations and motion values run on requestAnimationFrame
+// (lib/motion.ts PAGE_CLOCK) and every choreography ends within 600 ms.
 
 import AxeBuilder from "@axe-core/playwright";
 import { expect, test, type Page } from "@playwright/test";
@@ -10,7 +18,23 @@ import { IDS, failApi, mockApi, type MockMode } from "./mock-api";
 
 const TAGS = ["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa"];
 
+async function settle(page: Page) {
+  const { height, step, start } = await page.evaluate(() => ({
+    height: document.documentElement.scrollHeight,
+    step: window.innerHeight,
+    start: window.scrollY,
+  }));
+  for (let y = 0; y < height; y += step) {
+    await page.evaluate((top) => window.scrollTo({ top, behavior: "instant" }), y);
+    await page.waitForTimeout(30);
+  }
+  await page.evaluate((top) => window.scrollTo({ top, behavior: "instant" }), start);
+  await page.evaluate(() => Promise.all(document.getAnimations().map((a) => a.finished.catch(() => null))));
+  await page.waitForTimeout(700);
+}
+
 async function expectNoAxeViolations(page: Page) {
+  await settle(page);
   const results = await new AxeBuilder({ page }).withTags(TAGS).analyze();
   const summary = results.violations.map(
     (v) => `${v.id} (${v.impact}): ${v.help} -> ${v.nodes.map((n) => n.target.join(" ")).join(" | ")}`,
@@ -205,10 +229,16 @@ const CASES: Case[] = [
   { name: "history: loading", path: "/history/", mode: "loading", ready: (p) => expect(p.getByRole("status").last()).toContainText("Loading") },
 ];
 
-for (const scheme of ["light", "dark"] as const) {
-  test.describe(`axe, ${scheme} scheme`, () => {
+const PASSES = [
+  { name: "light scheme", colorScheme: "light", reducedMotion: "no-preference" },
+  { name: "dark scheme", colorScheme: "dark", reducedMotion: "no-preference" },
+  { name: "light scheme, reduced motion", colorScheme: "light", reducedMotion: "reduce" },
+] as const;
+
+for (const pass of PASSES) {
+  test.describe(`axe, ${pass.name}`, () => {
     test.beforeEach(async ({ page }) => {
-      await page.emulateMedia({ colorScheme: scheme });
+      await page.emulateMedia({ colorScheme: pass.colorScheme, reducedMotion: pass.reducedMotion });
     });
 
     for (const c of CASES) {

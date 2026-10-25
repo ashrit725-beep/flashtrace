@@ -31,6 +31,8 @@ export interface SafeToggle {
    * at the last frame); that does not start a new wait.
    */
   run: (change: () => boolean | void) => void;
+  /** Start the wait now, as if a change had just run (the frame viewer calls it when its opening fade ends). */
+  mark: () => void;
   /** Put this on the control's onKeyDown so a held Enter acts only once. */
   onKeyDown: (event: KeyboardEvent) => void;
 }
@@ -49,5 +51,8 @@ export function useSafeToggle(minMs: number = MIN_STEP_MS): SafeToggle {
     },
     [minMs],
   );
-  return { run, onKeyDown: blockKeyRepeat };
+  const mark = useCallback(() => {
+    last.current = performance.now();
+  }, []);
+  return { run, mark, onKeyDown: blockKeyRepeat };
 }

@@ -1,27 +1,65 @@
-/* Report screen. Everything here is static: the chart, the heatmap and the
-   evidence are still images; nothing blinks, pulses or auto-plays. */
+/* Report screen. The chart, the heatmap and the evidence are still images;
+   nothing blinks, pulses or auto-plays. One-shot entrances are drawn by
+   Motion (web/MOTION.md 3.3); everything here is the final state. Dark
+   colours come from tokens in globals.css only: no colour-scheme queries here. */
 
 /* ---------------------------------------------------------- verdict banner */
 
+/* A 1 px border in the verdict colour plus a 4 px top rule (no side stripe). */
 .banner {
-  border: 2px solid currentColor;
-  border-left-width: 12px;
-  border-radius: var(--radius);
-  padding: 18px 22px;
-  margin: 0 0 16px;
+  --tone: currentColor;
+  border: 1px solid color-mix(in srgb, var(--tone) 45%, transparent);
+  box-shadow: inset 0 4px 0 var(--tone);
+  border-radius: var(--radius-card);
+  padding: 24px 24px 20px;
+  margin: 0 0 var(--s4);
 }
-.banner .reason, .banner .meaning { color: var(--ink); }
+.banner .reason, .banner .meaning, .banner .figures dd { color: var(--ink); }
 .PASS { color: var(--pass); background: var(--pass-bg); }
 .FAIL { color: var(--fail); background: var(--fail-bg); }
 .INCONCLUSIVE { color: var(--warn); background: var(--warn-bg); }
+.verdictHead { display: flex; align-items: center; gap: var(--s3); margin: 0 0 var(--s3); }
+.seal { flex: none; display: block; }
 .verdictLine {
   font-family: var(--serif);
-  font-size: 38px;
-  line-height: 1.1;
-  margin: 0 0 10px;
+  font-size: var(--fs-verdict);
+  line-height: 1;
+  letter-spacing: -0.01em;
+  margin: 0;
 }
-.reason { font-size: 18px; margin: 0 0 6px; max-width: 72ch; }
-.meaning { font-size: 15px; margin: 0; max-width: 72ch; }
+.reason { font-size: 18px; margin: 0 0 var(--s4); max-width: 72ch; text-wrap: pretty; }
+.figures {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: var(--s3) var(--s5);
+  margin: 0 0 var(--s4);
+  padding: var(--s4) 0 0;
+  border-top: 1px solid color-mix(in srgb, currentColor 30%, transparent);
+}
+/* Labels wrap to different line counts; the values share one bottom line.
+   Sentence case, not tracked capitals: these labels are phrases ("Most red
+   flashes in a whole second"), and capitals wrapped them to three ragged
+   lines. Short caps labels stay in the summary list and table headers. */
+.figures div { min-width: 0; display: flex; flex-direction: column; }
+.figures dt {
+  font-size: var(--fs-small);
+  color: var(--muted);
+  font-weight: 500;
+  line-height: 1.35;
+  text-wrap: balance;
+}
+/* Data, so the system sans with lining tabular figures (the serif's old-style digits vary in height). */
+.figures dd {
+  margin: auto 0 0;
+  padding-top: 4px;
+  font-family: var(--sans);
+  font-size: var(--fs-h2);
+  font-weight: 600;
+  line-height: 1.1;
+  letter-spacing: -0.01em;
+  font-variant-numeric: tabular-nums lining-nums;
+}
+.meaning { font-size: 15px; margin: 0; max-width: 72ch; color: var(--muted) !important; text-wrap: pretty; }
 
 .actions { margin: 20px 0 8px; }
 
@@ -31,14 +69,14 @@
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
   gap: 14px 24px;
-  margin: 24px 0 0;
-  padding: 16px 0;
+  margin: var(--s5) 0 0;
+  padding: var(--s4) 0;
   border-top: 1px solid var(--rule);
   border-bottom: 1px solid var(--rule);
 }
 .summary div { min-width: 0; }
 .summary dt {
-  font-size: 12px;
+  font-size: var(--fs-meta);
   text-transform: uppercase;
   letter-spacing: 0.08em;
   color: var(--muted);
@@ -56,10 +94,10 @@
   list-style: none;
   margin: 0 0 8px;
   padding: 0;
-  font-size: 14px;
+  font-size: var(--fs-small);
 }
 .legend li { display: inline-flex; align-items: center; gap: 8px; }
-.swatch { width: 14px; height: 14px; display: inline-block; border: 1.5px solid; }
+.swatch { width: 12px; height: 12px; display: inline-block; border: 1.5px solid; }
 .swatchGeneral { background: var(--chart-general); border-color: var(--chart-general); }
 .swatchRed {
   border-color: var(--chart-red);
@@ -67,7 +105,7 @@
 }
 .swatchLimit { width: 22px; height: 0; border: 0; border-top: 2px dashed var(--fail); }
 .chartBox { width: 100%; }
-.chart { display: block; overflow: visible; }
+.chart { display: block; overflow: visible; touch-action: pan-y; }
 .chart text { font: 12px var(--sans); fill: var(--muted); font-variant-numeric: tabular-nums; }
 .chart .axisTitle { fill: var(--ink-soft); font-size: 13px; }
 .chart .limitLabel {
@@ -84,8 +122,11 @@
   stroke: var(--paper);
   stroke-width: 4px;
 }
+/* The pointer readout's column: a static tint, never animated. */
+.hoverColumn { fill: color-mix(in srgb, var(--paper-deep) 50%, transparent); }
+.readout { margin: 6px 0 0; min-height: 1.5em; font-size: var(--fs-small); color: var(--muted); }
 .swatchSpan { width: 22px; background: var(--fail-bg); border: 0; border-top: 3px solid var(--fail); }
-.tableToggle { margin: 12px 0; }
+.tableToggle { margin: var(--s3) 0; }
 
 /* ---------------------------------------------------------------- evidence */
 
@@ -98,46 +139,99 @@
   padding: 0;
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(min(240px, 100%), 1fr));
-  gap: 16px;
+  gap: var(--s4);
 }
 /* The button fills its grid cell, so every card in a row is the same height. */
 .evidence li { display: flex; max-width: 400px; }
+/* Hover: a darker border (by less than a flash transition; ink would be one)
+   and a deeper shadow that fades in by opacity (never an animated box-shadow).
+   The image never moves or zooms: evidence pixels stay exactly as captured, so
+   there is no press scale either. */
 .thumb {
+  position: relative;
   font: inherit;
   width: 100%;
   flex: 1;
   text-align: left;
-  padding: 0 0 10px;
-  border: 1.5px solid var(--rule-strong);
-  border-radius: var(--radius);
+  padding: 0 0 12px;
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius-card);
   background: var(--surface);
   color: var(--ink);
   cursor: zoom-in;
   display: flex;
   flex-direction: column;
   gap: 4px;
-  overflow: hidden;
+  box-shadow: var(--shadow-1);
   transition: border-color var(--transition);
 }
-.thumb:hover { border-color: var(--ink); }
-.thumb img { display: block; width: 100%; height: auto; border-bottom: 1px solid var(--rule); background: var(--paper-deep); }
-.thumbLabel { padding: 6px 10px 0; font-weight: 600; font-size: 14px; }
-.thumbMeta { padding: 0 10px; font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; margin-top: auto; }
+.thumb::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  box-shadow: var(--shadow-2);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--transition);
+}
+@media (hover: hover) and (pointer: fine) {
+  .thumb:hover { border-color: var(--rule-hover); }
+  .thumb:hover::after { opacity: 1; }
+}
+.thumb img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border-bottom: 1px solid var(--rule);
+  background: var(--paper-deep);
+  border-radius: var(--radius-card) var(--radius-card) 0 0;
+  outline: 1px solid var(--image-outline);
+  outline-offset: -1px;
+}
+.thumbLabel { padding: 8px 12px 0; font-weight: 600; font-size: var(--fs-small); }
+.thumbMeta { padding: 0 12px; font-size: var(--fs-meta); color: var(--muted); font-variant-numeric: tabular-nums; margin-top: auto; }
 
 /* ------------------------------------------------------------ frame dialog */
 
+/* The <dialog> is a transparent shell in the top layer; the panel inside it
+   carries the border and surface (it fades in and out, never scaled),
+   and the ghost outline flies beside it, unaffected by the panel's opacity. */
 .dialog {
   width: min(1100px, calc(100vw - 24px));
+  max-width: none;
   max-height: calc(100vh - 24px);
-  padding: 18px 20px 20px;
-  border: 2px solid var(--ink);
-  border-radius: var(--radius);
-  background: var(--surface);
+  padding: 0;
+  border: 0;
+  background: transparent;
   color: var(--ink);
+  overflow: visible;
 }
-/* A mid-grey dim, not near-black: opening/closing the viewer should not be a
-   large luminance jump for the whole screen. */
-.dialog::backdrop { background: rgb(20 19 17 / 0.5); }
+.panel {
+  max-height: calc(100vh - 24px);
+  overflow: auto;
+  padding: 18px 20px 20px;
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius-card);
+  background: var(--surface);
+  box-shadow: var(--shadow-2);
+}
+/* A paper veil, not a dim: opening and closing the viewer keeps the page
+   background's luminance where it was. It fades in with the panel (same
+   160 ms, same curve) and goes at once on close, with the panel (FrameDialog:
+   an instant close completes the viewer's flashes in one frame, not several).
+   One fade, never repeated. */
+.dialog::backdrop {
+  background: var(--veil);
+  animation: veil-in var(--dur-quick) var(--ease-out) both;
+}
+/* A keyboard-opened viewer appears at once, veil and panel together, so focus
+   never lands on a control that is still fading in (MOTION.md 8). */
+.dialog[data-instant]::backdrop { animation: none; }
+@keyframes veil-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
 .dialogHead { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 4px; }
 .dialogHead h2 { margin: 0; }
 .dialogImage {
@@ -149,7 +243,10 @@
   background: var(--paper-deep);
   border: 1px solid var(--rule);
   margin: 10px 0;
+  outline: 1px solid var(--image-outline);
+  outline-offset: -1px;
 }
+.ghost { z-index: 1; pointer-events: none; color: var(--ink); }
 .counter { font-variant-numeric: tabular-nums; font-weight: 600; margin: 0 0 12px; }
 
 /* ----------------------------------------------------------------- heatmap */
@@ -177,14 +274,18 @@
   border: 1px solid var(--rule-strong);
   background: var(--paper-deep);
 }
-.stage img { display: block; width: 100%; height: auto; }
+.stage img { display: block; width: 100%; height: auto; outline: 1px solid var(--image-outline); outline-offset: -1px; }
+/* The overlay stays mounted and fades (160 ms); the shared 350 ms gate limits how often. */
 .heatCanvas {
   position: absolute;
   left: 0;
   top: 0;
   image-rendering: pixelated;
   pointer-events: none;
+  opacity: 1;
+  transition: opacity var(--transition);
 }
+.heatHidden { opacity: 0; }
 .box {
   position: absolute;
   pointer-events: none;
@@ -194,10 +295,12 @@
   border: 3px dashed #171613;
   outline: 2px solid #ffffff;
 }
-.culpritBox {
-  border: 3px solid #1d5a3c;
-  outline: 2px solid #ffffff;
-}
+/* The culprit outline: a layer over the stage holding an SVG rect (non-scaling
+   3 px stroke with a white halo, drawn by HeatmapView) and its label, which is
+   placed below the box by left/top. Nothing in it is scaled. Fixed colours:
+   they sit on captured frames. */
+.outlineLayer { position: absolute; inset: 0; pointer-events: none; line-height: 1.2; }
+.outlineSvg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
 .boxLabel {
   position: absolute;
   left: -3px;
@@ -213,9 +316,12 @@
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.culpritBox .boxLabel { background: #1d5a3c; top: auto; bottom: -3px; transform: translateY(100%); }
 .labelRight .boxLabel { left: auto; right: -3px; }
-.figcaption { font-size: 14px; color: var(--ink-soft); margin-top: 0; line-height: 1.5; }
+/* The culprit label hangs below its box (left/top come from HeatmapView). */
+.boxLabel.culpritLabel { background: #1d5a3c; transform: none; }
+.boxLabel.culpritLabelRight { transform: translateX(-100%); }
+.figcaption { font-size: var(--fs-small); color: var(--ink-soft); margin-top: 0; line-height: 1.5; text-wrap: pretty; }
+.overlayRow { margin-top: var(--s3); }
 .legendBox { max-width: 360px; margin-top: 12px; }
 .rampBar { height: 14px; border: 1px solid var(--rule-strong); margin: 6px 0 4px; }
 /* Each tick is placed at its own count's position on the ramp (rampT), so
@@ -227,10 +333,14 @@
 .singleSwatch { display: flex; align-items: center; gap: 8px; font-size: 14px; }
 .swatchCell { width: 18px; height: 18px; border: 1px solid var(--rule-strong); flex: none; }
 
+.subhead { margin-top: var(--s6); }
+.ablate { margin-top: var(--s4); }
+
 /* ---------------------------------------------------------------- culprits */
 
 .selectedRow td { background: var(--pass-bg); }
 .selectedRow td:first-child { box-shadow: inset 4px 0 0 var(--accent); }
+.culpritRow td { transition: background-color var(--transition); }
 .culpritRow { cursor: pointer; }
 
 /* On a phone the table scrolls sideways; Rank and Element stay pinned at the
@@ -256,14 +366,15 @@
 
 /* minmax(0, 1fr): grid items default to min-width:auto, so a long CSS line
    in a <pre> would otherwise widen the whole page on a phone. */
-.fixes { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: 20px; }
+.fixes { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--s5); }
 .fix {
-  border: 1.5px solid var(--rule-strong);
-  border-radius: var(--radius);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius-card);
   background: var(--surface);
-  padding: 16px 18px;
+  box-shadow: var(--shadow-1);
+  padding: 20px;
 }
-.fixHead { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 8px 16px; }
+.fixHead { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 8px 16px; margin-bottom: var(--s2); }
 .fixHead h3 { margin: 0; }
 /* Long lines wrap instead of scrolling: a scrolling <pre> is a region that
    keyboard users cannot scroll (axe scrollable-region-focusable at phone
@@ -271,14 +382,21 @@
 .code {
   background: var(--paper-deep);
   border: 1px solid var(--rule);
+  border-radius: var(--radius);
   padding: 12px 14px;
   margin: 10px 0;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
 .measure { max-width: 560px; margin: 8px 0 12px; }
-.status { font-size: 14px; color: var(--ink-soft); min-height: 1.5em; margin: 6px 0 0; }
-.why { font-size: 14px; color: var(--warn); font-weight: 600; margin: 8px 0 4px; }
+/* A value the fix changed keeps a quiet tint (not a flash: the darker side stays above 0.80). */
+.changed { background: var(--pass-bg); }
+.status { font-size: var(--fs-small); color: var(--ink-soft); min-height: 1.5em; margin: 6px 0 0; }
+.why { font-size: var(--fs-small); color: var(--warn); font-weight: 600; margin: 8px 0 4px; }
+/* Fixed width: "Copy CSS" and "Copied" swap without the button changing size. */
+.copyButton { min-width: 7.5em; justify-content: flex-start; }
+.copyIcon { position: relative; display: inline-grid; width: 14px; height: 14px; place-items: center; }
+.copyText { display: inline-block; }
 
 /* ------------------------------------------------------------- finding lists */
 
@@ -288,7 +406,11 @@
 
 @media (max-width: 860px) {
   .heatmapLayout { grid-template-columns: minmax(0, 1fr); }
-  .verdictLine { font-size: 32px; }
+}
+@media (max-width: 640px) {
+  .banner { padding: 20px 16px 16px; }
+  .figures { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .fix { padding: 16px; }
 }
 
 .figureWrap { max-width: 880px; }

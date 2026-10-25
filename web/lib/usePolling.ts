@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 
 /**
  * The fastest the UI ever asks the server for anything (docs/API.md: "polls
@@ -9,6 +10,56 @@ import { useCallback, useEffect, useRef, useState } from "react";
  * so requests never overlap and never come faster than 1 per second.
  */
 export const POLL_INTERVAL_MS = 1000;
+
+/** A hidden tab runs no animation frames: apply the update after this long instead. */
+const HIDDEN_TAB_FALLBACK_MS = 100;
+
+/**
+ * A network result is applied no sooner than this long after its request
+ * started (page clock). Under FlashTrace's capture the request finishes while
+ * virtual time stands still, but reading its body is a further browser task:
+ * on a loaded machine it could finish one capture step later, and the result
+ * then appeared a frame apart in two captures of the same screen (self-audit
+ * F4, F4c and F7 under four concurrent captures). Measured from the request's
+ * start, the moment is the same in every run. In a browser it adds at most
+ * 50 ms, and only to an answer that came back faster than that.
+ */
+export const NETWORK_SETTLE_MS = 50;
+
+/**
+ * Applies a state update that arrives from outside an input event (a network
+ * answer, an IntersectionObserver report) in the next animation frame, and
+ * commits it at once (flushSync). A promise or observer callback is outside
+ * React's batching, so React would commit it in a task of its own at a moment
+ * set by machine speed. FlashTrace's self-audit captures this UI on a
+ * controlled clock, and there the frame in which new data appeared (and the
+ * time its animations started) differed between two captures of the same
+ * screen. In an animation frame it lands at the same, frame-aligned time every
+ * time; in a browser this costs at most one frame.
+ */
+export function onPageClock(update: () => void, requestStartedAt?: number): Promise<void> {
+  return new Promise((resolve) => {
+    let done = false;
+    let frame = 0;
+    let fallback: ReturnType<typeof setTimeout> | undefined;
+    const run = () => {
+      if (done) return;
+      done = true;
+      cancelAnimationFrame(frame);
+      clearTimeout(fallback);
+      flushSync(update);
+      resolve();
+    };
+    const start = () => {
+      frame = requestAnimationFrame(run);
+      fallback = setTimeout(run, HIDDEN_TAB_FALLBACK_MS);
+    };
+    // A network result waits until NETWORK_SETTLE_MS after its request started (see above).
+    const wait = requestStartedAt === undefined ? 0 : requestStartedAt + NETWORK_SETTLE_MS - performance.now();
+    if (wait > 0) setTimeout(start, wait);
+    else start();
+  });
+}
 
 export interface PollState<T> {
   /** Latest successful answer (kept while a retry is in flight). */
@@ -78,14 +129,19 @@ export function usePolling<T>(
       if (document.hidden) return; // the visibilitychange handler resumes us
       inFlight = true;
       lastStart = Date.now();
+      const startedAt = performance.now();
       try {
         const value = await fetcherRef.current();
         if (stopped) return;
-        setState({ token, data: value, error: null });
+        await onPageClock(() => {
+          if (!stopped) setState({ token, data: value, error: null });
+        }, startedAt);
         if (isDoneRef.current(value)) stopped = true;
       } catch (error) {
         if (stopped) return;
-        setState((prev) => ({ token, data: prev.token === token ? prev.data : null, error }));
+        await onPageClock(() => {
+          if (!stopped) setState((prev) => ({ token, data: prev.token === token ? prev.data : null, error }));
+        }, startedAt);
         stopped = true;
       } finally {
         inFlight = false;
@@ -133,18 +189,20 @@ export function useLoad<T>(key: string | null, fetcher: () => Promise<T>): PollS
 /**
  * The same once-per-second rule for event handlers (where hooks cannot be
  * used), e.g. "Verify this fix": waits POLL_INTERVAL_MS before every request
- * and resolves with the first value for which isDone is true, or null when
+ * and resolves with the first value for which isDone is true (and the page
+ * clock time its request started, for onPageClock), or null when
  * isCancelled() says the caller has gone away (the screen unmounted).
  */
 export async function pollUntil<T>(
   fetcher: () => Promise<T>,
   isDone: (value: T) => boolean,
   isCancelled: () => boolean,
-): Promise<T | null> {
+): Promise<{ value: T; startedAt: number } | null> {
   for (;;) {
     await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
     if (isCancelled()) return null;
+    const startedAt = performance.now();
     const value = await fetcher();
-    if (isDone(value)) return value;
+    if (isDone(value)) return { value, startedAt };
   }
 }

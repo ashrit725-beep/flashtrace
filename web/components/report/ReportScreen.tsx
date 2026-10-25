@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import {
   ApiError,
   ablate,
@@ -14,10 +15,12 @@ import {
   verifyFix,
   type Report,
 } from "@/lib/api";
-import { pollUntil, useLoad } from "@/lib/usePolling";
+import { GATE_MS, LargeAreaGateContext, useTrailingGate } from "@/lib/motion";
+import { onPageClock, pollUntil, useLoad } from "@/lib/usePolling";
+import { useSafeToggle } from "@/lib/useSafeToggle";
 import { EmptyState, ErrorState, LoadingState, errorMessage } from "../StatusViews";
 import CulpritsTable from "./CulpritsTable";
-import EvidenceStrip from "./EvidenceStrip";
+import EvidenceStrip, { type OpenRequest } from "./EvidenceStrip";
 import { AdvisoryList, TextList, ViolationsList } from "./FindingsLists";
 import FixPanel, { type VerifyFinished } from "./FixPanel";
 import FrameDialog from "./FrameDialog";
@@ -26,6 +29,13 @@ import styles from "./Report.module.css";
 import SummaryList from "./SummaryList";
 import TimelineChart from "./TimelineChart";
 import VerdictBanner from "./VerdictBanner";
+
+/**
+ * Job ids whose report entrance has played in this tab (web/MOTION.md 3.3:
+ * entrances run once per job id, on the first data arrival; a reload after
+ * Verify, or coming back to the same report, never replays them).
+ */
+const entered = new Set<string>();
 
 function Heading() {
   return (
@@ -50,7 +60,7 @@ function ReportProblem({ id, error, onRetry, retried }: ProblemProps) {
   const run = `/run/?id=${encodeURIComponent(id)}`;
   if (status === 409) {
     return (
-      <EmptyState title="This audit has not finished yet">
+      <EmptyState title="This audit has not finished yet" illustration="frame">
         <p>
           The report is written when the audit is done. <Link href={run}>Watch its progress</Link>.
         </p>
@@ -77,8 +87,28 @@ export default function ReportScreen() {
   const router = useRouter();
   const report = useLoad(id, () => getReport(id ?? ""));
 
-  const [selectedRank, setSelectedRank] = useState<number | null>(null);
-  const [dialogFrame, setDialogFrame] = useState<number | null>(null);
+  const [selection, setSelection] = useState<{ rank: number | null; instant: boolean }>({ rank: null, instant: false });
+  const selectedRank = selection.rank;
+  const [dialog, setDialog] = useState<OpenRequest | null>(null);
+  // SAFETY: opening the viewer veils the whole page, and each open plus close
+  // can complete two flashes (the veil over a black evidence thumbnail, the
+  // viewer's own frame). Opens are at least 1 s apart, and the viewer also stays
+  // shut for 1 s after it finished closing (the self-audit's F1 at 390 px found
+  // two open-close cycles inside one second); a click inside that time opens the
+  // viewer when it ends instead of being lost (leading plus trailing). Closing
+  // is never gated.
+  const openGate = useTrailingGate(GATE_MS.dialogOpen);
+  // flushSync: a deferred open runs from a timer; it commits in that same frame.
+  const openFrame = (request: OpenRequest) => openGate.run(() => flushSync(() => setDialog(request)));
+  const closeFrame = () => {
+    setDialog(null);
+    openGate.restart();
+  };
+  // SAFETY: the heatmap overlay and the data-table disclosure change the same
+  // cells, so they share one 350 ms gate (MOTION.md 3.3, section 6).
+  const largeArea = useSafeToggle(GATE_MS.largeArea);
+  // Decided once, when this job's report first arrives.
+  const [enterFor, setEnterFor] = useState<string | null>(null);
   const [verifying, setVerifying] = useState<number | null>(null);
   const [verifyError, setVerifyError] = useState<{ index: number; message: string } | null>(null);
   // The fix whose verification finished last, and the report object it
@@ -100,11 +130,20 @@ export default function ReportScreen() {
   const r: Report | null = report.data;
   const labels = useMemo(() => new Map((r?.evidenceFrames ?? []).map((f) => [f.index, f.label])), [r]);
 
+  // The first arrival of a job's report plays the entrance; record it so it never replays.
+  const arrivedId = r !== null ? id : null;
+  useEffect(() => {
+    if (arrivedId === null || entered.has(arrivedId)) return;
+    entered.add(arrivedId);
+    const frame = requestAnimationFrame(() => setEnterFor(arrivedId));
+    return () => cancelAnimationFrame(frame);
+  }, [arrivedId]);
+
   if (!id) {
     return (
       <>
         <Heading />
-        <EmptyState title="No report selected">
+        <EmptyState title="No report selected" illustration="frame">
           <p>
             Open a report from <Link href="/history/">History</Link> or <Link href="/">start a new audit</Link>.
           </p>
@@ -131,6 +170,9 @@ export default function ReportScreen() {
 
   const jobId = id;
   const selected = r.culprits.find((c) => c.rank === selectedRank) ?? null;
+  // The entrance plays for a report that has not played it yet in this tab
+  // (checked at render so the first painted frame is already the hidden state).
+  const enter = enterFor === jobId || !entered.has(jobId);
   const canAblate = r.culprits.length > 0 && r.culprits.some((c) => c.ablationDelta === null);
 
   const startReport = r;
@@ -147,15 +189,21 @@ export default function ReportScreen() {
     setVerifyDone(null);
     try {
       await verifyFix(jobId, n);
-      const job = await pollUntil(() => getJob(jobId), isFinished, () => !mounted.current);
-      if (job === null) return; // the screen has gone
+      const polled = await pollUntil(() => getJob(jobId), isFinished, () => !mounted.current);
+      if (polled === null) return; // the screen has gone
+      const job = polled.value;
       if (job.status === "error") throw new Error(job.error ?? "The verification run failed.");
       if (job.status === "cancelled") throw new Error("The audit was cancelled before the verification finished.");
-      setVerifyDone({ index: n, from: startReport });
-      report.retry();
+      // On the page clock, like every network result (lib/usePolling onPageClock), and in one
+      // commit: the busy state ends with the result, not in a React task of its own a frame
+      // later (two self-audit captures of F7 differed by that frame under load).
+      await onPageClock(() => {
+        setVerifying(null);
+        setVerifyDone({ index: n, from: startReport });
+        report.retry();
+      }, polled.startedAt);
     } catch (error) {
       setVerifyError({ index: n, message: errorMessage(error) });
-    } finally {
       setVerifying(null);
     }
   }
@@ -176,13 +224,13 @@ export default function ReportScreen() {
   }
 
   return (
-    <>
+    <LargeAreaGateContext.Provider value={largeArea}>
       <div className="page-head">
         <p className="kicker">Report</p>
         <h1>Audit report</h1>
       </div>
 
-      <VerdictBanner report={r} />
+      <VerdictBanner report={r} enter={enter} />
       <SummaryList report={r} />
 
       <div className={`btn-row ${styles.actions}`}>
@@ -222,20 +270,24 @@ export default function ReportScreen() {
           frames={r.evidenceFrames}
           fps={r.settings.fps}
           viewport={r.settings.viewport}
-          onOpen={setDialogFrame}
+          onOpen={openFrame}
         />
       </section>
 
       <section className="section" aria-labelledby="where-heading">
         <h2 id="where-heading">Where it flashes and what causes it</h2>
         <div className={styles.figureWrap}>
-          <HeatmapView jobId={jobId} report={r} selected={selected} />
+          <HeatmapView jobId={jobId} report={r} selected={selected} instant={selection.instant} />
         </div>
 
-        <h3 style={{ marginTop: 28 }}>Culprits</h3>
-        <CulpritsTable report={r} selectedRank={selectedRank} onSelect={setSelectedRank} />
+        <h3 className={styles.subhead}>Culprits</h3>
+        <CulpritsTable
+          report={r}
+          selectedRank={selectedRank}
+          onSelect={(rank, instant) => setSelection({ rank, instant })}
+        />
         {canAblate && (
-          <div style={{ marginTop: 16 }}>
+          <div className={styles.ablate}>
             <p className="hint" id="ablate-hint">
               Ablation hides each culprit in turn and measures again, which confirms the cause. It re-captures the
               page up to 6 times.
@@ -270,7 +322,7 @@ export default function ReportScreen() {
 
       <section className="section" aria-labelledby="violations-heading">
         <h2 id="violations-heading">Violations</h2>
-        <ViolationsList report={r} onViewFrame={setDialogFrame} />
+        <ViolationsList report={r} onViewFrame={openFrame} />
       </section>
 
       <section className="section" aria-labelledby="advisory-heading">
@@ -294,18 +346,21 @@ export default function ReportScreen() {
         <p className="muted">{r.disclaimer}</p>
       </section>
 
-      {dialogFrame !== null && (
+      {dialog !== null && (
         <FrameDialog
-          key={dialogFrame}
+          key={`${dialog.index}`}
           jobId={jobId}
-          startIndex={dialogFrame}
+          startIndex={dialog.index}
           frameCount={r.capture.frameCount}
           fps={r.settings.fps}
           viewport={r.settings.viewport}
           labels={labels}
-          onClose={() => setDialogFrame(null)}
+          origin={dialog.origin}
+          keyboard={dialog.keyboard}
+          opener={dialog.opener}
+          onClose={closeFrame}
         />
       )}
-    </>
+    </LargeAreaGateContext.Provider>
   );
 }

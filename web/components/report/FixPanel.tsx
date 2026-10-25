@@ -1,7 +1,11 @@
 "use client";
 
-import { useState } from "react";
+import { AnimatePresence, motion } from "motion/react";
+import { useEffect, useRef, useState } from "react";
 import type { Fix, FixKind, Measurement, Report } from "@/lib/api";
+import { DUR, PAGE_CLOCK, SHIFT, useMotionTokens } from "@/lib/motion";
+import CrossfadeLabel from "../motion/CrossfadeLabel";
+import DrawPath from "../motion/DrawPath";
 import styles from "./Report.module.css";
 
 const KIND_LABEL: Record<FixKind, string> = {
@@ -44,6 +48,29 @@ function statusText(fix: Fix, i: number, { verifying, verifyError, verifyFinishe
   );
 }
 
+/**
+ * An After value (web/MOTION.md 3.3). When a verification brings a new value
+ * it fades in (opacity, 4 px rise) beside the unchanged Before value. It never
+ * ticks from Before to After: the values in between were never measured.
+ */
+function AfterValue({ text }: { text: string }) {
+  const m = useMotionTokens();
+  return (
+    <AnimatePresence initial={false} mode="popLayout">
+      <motion.span
+        {...PAGE_CLOCK}
+        key={text}
+        style={{ display: "inline-block" }}
+        initial={m.from({ opacity: 0, y: SHIFT.xs })}
+        animate={{ opacity: 1, y: 0 }}
+        transition={m.tween(DUR.base)}
+      >
+        {text}
+      </motion.span>
+    </AnimatePresence>
+  );
+}
+
 function MeasureTable({ fix, n }: { fix: Fix; n: number }) {
   const rows: { label: string; get: (m: Measurement) => string }[] = [
     { label: "Verdict", get: (m) => m.verdict },
@@ -70,38 +97,107 @@ function MeasureTable({ fix, n }: { fix: Fix; n: number }) {
           </tr>
         </thead>
         <tbody>
-          {rows.map((row) => (
-            <tr key={row.label}>
-              <th scope="row">{row.label}</th>
-              <td className="numeric">{row.get(fix.before)}</td>
-              <td className="numeric">{fix.after ? row.get(fix.after) : "not measured"}</td>
-            </tr>
-          ))}
+          {rows.map((row) => {
+            const before = row.get(fix.before);
+            const after = fix.after ? row.get(fix.after) : null;
+            // A persistent tint marks a value the fix changed (not a flash: the darker side stays above 0.80).
+            const changed = after !== null && after !== before;
+            return (
+              <tr key={row.label}>
+                <th scope="row">{row.label}</th>
+                <td className="numeric">{before}</td>
+                <td className={`numeric ${changed ? styles.changed : ""}`}>
+                  <AfterValue text={after ?? "not measured"} />
+                </td>
+              </tr>
+            );
+          })}
         </tbody>
       </table>
     </div>
   );
 }
 
+const COPIED_FOR_MS = 2000;
+
+function CopyIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <rect x="8" y="8" width="12" height="12" rx="1.5" fill="none" stroke="currentColor" strokeWidth="2" />
+      <path d="M16 8V5.5A1.5 1.5 0 0 0 14.5 4h-9A1.5 1.5 0 0 0 4 5.5v9A1.5 1.5 0 0 0 5.5 16H8" fill="none" stroke="currentColor" strokeWidth="2" />
+    </svg>
+  );
+}
+
+/**
+ * Copy CSS (web/MOTION.md 3.3): the icon crossfades to a check and the label
+ * reads "Copied" in a fixed width, then reverts once after 2 s (one revert,
+ * nothing periodic). A click while "Copied" shows copies again and restarts
+ * the 2 s without replaying the morph. The status line is a polite live region.
+ */
 function CopyButton({ text, label }: { text: string; label: string }) {
   const [status, setStatus] = useState("");
+  const [copied, setCopied] = useState(false);
+  const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  useEffect(() => () => clearTimeout(timer.current), []);
   async function copy() {
     try {
       await navigator.clipboard.writeText(text);
       setStatus("Copied to the clipboard.");
+      setCopied(true);
+      clearTimeout(timer.current);
+      timer.current = setTimeout(() => setCopied(false), COPIED_FOR_MS);
     } catch {
       setStatus("Copy failed. Select the CSS and copy it by hand.");
     }
   }
   return (
     <>
-      <button type="button" className="btn btn-small" onClick={copy} aria-label={`Copy CSS for ${label}`}>
-        Copy CSS
+      <button
+        type="button"
+        className={`btn btn-small ${styles.copyButton}`}
+        onClick={copy}
+        aria-label={`${copied ? "Copied CSS" : "Copy CSS"} for ${label}`}
+      >
+        <span className={styles.copyIcon}>
+          <CrossfadeLabel value={copied ? "done" : "copy"} scaleFrom={0.8}>
+            {copied ? <DrawPath glyph="check" size={14} strokeWidth={2.5} draw={false} /> : <CopyIcon />}
+          </CrossfadeLabel>
+        </span>
+        <span className={styles.copyText}>{copied ? "Copied" : "Copy CSS"}</span>
       </button>
       <span className={styles.status} aria-live="polite">
         {status}
       </span>
     </>
+  );
+}
+
+/**
+ * The Verified badge (web/MOTION.md 3.3): when a verification flips it, "○ Not
+ * verified" crossfades to a drawn check and "Verified", and the badge settles
+ * from scale 0.96. One .badge element throughout, so its text is always one label.
+ */
+function VerifiedBadge({ verified }: { verified: boolean }) {
+  const m = useMotionTokens();
+  const [first] = useState(verified);
+  const changed = verified !== first;
+  return (
+    <motion.span
+      className={`badge ${verified ? "badge-ok" : "badge-no"}`}
+      initial={false}
+      animate={{ scale: changed && !m.reduce ? [0.96, 1] : 1 }}
+      transition={m.tween(DUR.base)}
+    >
+      <CrossfadeLabel value={verified ? "yes" : "no"}>
+        {verified ? (
+          <DrawPath glyph="check" size={13} strokeWidth={3} draw={changed} duration={DUR.base} />
+        ) : (
+          <span aria-hidden="true">○</span>
+        )}
+        {verified ? "Verified" : "Not verified"}
+      </CrossfadeLabel>
+    </motion.span>
   );
 }
 
@@ -129,10 +225,7 @@ export default function FixPanel({ report, verifying, verifyError, verifyFinishe
               <h3 id={headingId}>
                 Fix {n}: {KIND_LABEL[fix.kind]}
               </h3>
-              <span className={`badge ${fix.verified ? "badge-ok" : "badge-no"}`}>
-                <span aria-hidden="true">{fix.verified ? "✓" : "○"}</span>
-                {fix.verified ? "Verified" : "Not verified"}
-              </span>
+              <VerifiedBadge verified={fix.verified} />
             </div>
             {fix.after?.verdict === "PASS" && !fix.verified && (
               <p className={styles.why}>
@@ -162,6 +255,9 @@ export default function FixPanel({ report, verifying, verifyError, verifyFinishe
                 {/* aria-disabled, not disabled: a disabled button loses keyboard
                     focus (it drops to <body>), so the user would have to Tab
                     back from the top of the page. onClick ignores it while busy. */}
+                {/* The label stays "Verifying…" until the reloaded report has
+                    arrived, so it changes once ("Verifying…" -> "Verify again"),
+                    never through "Verify this fix" for a frame in between. */}
                 <button
                   type="button"
                   className="btn"
@@ -171,7 +267,11 @@ export default function FixPanel({ report, verifying, verifyError, verifyFinishe
                   aria-disabled={verifying !== null}
                   aria-describedby={`fix-${n}-status`}
                 >
-                  {verifying === i ? "Verifying…" : fix.verified ? "Verify again" : "Verify this fix"}
+                  {verifying === i || (verifyFinished?.index === i && !verifyFinished.loaded)
+                    ? "Verifying…"
+                    : fix.verified
+                      ? "Verify again"
+                      : "Verify this fix"}
                 </button>
                 <span id={`fix-${n}-status`} className={styles.status} role="status">
                   {statusText(fix, i, { verifying, verifyError, verifyFinished })}

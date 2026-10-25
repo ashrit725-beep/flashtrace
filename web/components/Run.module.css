@@ -1,30 +1,37 @@
-/* Running screen. The stepper and progress bar are completely static:
-   SAFETY (docs/SPEC.md section 9) rules out spinners and pulsing, so state
-   changes only when a poll (at most once per second) brings new numbers. */
+/* Running screen. SAFETY (docs/SPEC.md section 9) rules out spinners and
+   pulsing: state changes only when a poll (at most once per second) brings
+   new numbers, and then moves once (the fill, the counter, a check). */
 
 .phase {
   font-family: var(--serif);
-  font-size: 24px;
-  margin: 0 0 10px;
+  font-size: var(--fs-h2);
+  margin: 0 0 var(--s3);
   font-variant-numeric: tabular-nums;
 }
+/* The frame count is data: the system sans with lining tabular figures, like
+   the report's key figures. Georgia's old-style digits rise and drop below the
+   baseline, so a ticking count shimmied vertically. */
+.count {
+  white-space: nowrap;
+  font-family: var(--sans);
+  font-weight: 600;
+  font-size: 0.88em;
+  letter-spacing: -0.01em;
+  font-variant-numeric: tabular-nums lining-nums;
+}
 
-.bar {
-  appearance: none;
-  -webkit-appearance: none;
-  display: block;
+/* The visible bar; the native <progress> beside it is visually hidden and
+   carries the value for assistive technology. */
+.track {
   width: 100%;
   max-width: 640px;
   height: 14px;
-  border: 1.5px solid var(--ink);
+  border: 1px solid var(--ink);
   border-radius: var(--radius);
   background: var(--surface);
-  color: var(--accent);
   overflow: hidden;
 }
-.bar::-webkit-progress-bar { background: var(--surface); }
-.bar::-webkit-progress-value { background: var(--accent); }
-.bar::-moz-progress-bar { background: var(--accent); }
+.fill { height: 100%; background: var(--accent); }
 
 .barNote { margin: 8px 0 24px; color: var(--muted); font-size: 14px; }
 
@@ -51,7 +58,9 @@
   border-radius: 50%;
   font-size: 13px;
   font-weight: 700;
+  transition: background-color var(--transition), border-color var(--transition), color var(--transition);
 }
+.glyph svg { display: block; }
 .complete { color: var(--ink-soft); }
 .complete .glyph { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 .current { color: var(--ink); font-weight: 700; }

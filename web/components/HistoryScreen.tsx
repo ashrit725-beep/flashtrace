@@ -1,10 +1,13 @@
 "use client";
 
+import { useIsPresent } from "motion/react";
 import Link from "next/link";
-import { useEffect, useRef, useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import { deleteJob, isFinished, isReportReady, listJobs, type JobSummary } from "@/lib/api";
 import { PHASE_LABEL, formatDateTime } from "@/lib/format";
-import { useLoad } from "@/lib/usePolling";
+import { GATE_MS, useCooldown } from "@/lib/motion";
+import { onPageClock, useLoad } from "@/lib/usePolling";
+import { AnimatedItem, AnimatedRows } from "./motion/AnimatedRows";
 import { EmptyState, ErrorState, LoadingState } from "./StatusViews";
 import VerdictTag from "./VerdictTag";
 import styles from "./History.module.css";
@@ -37,8 +40,10 @@ interface ActionsProps {
 }
 
 // Shared by the table and the cards. data-delete lets the screen find the
-// visible Delete button for a job when it needs to move focus there.
+// visible Delete button for a job when it needs to move focus there; a row
+// that is leaving (its exit is still fading) drops it, so focus never goes there.
 function JobActions({ job, busy, onDelete }: ActionsProps) {
+  const present = useIsPresent();
   const when = formatDateTime(job.createdAt);
   const open = isReportReady(job) ? "Open report" : "Open progress";
   return (
@@ -50,7 +55,7 @@ function JobActions({ job, busy, onDelete }: ActionsProps) {
       <button
         type="button"
         className="btn btn-small btn-danger"
-        data-delete={job.id}
+        data-delete={present ? job.id : undefined}
         onClick={() => onDelete(job)}
         aria-disabled={busy}
         aria-label={`Delete audit of ${job.url}, ${when}`}
@@ -73,8 +78,20 @@ function focusDeleteButton(id: string | null): boolean {
 
 // Screen 4 (/history). One request on load (no polling: a list of past
 // audits does not need live updates); Retry or a delete reloads it.
+// Motion (web/MOTION.md 3.4, section 8): the list simply appears (it is a
+// utility view the user returns to often). A deleted row fades out (160 ms)
+// in its place, then the rows below close the gap at once (no glide).
 export default function HistoryScreen() {
   const jobs = useLoad("jobs", listJobs);
+  // SAFETY: each delete fades a row out and then moves the rest up, which can
+  // complete a flash in the cells of the rows that move. A delete is accepted
+  // at most once a second after the previous row actually left (on top of the
+  // confirm dialog): the cool-down starts when the server answers and again
+  // when the exit has finished and the rows close the gap, so two of those
+  // jumps are always more than a second apart (the self-audit's F4 measured 3
+  // per second when it started at the answer only). A delete that failed
+  // changed nothing, so its Retry is not held.
+  const removeCooldown = useCooldown(GATE_MS.remove);
   const [deleting, setDeleting] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState<{ job: JobSummary; error: unknown } | null>(null);
   const [deletedAny, setDeletedAny] = useState(false);
@@ -84,7 +101,10 @@ export default function HistoryScreen() {
   // Delete, or the previous row's if the last row was deleted.
   const focusAfterReload = useRef<{ deleted: string; next: string | null } | null>(null);
 
-  useEffect(() => {
+  // A layout effect: focus moves to the next row's Delete in the same commit
+  // in which the deleted row becomes inert, before the browser could drop
+  // focus to <body>.
+  useLayoutEffect(() => {
     const pending = focusAfterReload.current;
     if (!pending || !jobs.data || jobs.data.some((j) => j.id === pending.deleted)) return; // not reloaded yet
     focusAfterReload.current = null;
@@ -96,24 +116,39 @@ export default function HistoryScreen() {
   const sorted = [...(jobs.data ?? [])].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 
   // confirmFirst is false for the error box's Retry: the user already confirmed.
-  async function remove(job: JobSummary, confirmFirst = true) {
+  function remove(job: JobSummary, confirmFirst = true) {
     if (deleting !== null) return; // the buttons are only aria-disabled
+    if (!removeCooldown.ready()) return;
     if (confirmFirst && !window.confirm(`Delete the audit of ${job.url}? Its report and frames will be removed.`)) return;
+    void removeNow(job);
+  }
+
+  async function removeNow(job: JobSummary) {
     const at = sorted.findIndex((j) => j.id === job.id);
     const next = sorted[at + 1] ?? sorted[at - 1] ?? null;
     setDeleting(job.id);
     setDeleteError(null);
+    const startedAt = performance.now();
     try {
       await deleteJob(job.id);
+    } catch (error) {
+      await onPageClock(() => {
+        setDeleteError({ job, error });
+        setDeleting(null);
+      }, startedAt);
+      return;
+    }
+    // On the page clock and in one commit, like every network result (lib/usePolling
+    // onPageClock): the buttons leave their busy state on the same frame in every run,
+    // not in a React task of their own (two self-audit captures of F4c differed by a frame).
+    await onPageClock(() => {
+      removeCooldown.mark();
       focusAfterReload.current = { deleted: job.id, next: next?.id ?? null };
       setDeletedAny(true);
       setMessage(`Deleted the audit of ${job.url}.`);
-      jobs.retry();
-    } catch (error) {
-      setDeleteError({ job, error });
-    } finally {
       setDeleting(null);
-    }
+      jobs.retry();
+    }, startedAt);
   }
 
   const busy = deleting !== null;
@@ -151,9 +186,10 @@ export default function HistoryScreen() {
       )}
 
       {jobs.data && sorted.length === 0 && (
-        <EmptyState title="No audits yet" focusOnMount={deletedAny}>
+        <EmptyState title="No audits yet" focusOnMount={deletedAny} illustration="ledger">
           <p>
-            Audits you run appear here. <Link href="/">Start a new audit</Link>.
+            {deletedAny ? "Every audit has been deleted." : "This server has not run an audit yet."} Audits you run
+            appear here, newest first. <Link href="/">Run an audit</Link>.
           </p>
         </EmptyState>
       )}
@@ -174,8 +210,9 @@ export default function HistoryScreen() {
                 </tr>
               </thead>
               <tbody>
+                <AnimatedRows onExitComplete={removeCooldown.mark}>
                 {sorted.map((job) => (
-                  <tr key={job.id}>
+                  <AnimatedItem as="tr" key={job.id}>
                     <td className="num">{formatDateTime(job.createdAt)}</td>
                     <td className="url">{job.url}</td>
                     <td>
@@ -186,15 +223,17 @@ export default function HistoryScreen() {
                     <td>
                       <JobActions job={job} busy={busy} onDelete={remove} />
                     </td>
-                  </tr>
+                  </AnimatedItem>
                 ))}
+                </AnimatedRows>
               </tbody>
             </table>
           </div>
 
           <ul className={styles.cards} aria-label="Past audits, newest first">
+            <AnimatedRows onExitComplete={removeCooldown.mark}>
             {sorted.map((job) => (
-              <li key={job.id} className={styles.card}>
+              <AnimatedItem as="li" key={job.id} className={styles.card}>
                 <p className="url">{job.url}</p>
                 <dl className={styles.facts}>
                   <div>
@@ -213,8 +252,9 @@ export default function HistoryScreen() {
                   </div>
                 </dl>
                 <JobActions job={job} busy={busy} onDelete={remove} />
-              </li>
+              </AnimatedItem>
             ))}
+            </AnimatedRows>
           </ul>
         </>
       )}

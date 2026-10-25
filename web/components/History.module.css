@@ -7,6 +7,10 @@
 .cards { display: none; list-style: none; margin: 0; padding: 0; }
 
 .actions { display: flex; flex-wrap: nowrap; gap: 8px; align-items: center; }
+/* "Open report" and "Open progress" share one width, so every Delete lines up in the column. */
+.actions > :first-child { min-width: 9.5em; }
+/* On a card, Delete sits at the far edge, away from the primary "Open" action. */
+.card .actions > :last-child { margin-left: auto; }
 
 @media (max-width: 640px) {
   .tableView { display: none; }
@@ -14,17 +18,18 @@
 }
 
 .card {
-  border: 1.5px solid var(--rule-strong);
-  border-radius: var(--radius);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius-card);
   background: var(--surface);
-  padding: 14px 16px;
+  box-shadow: var(--shadow-1);
+  padding: 16px;
 }
 .card :global(.url) { margin: 0 0 8px; font-weight: 600; }
 
 .facts { margin: 0 0 12px; display: grid; gap: 4px; font-size: 15px; }
 .facts div { display: grid; grid-template-columns: 5.5em 1fr; gap: 8px; align-items: baseline; }
 .facts dt {
-  font-size: 12px;
+  font-size: var(--fs-meta);
   text-transform: uppercase;
   letter-spacing: 0.08em;
   color: var(--muted);

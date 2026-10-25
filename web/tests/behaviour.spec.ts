@@ -16,7 +16,9 @@ const SCREENS: { path: string; ready: (p: Page) => Promise<void> }[] = [
   { path: "/history/", ready: (p) => expect(p.getByRole("link", { name: /^Open report for/ }).first()).toBeVisible() },
 ];
 
-const STEP_GAP_MS = 400; // a little more than the viewer's 350 ms step limit
+const STEP_GAP_MS = 550; // a little more than the viewer's 500 ms step limit (and the 350 ms toggle gates)
+/** After a pointer-opened viewer: its 160 ms opening fade, then the 500 ms step limit (MOTION.md 8.1). */
+const OPEN_GAP_MS = 750;
 
 /** Press Tab until `name` has focus (keyboard only, no clicks). */
 async function tabTo(page: Page, name: string, max = 40) {
@@ -110,6 +112,8 @@ test("frame viewer: open with Enter, step with arrow keys, throttled, Escape res
   const counter = dialog.getByText(/^frame \d+ of 600/);
   await expect(counter).toHaveText(/^frame 14 of 600 \(t = 0\.233 s\)/);
 
+  // Opening counts as a change: the first step comes 500 ms or more after it (MOTION.md 3.3, 8).
+  await page.waitForTimeout(STEP_GAP_MS);
   await page.keyboard.press("ArrowRight");
   await expect(counter).toHaveText(/^frame 15 of 600 \(t = 0\.250 s\)/);
   await page.waitForTimeout(STEP_GAP_MS);
@@ -138,19 +142,22 @@ test("frame viewer: open with Enter, step with arrow keys, throttled, Escape res
   await expect(thumb).toBeFocused();
 });
 
-test("SAFETY: frame viewer ignores key auto-repeat and steps at most ~3 times per second", async ({ page }) => {
+test("SAFETY: frame viewer ignores key auto-repeat and steps at most twice per second", async ({ page }) => {
   await mockApi(page);
   await page.goto(`/report/?id=${IDS.FAIL}`);
   await page.getByRole("button", { name: /^Enlarge: .*frame 0 ·/ }).click();
   const counter = page.getByRole("dialog").getByText(/^frame \d+ of 600/);
   await expect(counter).toHaveText(/^frame 0 of 600/);
 
+  // Opening counts as a change: the first step comes 500 ms or more after the opening fade (MOTION.md 8.1).
+  await page.waitForTimeout(OPEN_GAP_MS);
+
   // Holding the key: the first keydown steps, the auto-repeats (repeat=true) do not.
   for (let i = 0; i < 15; i++) await page.keyboard.down("ArrowRight");
   await page.keyboard.up("ArrowRight");
   await expect(counter).toHaveText(/^frame 1 of 600/);
 
-  // Hammering the button: 10 clicks in well under a second give at most 3 steps.
+  // Hammering the button: 10 clicks in well under a second give at most 2 steps.
   await page.waitForTimeout(STEP_GAP_MS);
   const next = page.getByRole("button", { name: "Next frame" });
   const t0 = Date.now();
@@ -158,7 +165,7 @@ test("SAFETY: frame viewer ignores key auto-repeat and steps at most ~3 times pe
   const elapsed = Date.now() - t0;
   const text = (await counter.textContent()) ?? "";
   const index = Number(text.match(/^frame (\d+)/)?.[1]);
-  const allowed = 1 + Math.floor(elapsed / 350) + 1;
+  const allowed = 1 + Math.floor(elapsed / 500) + 1;
   expect(index - 1).toBeLessThanOrEqual(allowed);
   expect(index - 1).toBeGreaterThanOrEqual(1);
 });
@@ -206,38 +213,92 @@ test("reduced motion: no running animations on any screen", async ({ page }) => 
   }
 });
 
-test("SAFETY: nothing on any screen animates faster than 3 Hz", async ({ page }) => {
+/**
+ * Records every Web Animation the page creates (Element.animate: any that
+ * Motion or other code would start) and every CSS animation and transition
+ * that starts, with its timing, from before the first script runs. Motion's
+ * animations here run on requestAnimationFrame (lib/motion.ts PAGE_CLOCK), so
+ * they are not Web Animations; the rAF watchdog in motion.spec.ts and the
+ * token test cover those.
+ */
+const RECORD_ANIMATIONS = () => {
+  type Entry = { kind: string; duration: number; delay: number; iterations: number; what: string };
+  const seen: Entry[] = [];
+  (window as unknown as { __anims: Entry[] }).__anims = seen;
+  const known = new WeakSet<Animation>();
+  const record = (a: Animation, what: string) => {
+    if (known.has(a)) return;
+    known.add(a);
+    const t = a.effect?.getComputedTiming();
+    seen.push({
+      kind: a.constructor.name,
+      duration: Number(t?.duration ?? 0),
+      delay: Number(t?.delay ?? 0),
+      iterations: Number(t?.iterations ?? 1),
+      what,
+    });
+  };
+  const original = Element.prototype.animate;
+  Element.prototype.animate = function (this: Element, ...args: Parameters<Element["animate"]>) {
+    const animation = original.apply(this, args);
+    record(animation, `${this.tagName.toLowerCase()}.${String(this.className).split(" ")[0]}`);
+    return animation;
+  };
+  const fromEvent = (event: Event) => {
+    const target = event.target as Element;
+    if (!target?.getAnimations) return;
+    for (const a of target.getAnimations()) record(a, `${target.tagName.toLowerCase()} ${event.type}`);
+  };
+  for (const type of ["transitionrun", "animationstart"]) document.addEventListener(type, fromEvent, true);
+};
+
+test("SAFETY: every animation on every screen is one-shot and short", async ({ page }) => {
+  // Six screens, each scrolled through and hovered: more than the default 30 s on a busy machine.
+  test.setTimeout(120_000);
+  await page.addInitScript(RECORD_ANIMATIONS);
   await mockApi(page);
   for (const screen of SCREENS) {
     await page.goto(screen.path);
     await screen.ready(page);
+    // Scroll through the page so every in-view entrance plays, then hover
+    // controls (which starts their colour transitions) while sampling.
+    const height = await page.evaluate(() => document.documentElement.scrollHeight);
+    const step = page.viewportSize()?.height ?? 720;
+    for (let y = 0; y < height; y += step / 2) {
+      await page.evaluate((top) => window.scrollTo({ top, behavior: "instant" }), y);
+      await page.waitForTimeout(80);
+    }
     const buttons = page.getByRole("button");
     const count = Math.min(await buttons.count(), 6);
-    // Sample repeatedly for ~1.2 s while hovering controls (which starts
-    // their colour transitions), so anything that moves gets caught.
-    for (let sample = 0; sample < 12; sample++) {
+    const live: { kind: string; duration: number; iterations: number }[] = [];
+    for (let sample = 0; sample < 8; sample++) {
       if (count > 0) await buttons.nth(sample % count).hover();
-      const found = await page.evaluate(() =>
-        document.getAnimations().map((a) => {
-          const timing = a.effect?.getComputedTiming();
-          return {
-            kind: a.constructor.name,
-            duration: Number(timing?.duration ?? 0),
-            iterations: Number(timing?.iterations ?? 1),
-          };
-        }),
+      live.push(
+        ...(await page.evaluate(() =>
+          document.getAnimations().map((a) => {
+            const t = a.effect?.getComputedTiming();
+            return { kind: a.constructor.name, duration: Number(t?.duration ?? 0), iterations: Number(t?.iterations ?? 1) };
+          }),
+        )),
       );
-      for (const a of found) {
-        if (a.kind === "CSSTransition") {
-          // One-way colour change on hover/focus: short (<= 200 ms) and never repeating.
-          expect(a.duration, `${screen.path} transition`).toBeLessThanOrEqual(200);
-          expect(a.iterations, `${screen.path} transition`).toBe(1);
-        } else {
-          // Anything periodic must have a period of at least 1 s (well under 3 Hz).
-          expect(a.duration, `${screen.path} ${a.kind}`).toBeGreaterThanOrEqual(1000);
-        }
+      await page.waitForTimeout(60);
+    }
+    const created = await page.evaluate(
+      () => (window as unknown as { __anims: { kind: string; duration: number; delay: number; iterations: number; what: string }[] }).__anims,
+    );
+    for (const a of [...created, ...live.map((l) => ({ ...l, delay: 0, what: "sampled" }))]) {
+      const label = `${screen.path} ${a.kind} ${a.what}`;
+      // Never periodic: exactly one iteration (Infinity and repeats fail here).
+      expect(a.iterations, label).toBe(1);
+      expect(Number.isFinite(a.duration), label).toBe(true);
+      if (a.kind === "CSSTransition") {
+        // One-way colour or press change: 200 ms or less.
+        expect(a.duration, label).toBeLessThanOrEqual(200);
+      } else {
+        // One-shot, and the whole choreography (delay included) ends within 600 ms.
+        expect(a.duration, label).toBeLessThanOrEqual(600);
+        expect(a.delay + a.duration, label).toBeLessThanOrEqual(600);
       }
-      await page.waitForTimeout(100);
     }
     const hazards = await page.evaluate(() => ({
       // Chrome animates an indeterminate <progress>; every bar must have a value.
@@ -446,7 +507,9 @@ test("history: newest first, open a report, delete with confirm", async ({ page 
 /**
  * Counts how often `target` changes state (its aria-pressed / aria-expanded
  * attribute) while `act` runs, and how often anything appears or disappears
- * under `area` (the heatmap canvas, the culprit outline, the table).
+ * under `area` (the culprit outline, the table) or the area switches layers
+ * (the heatmap stage's data-overlay: the canvas stays mounted and fades, so it
+ * is never inserted or removed).
  */
 async function countChanges(target: Locator, area: Locator, act: () => Promise<void>) {
   await target.evaluate((el) => {
@@ -462,7 +525,7 @@ async function countChanges(target: Locator, area: Locator, act: () => Promise<v
     w.__swaps = 0;
     new MutationObserver((records) => {
       for (const r of records) w.__swaps += r.type === "attributes" ? 1 : r.addedNodes.length + r.removedNodes.length;
-    }).observe(el, { childList: true, attributes: true, attributeFilter: ["hidden"] });
+    }).observe(el, { childList: true, attributes: true, attributeFilter: ["hidden", "data-overlay"] });
   });
   await act();
   return target.page().evaluate(() => {

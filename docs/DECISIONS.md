@@ -368,3 +368,16 @@ Decision: the runner passes run_audit a JobProgress object. It is called once pe
 ## ADR-037 — Server hardening beyond docs/API.md (2026-10-24)
 
 Context: a loopback-only server can still be reached by web pages through DNS rebinding and cross-site form POSTs. Decision: (1) serve() refuses any host but 127.0.0.1. (2) TrustedHostMiddleware accepts only the Host names 127.0.0.1 and localhost, and answers anything else with 400. (3) A POST or DELETE carrying an Origin header that is not the server's own origin (or, with FLASHTRACE_DEV_CORS=1, http://localhost:3000 or http://127.0.0.1:3000) gets 403. Requests without an Origin header, such as curl, are allowed. (4) CORS is off unless FLASHTRACE_DEV_CORS=1. (5) URLs with a user name or password are refused with 422, because the URL is stored in meta.json and the report. (6) Swagger and ReDoc are disabled because they load scripts from a CDN; /openapi.json stays. (7) A malformed job id returns 422; a frame index must be a whole number, and anything outside 0..frameCount-1 returns 404, so a client never names a path. (8) Relative local paths are resolved against the project directory, and symlinks are resolved before the inside check. The outside check runs before the existence check, so the error never reveals whether an outside file exists. Consequences: two extra status codes (400 bad Host, 403 foreign Origin) that docs/API.md should list.
+
+**ADR-024 amendment (2026-10-25).** A 390 px and dark-mode review, measured with the self-audit, found ordinary
+actions that exceeded 3 flashes per second: one History delete (a gap-closing glide of dense text across the screen),
+Back/Forward pairs between routes, culprit selection re-wrapping the heatmap caption and gliding a dense label, radio
+churn moving the form, and the reduced-motion switch replaying entrances. Fixes: list gaps close at once; large
+layout shifts are designed out (constant caption, always-present custom-size row); dense glides run only at 1024 px
+and wider; the route display gate is measured from the last display change and holds for 500 ms; the frame viewer
+steps at most every 500 ms, counted from the end of its opening fade; network results apply at a fixed page-clock
+time after their request. The self-audit (tests/test_ui_self_audit.py) runs every interaction scenario at 1280 px
+light, 390 px light and 1280 px dark, plus an attack scenario for each finding and a strobe control page that must
+FAIL; all pass, also with four concurrent processes. The worst measured case is the frame viewer at 390 px (open,
+two steps, close) at 3 per second, which is within WCAG's "no more than three"; four in one second is impossible by
+the gate arithmetic.

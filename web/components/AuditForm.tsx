@@ -1,8 +1,11 @@
 "use client";
 
+import { motion } from "motion/react";
 import { useRouter } from "next/navigation";
-import { useState, type FormEvent } from "react";
+import { useRef, useState, type FormEvent, type ReactNode } from "react";
 import { createJob, type AttributeMode, type JobSettings, type Size } from "@/lib/api";
+import { DUR, PAGE_CLOCK, SHIFT, useMotionTokens } from "@/lib/motion";
+import CrossfadeLabel from "./motion/CrossfadeLabel";
 import { ErrorState } from "./StatusViews";
 import styles from "./NewAudit.module.css";
 
@@ -88,6 +91,107 @@ function toSettings(v: FormValues, attribute: AttributeMode): JobSettings {
   return { duration: Number(v.duration), viewport, attribute };
 }
 
+/**
+ * The message under a field (web/MOTION.md 3.1). Its first line sits in a
+ * slot that is always reserved, so a one-line message moves nothing below it
+ * (the next field stays where the pointer is). It fades in with a 4 px drop
+ * from the field just left; extra lines appear at once (no height tween).
+ */
+function FieldMessage({ id, children }: { id: string; children?: ReactNode }) {
+  const m = useMotionTokens();
+  return (
+    <span className="field-msg">
+      {children && (
+        <motion.span
+          {...PAGE_CLOCK}
+          key={id}
+          className="error-text"
+          id={id}
+          initial={m.from({ opacity: 0, y: -SHIFT.xs })}
+          animate={{ opacity: 1, y: 0 }}
+          transition={m.tween(DUR.quick)}
+        >
+          {children}
+        </motion.span>
+      )}
+    </span>
+  );
+}
+
+/**
+ * Whether a radio group's next selection mark appears without a fade: on the
+ * first render (the default choice was always there) and when an arrow key
+ * moved the selection (keyboard actions are instant, MOTION.md principle 3).
+ */
+function useChoiceMotion() {
+  const lastKey = useRef(Number.NEGATIVE_INFINITY);
+  const [instant, setInstant] = useState(true);
+  return {
+    instant,
+    onKeyDown: () => {
+      lastKey.current = performance.now();
+    },
+    /** Call from the radio's onChange. */
+    note: () => setInstant(performance.now() - lastKey.current < 250),
+  };
+}
+
+interface CardProps {
+  name: string;
+  id: string;
+  value: string;
+  checked: boolean;
+  onChange: () => void;
+  label: string;
+  hint?: string;
+  instant: boolean;
+}
+
+/**
+ * A radio choice as a card. The native radio stays (keyboard, forms, screen
+ * readers); the card is its label. The selection ring and tint appear on the
+ * checked card in place: the old one goes at once and the new one fades in
+ * (160 ms), which says "this one is chosen" without sweeping across the cards
+ * between them (a glide showed the middle card as selected on its way past,
+ * and stretched the ring between cards of different heights). The keyboard
+ * focus ring sits on the card, static.
+ */
+function RadioCard({ name, id, value, checked, onChange, label, hint, instant }: CardProps) {
+  const m = useMotionTokens();
+  const hintId = hint ? `${id}-hint` : undefined;
+  return (
+    <label className="radio-card" htmlFor={id}>
+      {checked && (
+        <motion.span
+          {...PAGE_CLOCK}
+          className="radio-card-indicator"
+          aria-hidden="true"
+          initial={instant ? false : m.from({ opacity: 0 })}
+          animate={{ opacity: 1 }}
+          transition={m.tween(DUR.quick)}
+        />
+      )}
+      <input
+        type="radio"
+        id={id}
+        name={name}
+        value={value}
+        checked={checked}
+        onChange={onChange}
+        aria-describedby={hintId}
+      />
+      <span className="radio-card-text">
+        <span className="radio-card-label">{label}</span>
+        {hint && (
+          <span className="hint" id={hintId}>
+            {hint}
+          </span>
+        )}
+      </span>
+    </label>
+  );
+}
+
 export default function AuditForm() {
   const router = useRouter();
   const [values, setValues] = useState<FormValues>({
@@ -103,6 +207,18 @@ export default function AuditForm() {
   const [touched, setTouched] = useState<Partial<Record<Field, boolean>>>({});
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<unknown>(null);
+
+  const viewportKeys = useChoiceMotion();
+  const attributeKeys = useChoiceMotion();
+  // SAFETY and layout: the custom-size row is always there, so choosing a
+  // size never moves the blocks below it. Its inputs are enabled only for
+  // Custom size and otherwise show the chosen preset's size. Inserting the
+  // row pushed everything below down by ~80 px (110 px at 390 px), and churning
+  // through the radios at phone width completed flashes on several frames per
+  // toggle (self-audit F5 at 390 px: 8 a second); it also moved the attribution
+  // cards under a pointer that was about to press one.
+  const custom = values.preset === "custom";
+  const presetSize = PRESETS.find((p) => p.id === values.preset)?.size;
 
   const errors = validate(values);
   const shown = (field: Field) => (touched[field] ? errors[field] : undefined);
@@ -170,11 +286,7 @@ export default function AuditForm() {
           onChange={set("target")}
           onBlur={blur("target")}
         />
-        {shown("target") && (
-          <span className="error-text" id="target-error">
-            {shown("target")}
-          </span>
-        )}
+        <FieldMessage id="target-error">{shown("target")}</FieldMessage>
       </div>
 
       <div className="field">
@@ -197,126 +309,116 @@ export default function AuditForm() {
           onChange={set("duration")}
           onBlur={blur("duration")}
         />
-        {shown("duration") && (
-          <span className="error-text" id="duration-error">
-            {shown("duration")}
-          </span>
-        )}
+        <FieldMessage id="duration-error">{shown("duration")}</FieldMessage>
       </div>
 
-      <fieldset aria-describedby="viewport-hint">
+      <fieldset aria-describedby="viewport-hint" onKeyDown={viewportKeys.onKeyDown}>
         <legend className="legend">Viewport</legend>
         <span className="hint" id="viewport-hint">
           Other widths scale the 341 × 256 px window by width (an assumption, listed in the report).
         </span>
-        {PRESETS.map((p) => (
-          <div className="choice" key={p.id}>
-            <input
-              type="radio"
-              id={`vp-${p.id}`}
+        <div className="radio-cards">
+          {[...PRESETS.map((p) => ({ id: p.id, label: p.label })), { id: "custom", label: "Custom size" }].map((p) => (
+            <RadioCard
+              key={p.id}
               name="viewport"
+              id={`vp-${p.id}`}
               value={p.id}
               checked={values.preset === p.id}
-              onChange={set("preset")}
+              onChange={() => {
+                viewportKeys.note();
+                setValues((prev) => ({ ...prev, preset: p.id }));
+              }}
+              label={p.label}
+              instant={viewportKeys.instant}
             />
-            <label htmlFor={`vp-${p.id}`}>{p.label}</label>
-          </div>
-        ))}
-        <div className="choice">
-          <input
-            type="radio"
-            id="vp-custom"
-            name="viewport"
-            value="custom"
-            checked={values.preset === "custom"}
-            onChange={set("preset")}
-          />
-          <label htmlFor="vp-custom">Custom size</label>
+          ))}
         </div>
-        {values.preset === "custom" && (
-          <div className={styles.sizeRow}>
-            <div>
-              <label htmlFor="vp-width">Width (px)</label>
-              <input
-                id="vp-width"
-                className="input input-short"
-                type="number"
-                min={200}
-                max={3840}
-                inputMode="numeric"
-                aria-invalid={shown("width") ? true : undefined}
-                aria-describedby={describedBy("width")}
-                value={values.width}
-                onChange={set("width")}
-                onBlur={blur("width")}
-              />
-            </div>
-            <span className={styles.times} aria-hidden="true">
-              ×
-            </span>
-            <div>
-              <label htmlFor="vp-height">Height (px)</label>
-              <input
-                id="vp-height"
-                className="input input-short"
-                type="number"
-                min={200}
-                max={3840}
-                inputMode="numeric"
-                aria-invalid={shown("height") ? true : undefined}
-                aria-describedby={describedBy("height")}
-                value={values.height}
-                onChange={set("height")}
-                onBlur={blur("height")}
-              />
-            </div>
-            {shown("width") && (
-              <span className="error-text" id="width-error">
-                {shown("width")}
-              </span>
-            )}
-            {shown("height") && (
-              <span className="error-text" id="height-error">
-                {shown("height")}
-              </span>
-            )}
+        <div className={styles.sizeRow}>
+          <span className={`hint ${styles.sizeHint}`} id="size-hint">
+            The chosen size, in pixels. Choose Custom size to type your own.
+          </span>
+          <div>
+            <label htmlFor="vp-width">Width (px)</label>
+            <input
+              id="vp-width"
+              className="input input-short"
+              type="number"
+              min={200}
+              max={3840}
+              inputMode="numeric"
+              disabled={!custom}
+              aria-invalid={shown("width") ? true : undefined}
+              aria-describedby={describedBy("width", "size-hint")}
+              value={custom ? values.width : String(presetSize?.width ?? "")}
+              onChange={set("width")}
+              onBlur={blur("width")}
+            />
+          </div>
+          <span className={styles.times} aria-hidden="true">
+            ×
+          </span>
+          <div>
+            <label htmlFor="vp-height">Height (px)</label>
+            <input
+              id="vp-height"
+              className="input input-short"
+              type="number"
+              min={200}
+              max={3840}
+              inputMode="numeric"
+              disabled={!custom}
+              aria-invalid={shown("height") ? true : undefined}
+              aria-describedby={describedBy("height", "size-hint")}
+              value={custom ? values.height : String(presetSize?.height ?? "")}
+              onChange={set("height")}
+              onBlur={blur("height")}
+            />
+          </div>
+          <div className={styles.sizeMessages}>
+            <FieldMessage id="width-error">{shown("width")}</FieldMessage>
+            {shown("height") && <FieldMessage id="height-error">{shown("height")}</FieldMessage>}
+          </div>
+        </div>
+      </fieldset>
+
+      <fieldset onKeyDown={attributeKeys.onKeyDown}>
+        <legend className="legend">Find the cause (attribution)</legend>
+        <div className="radio-cards radio-cards-wide">
+          {MODES.map((mode) => (
+            <RadioCard
+              key={mode.id}
+              name="attribute"
+              id={`attr-${mode.id}`}
+              value={mode.id}
+              checked={attribute === mode.id}
+              onChange={() => {
+                attributeKeys.note();
+                setAttribute(mode.id);
+              }}
+              label={mode.label}
+              hint={mode.hint}
+              instant={attributeKeys.instant}
+            />
+          ))}
+        </div>
+      </fieldset>
+
+      <div>
+        {submitError !== null && (
+          <div className={styles.submitError}>
+            <ErrorState title="The audit could not be started" error={submitError} onRetry={submit} focusOnMount />
           </div>
         )}
-      </fieldset>
 
-      <fieldset>
-        <legend className="legend">Find the cause (attribution)</legend>
-        {MODES.map((m) => (
-          <div className="choice" key={m.id}>
-            <input
-              type="radio"
-              id={`attr-${m.id}`}
-              name="attribute"
-              value={m.id}
-              checked={attribute === m.id}
-              onChange={() => setAttribute(m.id)}
-              aria-describedby={`attr-${m.id}-hint`}
-            />
-            <label htmlFor={`attr-${m.id}`}>{m.label}</label>
-            <span className="hint" id={`attr-${m.id}-hint`}>
-              {m.hint}
-            </span>
-          </div>
-        ))}
-      </fieldset>
-
-      {submitError !== null && (
-        <div className={styles.submitError}>
-          <ErrorState title="The audit could not be started" error={submitError} onRetry={submit} focusOnMount />
-        </div>
-      )}
-
-      {/* aria-disabled, not disabled: a disabled button drops keyboard focus
-          to <body>, so after a failed submit the user would have to Tab back
-          from the top of the page. submit() ignores presses while busy. */}
-      <button type="submit" className="btn btn-primary" aria-disabled={submitting}>
-        {submitting ? "Starting…" : "Run audit"}
-      </button>
+        {/* aria-disabled, not disabled: a disabled button drops keyboard focus
+            to <body>, so after a failed submit the user would have to Tab back
+            from the top of the page. submit() ignores presses while busy. The
+            label crossfades inside a fixed minimum width, so nothing jumps. */}
+        <button type="submit" className={`btn btn-primary ${styles.runButton}`} aria-disabled={submitting}>
+          <CrossfadeLabel value={submitting ? "starting" : "run"}>{submitting ? "Starting…" : "Run audit"}</CrossfadeLabel>
+        </button>
+      </div>
     </form>
   );
 }

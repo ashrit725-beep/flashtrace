@@ -1,5 +1,6 @@
 "use client";
 
+import { motion } from "motion/react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { useEffect, useState } from "react";
@@ -14,9 +15,20 @@ import {
   type JobSummary,
 } from "@/lib/api";
 import { ATTRIBUTE_LABEL, PHASE_LABEL, phaseText, sizeLabel } from "@/lib/format";
+import { DUR, EASE, useMotionTokens } from "@/lib/motion";
 import { usePolling } from "@/lib/usePolling";
+import CrossfadeLabel from "./motion/CrossfadeLabel";
+import DrawPath from "./motion/DrawPath";
+import NumberTicker from "./motion/NumberTicker";
 import { EmptyState, ErrorState, LoadingState, errorMessage } from "./StatusViews";
 import styles from "./Run.module.css";
+
+/**
+ * How long "Done. Opening the report…" stays before the report replaces this
+ * screen: the end state is seen before the page changes. Time, not motion; it
+ * stays under reduced motion.
+ */
+const HANDOFF_HOLD_MS = 450;
 
 // The phases shown in the stepper, in order, for this job. A new audit lists
 // every step its settings will run, ablation included, so the user sees the
@@ -33,12 +45,18 @@ function stepsFor(job: JobSummary): JobPhase[] {
   return steps;
 }
 
-const STEP_GLYPH = { complete: "✓", current: "›", pending: "" } as const;
 const STEP_STATUS = { complete: "completed", current: "in progress", pending: "not started" } as const;
 
+// Motion (web/MOTION.md 3.2): when a step completes because the next one
+// started, its circle fills and its check draws (240 ms, from +60 ms). Steps
+// already complete when this screen first saw the job show their check at
+// once. The current step is a static ring: nothing pulses.
 function Stepper({ job }: { job: JobSummary }) {
   const steps = stepsFor(job);
   const at = Math.max(0, steps.indexOf(job.phase));
+  const doneCount = isReportReady(job) ? steps.length : at;
+  // How many steps were complete on the first answer this screen saw (never animated).
+  const [firstDone] = useState(doneCount);
   return (
     <ol className={styles.stepper} aria-label="Audit phases">
       {steps.map((step, i) => {
@@ -50,7 +68,8 @@ function Stepper({ job }: { job: JobSummary }) {
             aria-current={state === "current" ? "step" : undefined}
           >
             <span className={styles.glyph} aria-hidden="true">
-              {STEP_GLYPH[state]}
+              {state === "complete" && <DrawPath glyph="check" size={16} strokeWidth={2.5} draw={i >= firstDone} delay={0.06} />}
+              {state === "current" && "›"}
             </span>
             {step === "done" ? "Report ready" : PHASE_LABEL[step]}
             <span className="visually-hidden">, {STEP_STATUS[state]}</span>
@@ -58,6 +77,29 @@ function Stepper({ job }: { job: JobSummary }) {
         );
       })}
     </ol>
+  );
+}
+
+/**
+ * The progress bar (web/MOTION.md 3.2). The native <progress> stays the one
+ * accessible element (visually hidden; tests and screen readers read it). The
+ * fill beside it is aria-hidden and moves only when a poll brings a new value
+ * (420 ms, retargets mid-flight); between polls nothing moves. Keyed by phase,
+ * so a new phase starts at its own value instead of sliding backwards.
+ */
+function ProgressFill({ phase, ratio }: { phase: string; ratio: number }) {
+  const m = useMotionTokens();
+  return (
+    <div className={styles.track} aria-hidden="true">
+      <motion.div
+        key={phase}
+        className={styles.fill}
+        style={{ originX: 0 }}
+        initial={{ scaleX: ratio }}
+        animate={{ scaleX: ratio }}
+        transition={m.tween(DUR.emphasis, { ease: EASE.out })}
+      />
+    </div>
   );
 }
 
@@ -77,6 +119,10 @@ export default function RunScreen() {
   const [cancelled, setCancelled] = useState(false);
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<unknown>(null);
+  // Whether this screen has shown the job while it was still running: only
+  // then does finishing get the hand-off (last check, full bar, hold). A job
+  // that is already done on the first answer redirects at once.
+  const [sawRunning, setSawRunning] = useState(false);
 
   // Stop polling once we cancelled: the job no longer exists on the server.
   // isFinished (not status alone): after "Re-run attribution with ablation"
@@ -85,10 +131,30 @@ export default function RunScreen() {
   const job = poll.data;
   const ready = job !== null && isReportReady(job);
 
-  // Done: go straight to the report. replace() keeps Back from bouncing here.
+  const running = job !== null && !isFinished(job);
+  // The bar's identity: a new working phase restarts it at its own value,
+  // while finishing keeps it, so the fill can run on to 100%.
+  const [barPhase, setBarPhase] = useState<string | null>(null);
+  const workingPhase = job !== null && !ready ? job.phase : null;
+  if (workingPhase !== null && workingPhase !== barPhase) setBarPhase(workingPhase);
   useEffect(() => {
-    if (job && isReportReady(job)) router.replace(`/report/?id=${encodeURIComponent(job.id)}`);
-  }, [job, router]);
+    if (!running || sawRunning) return;
+    const frame = requestAnimationFrame(() => setSawRunning(true));
+    return () => cancelAnimationFrame(frame);
+  }, [running, sawRunning]);
+
+  // Done: go to the report; replace() keeps Back from bouncing here. After a
+  // run this screen watched, hold "Done. Opening the report…" for 450 ms first.
+  useEffect(() => {
+    if (!job || !isReportReady(job)) return;
+    const go = () => router.replace(`/report/?id=${encodeURIComponent(job.id)}`);
+    if (!sawRunning) {
+      go();
+      return;
+    }
+    const timer = setTimeout(go, HANDOFF_HOLD_MS);
+    return () => clearTimeout(timer);
+  }, [job, router, sawRunning]);
 
   // confirmFirst is false for the error box's Retry: the user already confirmed.
   async function cancel(confirmFirst = true) {
@@ -126,7 +192,7 @@ export default function RunScreen() {
     return (
       <>
         <Heading />
-        <EmptyState title="No audit selected">
+        <EmptyState title="No audit selected" illustration="trace">
           <p>
             This page shows a running audit. <Link href="/">Start a new audit</Link> or open one from{" "}
             <Link href="/history/">History</Link>.
@@ -223,27 +289,51 @@ export default function RunScreen() {
 
   const { current, total } = job.progress;
   const text = phaseText(job);
+  const counted = total > 0 && job.phase !== "done" && job.phase !== "error";
+  const value = Math.min(current, total);
+  const ratio = ready ? 1 : total > 0 ? value / total : 0;
   return (
     <>
       <Heading url={job.url} />
       <section aria-labelledby="phase-now">
         <h2 id="phase-now" className={styles.phase}>
-          {ready ? "Done. Opening the report…" : text}
+          <CrossfadeLabel value={ready ? "done" : "working"} display="inline-block">
+            {ready ? (
+              "Done. Opening the report…"
+            ) : counted ? (
+              // "Capturing frames 312/600": the number ticks between polls' values (they were all
+              // really captured). The ticking digits are hidden from screen readers; the exact value is not.
+              <>
+                {PHASE_LABEL[job.phase]}{" "}
+                <span className={styles.count} aria-hidden="true">
+                  <NumberTicker value={value} digits={String(total).length} />/{total}
+                </span>
+                <span className="visually-hidden">
+                  {value}/{total}
+                </span>
+              </>
+            ) : (
+              text
+            )}
+          </CrossfadeLabel>
         </h2>
         {/* Announce phase changes only (not every frame count) to keep screen readers calm. */}
         <p className="visually-hidden" aria-live="polite">
-          {PHASE_LABEL[job.phase]}
+          {ready ? "Done. Opening the report…" : PHASE_LABEL[job.phase]}
         </p>
-        {total > 0 ? (
+        {total > 0 || ready ? (
           <>
             <progress
-              className={styles.bar}
-              value={Math.min(current, total)}
-              max={total}
+              className="visually-hidden"
+              value={ready ? Math.max(1, total) : value}
+              max={Math.max(1, total)}
               aria-labelledby="phase-now"
-              aria-valuetext={text}
+              aria-valuetext={ready ? "Done" : text}
             />
-            <p className={`${styles.barNote} num`}>{Math.round((Math.min(current, total) / total) * 100)}% of this step</p>
+            <ProgressFill phase={barPhase ?? job.phase} ratio={ratio} />
+            <p className={`${styles.barNote} num`}>
+              {ready ? "100% done" : `${Math.round(ratio * 100)}% of this step`}
+            </p>
           </>
         ) : (
           <p className={styles.barNote}>This step has no frame count; it usually takes a few seconds.</p>

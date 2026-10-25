@@ -3,11 +3,15 @@
 import { getHealth } from "@/lib/api";
 import { useLoad } from "@/lib/usePolling";
 import AuditForm from "./AuditForm";
+import Reveal from "./motion/Reveal";
 import { ErrorState, LoadingState } from "./StatusViews";
 import styles from "./NewAudit.module.css";
 
 // Screen 1 (/). Checks the local server first: if `flashtrace serve` is not
 // running, a form that can never submit would only waste the user's time.
+// Motion (web/MOTION.md 3.1): the page head and explainer are server-rendered
+// and never move; the form rises in (240 ms) when the health check answers,
+// because that answer is what made it usable.
 export default function NewAuditScreen() {
   const health = useLoad("health", getHealth);
 
@@ -39,13 +43,13 @@ export default function NewAuditScreen() {
             </ErrorState>
           )}
           {health.data && (
-            <>
+            <Reveal>
               <p className={styles.server}>
                 Connected to the local server (version {health.data.version}, engine{" "}
                 {health.data.engineVersion}).
               </p>
               <AuditForm />
-            </>
+            </Reveal>
           )}
         </div>
 

@@ -1,9 +1,10 @@
 "use client";
 
-import { useEffect, useId, useRef, useState } from "react";
+import { motion } from "motion/react";
+import { useEffect, useId, useRef, useState, type PointerEvent } from "react";
 import type { TimelineBin, Violation } from "@/lib/api";
 import { frameTime } from "@/lib/format";
-import { useSafeToggle } from "@/lib/useSafeToggle";
+import { EASE, DUR, PAGE_CLOCK, staggerDelay, useInViewArrival, useLargeAreaGate, useMotionTokens } from "@/lib/motion";
 import styles from "./Report.module.css";
 
 /** WCAG 2.3.1: no more than three flashes in any one-second period. */
@@ -12,6 +13,17 @@ const HEIGHT = 240;
 const M = { top: 28, bottom: 46, left: 52 };
 /** Wide charts label the limit line at its right end; narrow ones above the plot. */
 const LABEL_ROOM = 176;
+
+// Motion (web/MOTION.md 3.3, section 8), once, when the chart first comes on
+// screen. The WCAG limit is the reference every bar is judged against, like the
+// axes and the grid, so it is there from the first frame. The bars rise against
+// it from the baseline (DUR.base on ease-out, so they answer at once, staggered
+// by at most 120 ms in total), then the windows over the limit are marked (the
+// spans fade in from +240 ms, DUR.quick). Everything ends by 400 ms. A bar
+// being drawn is not read as a value; the data table and the readout give the
+// exact counts.
+const BAR = { duration: DUR.base, stagger: 0.12 } as const;
+const SPANS = { delay: 0.24 } as const;
 
 interface Props {
   bins: TimelineBin[];
@@ -76,9 +88,15 @@ export default function TimelineChart({ bins, violations, fps }: Props) {
   const [boxRef, width] = useWidth<HTMLDivElement>(720);
   const [showTable, setShowTable] = useState(false);
   // SAFETY: showing the table pushes everything below it (including the
-  // black-and-white evidence frames) up and down; keep that under 3 Hz.
-  const safe = useSafeToggle();
-  const hatchId = useId().replace(/:/g, "") + "hatch";
+  // black-and-white evidence frames and the heatmap) up and down; keep that
+  // under 3 Hz. The heatmap overlay changes the same cells, so both controls
+  // share the report's one large-area gate (MOTION.md 3.3).
+  const safe = useLargeAreaGate();
+  const m = useMotionTokens();
+  const [arriveRef, arrival] = useInViewArrival<HTMLDivElement>(!m.reduce);
+  const [hover, setHover] = useState<number | null>(null);
+  const uid = useId().replace(/:/g, "");
+  const hatchId = `${uid}hatch`;
 
   if (bins.length === 0) {
     return <p className="muted">No timeline: the capture contained no frames to count.</p>;
@@ -103,8 +121,23 @@ export default function TimelineChart({ bins, violations, fps }: Props) {
   const yTicks = Array.from({ length: Math.floor(yMax / yStep) + 1 }, (_, i) => i * yStep);
   const xEvery = Math.max(1, Math.ceil(28 / band)); // keep x labels at least ~28 px apart
 
+  // ---- one-shot entrance, driven by the in-view arrival. The chart starts in
+  // its final state and is hidden only after the observer reported it off
+  // screen (MOTION.md principle 7); it animates only when it then comes on screen.
+  const waiting = arrival === "waiting";
+  const timing = (duration: number, delay: number) =>
+    arrival === "play" ? m.tween(duration, { delay, ease: EASE.out }) : { duration: 0 };
+
+  // ---- pointer readout: a static column tint and one line of text (no motion, no gate needed)
+  function onPointer(event: PointerEvent<SVGSVGElement>) {
+    const box = event.currentTarget.getBoundingClientRect();
+    const second = Math.floor((event.clientX - box.left - M.left) / band);
+    setHover(second >= 0 && second < bins.length ? second : null);
+  }
+  const hovered = hover === null ? null : bins[hover];
+
   return (
-    <div>
+    <div ref={arriveRef}>
       <ul className={styles.legend} aria-hidden="true">
         <li>
           <span className={`${styles.swatch} ${styles.swatchGeneral}`} /> General flashes
@@ -124,57 +157,86 @@ export default function TimelineChart({ bins, violations, fps }: Props) {
       </ul>
 
       <div ref={boxRef} className={styles.chartBox}>
-        <svg className={styles.chart} width={width} height={HEIGHT} role="img" aria-label={summary(bins, spans, fps)}>
+        <svg
+          className={styles.chart}
+          width={width}
+          height={HEIGHT}
+          role="img"
+          aria-label={summary(bins, spans, fps)}
+          onPointerMove={onPointer}
+          onPointerLeave={() => setHover(null)}
+        >
           <defs>
             <pattern id={hatchId} width="5" height="5" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
               <rect width="2" height="5" fill="var(--chart-red)" />
             </pattern>
           </defs>
 
+          {/* pointer readout column: drawn first, under everything */}
+          {hover !== null && (
+            <rect className={styles.hoverColumn} x={M.left + band * hover} y={M.top} width={band} height={plotH} />
+          )}
+
           {/* violation spans first, so grid and bars draw on top of the shading */}
           {spans.map((s) => (
-            <g key={s.n}>
+            <motion.g
+              {...PAGE_CLOCK}
+              key={s.n}
+              data-arrive=""
+              initial={false}
+              animate={{ opacity: waiting ? 0 : 1 }}
+              transition={timing(DUR.quick, SPANS.delay)}
+            >
               <rect x={x(s.from)} y={M.top} width={Math.max(1, x(s.to) - x(s.from))} height={plotH} fill="var(--fail-bg)" />
               <line x1={x(s.from)} x2={x(s.to)} y1={M.top} y2={M.top} stroke="var(--fail)" strokeWidth="3" />
-            </g>
+            </motion.g>
           ))}
 
           {/* horizontal grid + y tick labels */}
           {yTicks.map((v) => (
             <g key={v}>
-              <line x1={M.left} x2={M.left + plotW} y1={y(v)} y2={y(v)} stroke="var(--chart-grid)" />
+              <line x1={M.left} x2={M.left + plotW} y1={y(v)} y2={y(v)} stroke="var(--chart-grid)" shapeRendering="crispEdges" />
               <text x={M.left - 8} y={y(v) + 4} textAnchor="end">
                 {v}
               </text>
             </g>
           ))}
 
-          {/* bars: general solid, red hatched, so the series differ by more than colour */}
+          {/* bars: general solid, red hatched, so the series differ by more than colour. Square
+              ends, no rounding: a bar's top is its value. Each grows from the baseline once. */}
           {bins.map((b, i) => {
             const cx = M.left + band * i + band / 2;
             return (
               <g key={b.t}>
-                <rect
-                  x={hasRed ? cx - barW - 1 : cx - barW / 2}
-                  y={y(b.generalFlashes)}
-                  width={barW}
-                  height={y(0) - y(b.generalFlashes)}
-                  fill="var(--chart-general)"
-                />
-                {hasRed &&
-                  (b.redFlashes > 0 ? (
-                    <rect
-                      x={cx + 1}
-                      y={y(b.redFlashes)}
-                      width={barW}
-                      height={y(0) - y(b.redFlashes)}
-                      fill={`url(#${hatchId})`}
-                      stroke="var(--chart-red)"
-                    />
-                  ) : (
-                    // A zero still gets a 1 px stub, so the pair reads as centred on its label.
-                    <rect x={cx + 1} y={y(0) - 1} width={barW} height={1} fill="var(--chart-red)" />
-                  ))}
+                <motion.g
+                  data-arrive=""
+                  style={{ originY: 1 }}
+                  initial={false}
+                  animate={{ scaleY: waiting ? 0 : 1 }}
+                  transition={timing(BAR.duration, staggerDelay(i, bins.length, BAR.stagger))}
+                >
+                  <rect
+                    x={hasRed ? cx - barW - 1 : cx - barW / 2}
+                    y={y(b.generalFlashes)}
+                    width={barW}
+                    height={y(0) - y(b.generalFlashes)}
+                    fill="var(--chart-general)"
+                  />
+                  {hasRed &&
+                    (b.redFlashes > 0 ? (
+                      <rect
+                        x={cx + 1}
+                        y={y(b.redFlashes)}
+                        width={barW}
+                        height={y(0) - y(b.redFlashes)}
+                        fill={`url(#${hatchId})`}
+                        stroke="var(--chart-red)"
+                      />
+                    ) : (
+                      // A zero still gets a 1 px stub, so the pair reads as centred on its label.
+                      <rect x={cx + 1} y={y(0) - 1} width={barW} height={1} fill="var(--chart-red)" />
+                    ))}
+                </motion.g>
                 {i % xEvery === 0 && (
                   <text x={cx} y={M.top + plotH + 18} textAnchor="middle">
                     {b.t}
@@ -185,8 +247,8 @@ export default function TimelineChart({ bins, violations, fps }: Props) {
           })}
 
           {/* axes */}
-          <line x1={M.left} x2={M.left + plotW} y1={y(0)} y2={y(0)} stroke="var(--ink)" strokeWidth="1.5" />
-          <line x1={M.left} x2={M.left} y1={M.top} y2={y(0)} stroke="var(--ink)" strokeWidth="1.5" />
+          <line x1={M.left} x2={M.left + plotW} y1={y(0)} y2={y(0)} stroke="var(--ink)" strokeWidth="1" shapeRendering="crispEdges" />
+          <line x1={M.left} x2={M.left} y1={M.top} y2={y(0)} stroke="var(--ink)" strokeWidth="1" shapeRendering="crispEdges" />
 
           {/* the threshold every one-second window is judged against */}
           <line
@@ -213,15 +275,20 @@ export default function TimelineChart({ bins, violations, fps }: Props) {
           {spans.map((s) => {
             const fromRight = x(s.from) > M.left + plotW / 2;
             return (
-              <text
+              <motion.text
+                {...PAGE_CLOCK}
                 key={s.n}
+                data-arrive=""
                 className={styles.spanLabel}
                 x={fromRight ? x(s.to) - 6 : x(s.from) + 6}
                 y={M.top + 16 + (s.n - 1) * 16}
                 textAnchor={fromRight ? "end" : "start"}
+                initial={false}
+                animate={{ opacity: waiting ? 0 : 1 }}
+                transition={timing(DUR.quick, SPANS.delay)}
               >
                 Violation {s.n}: up to {s.v.maxRatePerSec}/s{wide ? " (sliding window)" : ""}
-              </text>
+              </motion.text>
             );
           })}
 
@@ -237,6 +304,14 @@ export default function TimelineChart({ bins, violations, fps }: Props) {
           </text>
         </svg>
       </div>
+
+      {/* Pointer readout, one line, reserved height. aria-hidden: the data
+          table below is the accessible path to the same numbers. */}
+      <p className={`${styles.readout} num`} aria-hidden="true">
+        {hovered
+          ? `Second ${hovered.t}–${hovered.t + 1}: ${hovered.generalFlashes} general, ${hovered.redFlashes} red`
+          : "Point at a second to read its counts."}
+      </p>
 
       {/* A disclosure: aria-expanded tells the truth because the table is
           really hidden (the `hidden` attribute) while collapsed. Screen reader

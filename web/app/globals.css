@@ -3,9 +3,13 @@
    sans for data, one green accent, tabular numerals. No web fonts and no
    network resources: every font below is already on the user's machine.
 
-   SAFETY (docs/SPEC.md section 9): nothing in this UI animates. The only
-   motion is a <=150 ms colour transition on controls, removed entirely under
-   prefers-reduced-motion. No keyframes, no spinners, no blinking. */
+   SAFETY (docs/SPEC.md section 9, docs/DECISIONS.md ADR-024, web/MOTION.md):
+   motion is one-shot only. Nothing loops, repeats, pulses or shimmers; every
+   transition here is 200 ms or less and every animation 600 ms or less. Under
+   prefers-reduced-motion (or the footer's "Reduce motion") all of it is off.
+   Hover colour pairs are never a flash transition (a change of 0.10 or more
+   in relative luminance with the darker side below 0.80), in either scheme,
+   because hover runs at pointer speed and cannot be rate-limited. */
 
 :root {
   color-scheme: light dark;
@@ -18,6 +22,9 @@
   --muted: #5e594f;
   --rule: #d5cebf;
   --rule-strong: #9a917d;
+  /* A hovered border: darker than --rule-strong by less than 0.10 in relative
+     luminance, so hovering is never a flash transition (ink would be 0.28). */
+  --rule-hover: #847c68;
   --accent: #1d5a3c;
   --accent-hover: #164a31;
   --on-accent: #ffffff;
@@ -31,33 +38,87 @@
   --fail-bg: #f7e6e2;
   --warn: #6e4600;
   --warn-bg: #f6ecd6;
+  /* A destructive button at rest: neutral text that turns --fail on hover or
+     focus. Its luminance is within 0.10 of --fail in each scheme, so the hover
+     is never a flash transition (dark --ink-soft would be 0.104 away). */
+  --danger-ink: #423e37;
 
   /* Chart series */
   --chart-general: #423e37;
   --chart-red: #b3261e;
   --chart-grid: #ddd6c7;
 
+  /* Hover tints. .btn: 60 % paper-deep on surface (L 0.864, not a transition
+     against surface L 0.983). Rows: 40 % paper-deep on paper. */
+  --btn-hover: color-mix(in srgb, var(--paper-deep) 60%, var(--surface));
+  --row-hover: color-mix(in srgb, var(--paper-deep) 40%, var(--paper));
+
+  /* Depth through borders first, then a quiet shadow. No glass, no glow. */
+  --shadow-1: 0 1px 0 rgb(23 22 19 / 0.04), 0 1px 2px rgb(23 22 19 / 0.06);
+  --shadow-2: 0 1px 2px rgb(23 22 19 / 0.06), 0 12px 28px -14px rgb(23 22 19 / 0.22);
+  --image-outline: rgb(0 0 0 / 0.1);
+  --veil: color-mix(in srgb, var(--paper) 88%, transparent);
+
   --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   --serif: Georgia, "Iowan Old Style", "Times New Roman", Times, serif;
   --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 
+  /* Type scale: major third on a 16 px base. */
+  --fs-meta: 13px;
+  --fs-small: 14px;
+  --fs-body: 16px;
+  --fs-h3: 20px;
+  --fs-h2: 25px;
+  --fs-h1: 39px;
+  --fs-verdict: 48px;
+
+  /* Spacing: 4 px base. */
+  --s1: 4px;
+  --s2: 8px;
+  --s3: 12px;
+  --s4: 16px;
+  --s5: 24px;
+  --s6: 32px;
+  --s7: 48px;
+  --s8: 64px;
+
   --gutter: 24px;
-  --radius: 3px;
-  --transition: 150ms ease-out;
+  --radius: 4px;
+  --radius-card: 6px;
+
+  /* Motion tokens (lib/motion.ts mirrors them for Motion). */
+  --dur-press: 120ms;
+  --dur-quick: 160ms;
+  --dur-base: 240ms;
+  --dur-emphasis: 420ms;
+  --dur-max: 600ms;
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  /* For something already on screen moving; never for a large-area fade. */
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  --ease-draw: cubic-bezier(0.65, 0, 0.35, 1);
+  --shift-xs: 4px;
+  --shift-s: 8px;
+  --press-scale: 0.97;
+  --enter-scale: 0.98;
+  --transition: var(--dur-quick) var(--ease-out);
 }
 
+/* Dark scheme: from the OS setting unless the page says light, or forced with
+   data-theme="dark" (the self-audit's pre-roll uses it). Two copies of one
+   block, because CSS cannot share a declaration list between the two. */
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme="light"]) {
     --paper: #141311;
     --paper-deep: #1e1c19;
-    --surface: #1a1916;
+    --surface: #1d1b18;
     --ink: #ede8dd;
     --ink-soft: #cdc6b8;
     --muted: #aaa293;
     --rule: #3a3731;
     --rule-strong: #6b655a;
+    --rule-hover: #857e70;
     --accent: #84c9a0;
-    --accent-hover: #a2d9b8;
+    --accent-hover: #93d1ac;
     --on-accent: #0d1a12;
     --focus: #84c9a0;
 
@@ -67,20 +128,84 @@
     --fail-bg: #2c1714;
     --warn: #e9c46e;
     --warn-bg: #2a2212;
+    --danger-ink: #c4bdaf;
 
     --chart-general: #cdc6b8;
     --chart-red: #f08378;
     --chart-grid: #34312b;
+
+    /* Elevation in the dark: level 1 is a hairline ring; level 2 (hover lift,
+       dialog) adds a stronger ring and a deep drop, so the hover and the
+       viewer read as raised here too. */
+    --shadow-1: 0 0 0 1px var(--rule), inset 0 1px 0 rgb(255 255 255 / 0.04);
+    --shadow-2: 0 0 0 1px var(--rule-strong), 0 16px 32px -12px rgb(0 0 0 / 0.6), inset 0 1px 0 rgb(255 255 255 / 0.06);
+    --image-outline: rgb(255 255 255 / 0.1);
   }
 }
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --paper: #141311;
+  --paper-deep: #1e1c19;
+  --surface: #1d1b18;
+  --ink: #ede8dd;
+  --ink-soft: #cdc6b8;
+  --muted: #aaa293;
+  --rule: #3a3731;
+  --rule-strong: #6b655a;
+  --rule-hover: #857e70;
+  --accent: #84c9a0;
+  --accent-hover: #93d1ac;
+  --on-accent: #0d1a12;
+  --focus: #84c9a0;
 
+  --pass: #84c9a0;
+  --pass-bg: #15251b;
+  --fail: #f2a196;
+  --fail-bg: #2c1714;
+  --warn: #e9c46e;
+  --warn-bg: #2a2212;
+  --danger-ink: #c4bdaf;
+
+  --chart-general: #cdc6b8;
+  --chart-red: #f08378;
+  --chart-grid: #34312b;
+
+  /* Elevation in the dark: level 1 is a hairline ring; level 2 (hover lift,
+     dialog) adds a stronger ring and a deep drop, so the hover and the
+     viewer read as raised here too. */
+  --shadow-1: 0 0 0 1px var(--rule), inset 0 1px 0 rgb(255 255 255 / 0.04);
+  --shadow-2: 0 0 0 1px var(--rule-strong), 0 16px 32px -12px rgb(0 0 0 / 0.6), inset 0 1px 0 rgb(255 255 255 / 0.06);
+  --image-outline: rgb(255 255 255 / 0.1);
+}
+:root[data-theme="light"] { color-scheme: light; }
+
+/* Reduced motion: the OS setting, or the in-app switch (data-motion on <html>).
+   Every duration and offset is zero and nothing transitions or animates. */
 @media (prefers-reduced-motion: reduce) {
-  :root { --transition: 0s; }
-  *, *::before, *::after {
+  :root {
+    --dur-press: 0ms; --dur-quick: 0ms; --dur-base: 0ms; --dur-emphasis: 0ms; --dur-max: 0ms;
+    --shift-xs: 0px; --shift-s: 0px; --press-scale: 1; --enter-scale: 1;
+    --transition: 0s;
+  }
+  /* ::backdrop as well: the frame viewer's veil fades in by a CSS animation. */
+  *, *::before, *::after, *::backdrop {
     transition: none !important;
     animation: none !important;
     scroll-behavior: auto !important;
   }
+}
+:root[data-motion="reduce"] {
+  --dur-press: 0ms; --dur-quick: 0ms; --dur-base: 0ms; --dur-emphasis: 0ms; --dur-max: 0ms;
+  --shift-xs: 0px; --shift-s: 0px; --press-scale: 1; --enter-scale: 1;
+  --transition: 0s;
+}
+:root[data-motion="reduce"] *,
+:root[data-motion="reduce"] *::before,
+:root[data-motion="reduce"] *::after,
+:root[data-motion="reduce"] *::backdrop {
+  transition: none !important;
+  animation: none !important;
+  scroll-behavior: auto !important;
 }
 
 /* ------------------------------------------------------------------ base */
@@ -90,8 +215,13 @@
 html {
   background: var(--paper);
   color: var(--ink);
-  font: 16px/1.5 var(--sans);
+  font: var(--fs-body)/1.5 var(--sans);
   -webkit-text-size-adjust: 100%;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  /* Moving between a short page and a long one must not shift every centred
+     element sideways by the scrollbar's width. */
+  scrollbar-gutter: stable;
 }
 
 body {
@@ -102,18 +232,20 @@ body {
   background: var(--paper);
 }
 
+::selection { background: var(--pass-bg); color: var(--ink); }
+
 h1, h2, h3 {
   font-family: var(--serif);
   font-weight: 400;
   line-height: 1.2;
-  letter-spacing: -0.005em;
-  margin: 0 0 12px;
+  margin: 0 0 var(--s3);
+  text-wrap: balance;
 }
-h1 { font-size: 34px; }
-h2 { font-size: 24px; }
-h3 { font-size: 18px; }
+h1 { font-size: var(--fs-h1); line-height: 1.1; letter-spacing: -0.01em; }
+h2 { font-size: var(--fs-h2); }
+h3 { font-size: var(--fs-h3); }
 
-p { margin: 0 0 12px; }
+p { margin: 0 0 var(--s3); }
 
 a { color: var(--accent); text-underline-offset: 2px; }
 a:hover { color: var(--accent-hover); }
@@ -188,56 +320,90 @@ img { max-width: 100%; height: auto; }
   padding: 0;
 }
 .primary-nav a {
+  position: relative;
   display: inline-block;
   padding: 8px 0;
   color: var(--ink-soft);
   text-decoration: none;
-  font-size: 13px;
+  font-size: var(--fs-meta);
   text-transform: uppercase;
-  letter-spacing: 0.06em;
-  border-bottom: 2px solid transparent;
+  letter-spacing: 0.08em;
 }
-.primary-nav a:hover { color: var(--ink); }
-.primary-nav a[aria-current="page"] { color: var(--ink); border-bottom-color: var(--accent); }
+/* Hover underlines instead of recolouring: ink-soft to ink is a flash pair in the dark scheme. */
+.primary-nav a:hover { text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 6px; }
+.primary-nav a[aria-current="page"] { color: var(--ink); }
+/* The current page's 2 px accent rule; it glides between items (GlideIndicator). */
+.nav-underline {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2px;
+  background: var(--accent);
+  pointer-events: none;
+}
 
 /* main.wrap, not main: .wrap's own padding shorthand would otherwise win. */
 main.wrap {
   flex: 1;
-  padding-top: 32px;
-  padding-bottom: 56px;
+  padding-top: var(--s6);
+  padding-bottom: var(--s8);
 }
 main:focus { outline: none; }
 
 .site-footer {
   border-top: 2px solid var(--ink);
   padding: 14px 0 18px;
-  font-size: 14px;
+  font-size: var(--fs-small);
   color: var(--muted);
 }
+.footer-inner { display: flex; flex-wrap: wrap; justify-content: space-between; gap: var(--s2) var(--s5); align-items: flex-start; }
 .site-footer p { margin: 0 0 4px; }
 .site-footer .disclaimer { color: var(--ink); font-weight: 600; }
+.motion-switch { margin: 0; }
+
+/* A text-styled toggle (the footer's "Reduce motion"). */
+.link-button {
+  position: relative;
+  font: inherit;
+  color: var(--accent);
+  background: none;
+  border: 0;
+  padding: 2px 0;
+  min-height: 24px;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+.link-button:hover { color: var(--accent-hover); }
+/* 40 px tall hit area without moving the text. */
+.link-button::after { content: ""; position: absolute; inset: -8px 0; }
 
 /* -------------------------------------------------------------- headings */
 
-.page-head { margin-bottom: 24px; }
+.page-head { margin-bottom: var(--s5); }
 .kicker {
-  font-size: 13px;
+  font-size: var(--fs-meta);
   text-transform: uppercase;
-  letter-spacing: 0.1em;
+  letter-spacing: 0.08em;
   color: var(--accent);
   font-weight: 600;
-  margin: 0 0 8px;
+  margin: 0 0 var(--s2);
 }
-.lede { color: var(--ink-soft); max-width: 68ch; }
-.section { margin-top: 40px; }
-.section > h2 { border-top: 1px solid var(--rule); padding-top: 16px; }
+.lede { color: var(--ink-soft); max-width: 68ch; text-wrap: pretty; }
+.section { margin-top: var(--s7); }
+.section > h2 { border-top: 1px solid var(--rule); padding-top: var(--s4); }
 .muted { color: var(--muted); }
 .num { font-variant-numeric: tabular-nums; }
 .url { font-family: var(--mono); font-size: 14px; overflow-wrap: anywhere; }
 
 /* --------------------------------------------------------------- buttons */
 
+/* Hover changes colour only (never a flash pair, see the header). The press
+   is a 0.97 scale on pointer press; :not(:focus-visible) keeps Space on a
+   keyboard-focused button from scaling. Never `transition: all`. */
 .btn {
+  position: relative;
   font: inherit;
   font-size: 15px;
   line-height: 1.2;
@@ -253,32 +419,52 @@ main:focus { outline: none; }
   align-items: center;
   justify-content: center;
   gap: 8px;
-  transition: background-color var(--transition), color var(--transition);
+  transition:
+    background-color var(--transition),
+    border-color var(--transition),
+    color var(--transition),
+    transform var(--dur-press) var(--ease-out);
 }
-.btn:hover { background: var(--paper-deep); color: var(--ink); }
+@media (hover: hover) and (pointer: fine) {
+  .btn:hover { background: var(--btn-hover); color: var(--ink); }
+  .btn-primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); color: var(--on-accent); }
+  .btn-danger:hover { background: var(--fail-bg); color: var(--fail); }
+  .btn[aria-disabled="true"]:hover { background: var(--surface); color: var(--muted); }
+  .btn[aria-pressed="true"]:hover { background: var(--ink); color: var(--paper); }
+}
+.btn:active:not(:focus-visible):not([aria-disabled="true"]):not(:disabled) { transform: scale(var(--press-scale)); }
 .btn:disabled { cursor: not-allowed; opacity: 0.65; }
 /* aria-disabled keeps the button focusable (focus is not lost at the first or
    last frame); it is styled without opacity so its text keeps full contrast. */
 .btn[aria-disabled="true"] { cursor: not-allowed; border-style: dashed; color: var(--muted); }
-.btn[aria-disabled="true"]:hover { background: var(--surface); color: var(--muted); }
 .btn-primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
-.btn-primary:hover { background: var(--accent-hover); border-color: var(--accent-hover); color: var(--on-accent); }
-.btn-danger { border-color: var(--fail); color: var(--fail); }
-.btn-danger:hover { background: var(--fail-bg); color: var(--fail); }
+.btn-primary[aria-disabled="true"] { color: var(--on-accent); }
+/* Destructive actions are quiet at rest (one per History row: red there out-
+   shouted the FAIL verdicts) and turn red on intent: hover tints the
+   background and the text, focus the text. The border stays --rule-strong, so
+   no hover pair is a flash transition in either scheme. */
+.btn-danger { border-color: var(--rule-strong); color: var(--danger-ink); }
+.btn-danger:focus-visible { color: var(--fail); }
 .btn-small { min-height: 32px; padding: 5px 10px; font-size: 14px; }
+/* 40 px tall hit area for 32 px buttons, vertical only so neighbours in a row never overlap. */
+.btn-small::after { content: ""; position: absolute; inset: -4px 0; }
 .btn[aria-pressed="true"] { background: var(--ink); color: var(--paper); }
-.btn-row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+.btn-row { display: flex; flex-wrap: wrap; gap: var(--s3); align-items: center; }
 
 /* ----------------------------------------------------------------- forms */
 
-.field { margin: 0 0 20px; }
+/* Field block 24 px including the message slot below the input. */
+.field { margin: 0 0 var(--s2); }
 .field > label, .legend {
   display: block;
   font-weight: 600;
   margin-bottom: 6px;
 }
-.hint { display: block; color: var(--muted); font-size: 14px; margin: 0 0 6px; }
-.error-text { display: block; color: var(--fail); font-size: 14px; font-weight: 600; margin-top: 6px; }
+.hint { display: block; color: var(--muted); font-size: var(--fs-small); margin: 0 0 6px; text-wrap: pretty; }
+/* One line is always reserved for a field's message, so a one-line message
+   moves nothing below it. Extra lines appear at once. */
+.field-msg { display: block; min-height: 1.25em; margin-top: 6px; font-size: var(--fs-small); line-height: 1.25; }
+.error-text { display: block; color: var(--fail); font-size: var(--fs-small); font-weight: 600; }
 .input {
   font: inherit;
   width: 100%;
@@ -289,31 +475,73 @@ main:focus { outline: none; }
   background: var(--surface);
   border: 1.5px solid var(--rule-strong);
   border-radius: var(--radius);
+  transition: border-color var(--transition);
 }
-.input:hover { border-color: var(--ink-soft); }
+.input:hover { border-color: var(--rule-hover); }
+/* A disabled input (the custom size while a preset is chosen) keeps the
+   surface background: a darker fill would be a flash transition when radio
+   churn toggles it. Dashed border and muted figures say "not editable". */
+.input:disabled { border-style: dashed; border-color: var(--rule-strong); color: var(--muted); cursor: not-allowed; }
 .input[aria-invalid="true"] { border-color: var(--fail); border-width: 2px; }
 .input-short { max-width: 140px; }
-fieldset { border: 0; margin: 0 0 20px; padding: 0; min-width: 0; }
+fieldset { border: 0; margin: 0 0 var(--s5); padding: 0; min-width: 0; }
 legend { padding: 0; }
-.choice {
+
+/* Radio cards: the native radio stays inside its label card. The selection
+   ring and tint (.radio-card-indicator) fade in on the checked card, in place;
+   content sits above it. Two columns, one on phones. */
+.radio-cards {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--s2);
+  margin-top: var(--s2);
+}
+.radio-cards-wide { grid-template-columns: minmax(0, 1fr); }
+.radio-card {
+  position: relative;
   display: grid;
   grid-template-columns: auto 1fr;
   gap: 2px 10px;
   align-items: start;
-  padding: 8px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius-card);
+  background: var(--surface);
+  cursor: pointer;
+  transition: border-color var(--transition);
 }
-.choice input { margin: 4px 0 0; width: 18px; height: 18px; accent-color: var(--accent); }
-.choice label { font-weight: 500; }
-.choice .hint { grid-column: 2; margin: 0; }
+.radio-card:hover { border-color: var(--rule-hover); }
+.radio-card:has(input:focus-visible) { outline: 3px solid var(--focus); outline-offset: 2px; }
+.radio-card input {
+  position: relative;
+  z-index: 2;
+  margin: 3px 0 0;
+  width: 18px;
+  height: 18px;
+  accent-color: var(--accent);
+}
+.radio-card input:focus-visible { outline: none; }
+.radio-card-text { position: relative; z-index: 2; display: grid; gap: 2px; }
+.radio-card-label { font-weight: 500; }
+.radio-card .hint { margin: 0; }
+.radio-card-indicator {
+  position: absolute;
+  inset: -1px;
+  z-index: 1;
+  border-radius: var(--radius-card);
+  background: var(--pass-bg);
+  box-shadow: 0 0 0 2px var(--accent);
+  pointer-events: none;
+}
 
 /* ---------------------------------------------------------------- tables */
 
 .table-wrap { overflow-x: auto; }
 table { border-collapse: collapse; width: 100%; font-size: 15px; font-variant-numeric: tabular-nums; }
 caption { text-align: left; font-weight: 600; padding: 0 0 8px; }
-th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--rule); vertical-align: top; }
+th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--rule); vertical-align: top; }
 th {
-  font-size: 12px;
+  font-size: var(--fs-meta);
   text-transform: uppercase;
   letter-spacing: 0.08em;
   color: var(--muted);
@@ -322,21 +550,35 @@ th {
 td.numeric, th.numeric { text-align: right; }
 /* Row headers read as data labels, not as small-caps column headings. */
 th[scope="row"] { text-transform: none; letter-spacing: 0; font-size: inherit; color: var(--ink); font-weight: 500; }
+@media (hover: hover) and (pointer: fine) {
+  tbody tr:hover > td, tbody tr:hover > th { background: var(--row-hover); }
+}
 
 /* ------------------------------------------- loading / empty / error states */
 
 .state {
-  border: 1.5px solid var(--rule-strong);
-  border-radius: var(--radius);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--radius-card);
   background: var(--surface);
+  box-shadow: var(--shadow-1);
   padding: 20px 22px;
   max-width: 720px;
 }
-.state > :last-child { margin-bottom: 0; }
+.state > :last-child, .state-body > :last-child { margin-bottom: 0; }
 .state h2 { font-size: 22px; }
-.state-error { border-color: var(--fail); border-left-width: 8px; }
-.state-loading { border-style: dashed; }
-.state pre { background: var(--paper-deep); padding: 10px 12px; border: 1px solid var(--rule); overflow-x: auto; }
+/* The banner's tone treatment: a 1 px tone border plus a 4 px top rule (no side stripe). */
+.state-error {
+  border-color: color-mix(in srgb, var(--fail) 45%, var(--rule));
+  box-shadow: inset 0 4px 0 var(--fail), var(--shadow-1);
+  padding-top: 24px;
+}
+/* The loading box is reserved at once and stays blank for its first 250 ms. */
+.state-loading { border-style: dashed; box-shadow: none; min-height: 66px; }
+.state-loading[data-shown="false"] { visibility: hidden; }
+.state pre { background: var(--paper-deep); padding: 10px 12px; border: 1px solid var(--rule); border-radius: var(--radius); overflow-x: auto; }
+.state-with-drawing { display: flex; gap: var(--s4); align-items: flex-start; }
+.state-body { min-width: 0; flex: 1; }
+.empty-drawing { flex: none; color: var(--ink-soft); margin-top: 2px; }
 
 /* ------------------------------------------------------------- verdicts */
 
@@ -363,13 +605,14 @@ th[scope="row"] { text-transform: none; letter-spacing: 0; font-size: inherit; c
 .verdict-INCONCLUSIVE { color: var(--warn); }
 
 .badge {
+  position: relative;
   display: inline-flex;
   align-items: center;
   gap: 5px;
   padding: 2px 8px;
   border: 1.5px solid currentColor;
   border-radius: var(--radius);
-  font-size: 13px;
+  font-size: var(--fs-meta);
   font-weight: 600;
   white-space: nowrap;
 }
@@ -377,12 +620,12 @@ th[scope="row"] { text-transform: none; letter-spacing: 0; font-size: inherit; c
 .badge-no { color: var(--muted); }
 
 .notice {
-  border: 1.5px solid var(--warn);
-  border-left-width: 8px;
+  border: 1px solid color-mix(in srgb, var(--warn) 45%, var(--rule));
+  box-shadow: inset 0 4px 0 var(--warn);
   background: var(--warn-bg);
-  padding: 12px 16px;
-  border-radius: var(--radius);
-  margin: 16px 0;
+  padding: 16px 16px 12px;
+  border-radius: var(--radius-card);
+  margin: var(--s4) 0;
   max-width: 900px;
 }
 .notice > :last-child { margin-bottom: 0; }
@@ -390,11 +633,26 @@ th[scope="row"] { text-transform: none; letter-spacing: 0; font-size: inherit; c
 
 .plain-list { list-style: none; margin: 0; padding: 0; }
 
+/* ------------------------------------------------------------ route frame */
+
+/* The route wrapper (app/template.tsx) only fades; it must not change layout. */
+.route { display: block; }
+
 @media (max-width: 640px) {
-  :root { --gutter: 16px; }
-  h1 { font-size: 28px; }
-  h2 { font-size: 21px; }
-  main.wrap { padding-top: 24px; }
+  :root { --gutter: 16px; --fs-h1: 31px; --fs-h2: 22px; --fs-verdict: 38px; }
+  main.wrap { padding-top: var(--s5); }
+  .section { margin-top: var(--s6); }
   .masthead-inner { gap: 8px 20px; padding-top: 8px; padding-bottom: 4px; }
   th, td { padding: 8px 6px; }
+  .radio-cards { grid-template-columns: minmax(0, 1fr); }
+  .state { padding: 16px; }
+}
+
+/* ------------------------------------------------------------------ print */
+
+/* A printed report shows every final state: nothing waits for an animation. */
+@media print {
+  [data-arrive], [data-arrive] * { opacity: 1 !important; transform: none !important; }
+  .route { opacity: 1 !important; }
+  .site-footer .motion-switch { display: none; }
 }

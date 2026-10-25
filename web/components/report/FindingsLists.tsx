@@ -1,10 +1,13 @@
 import type { Report } from "@/lib/api";
 import { frameTime, sizeLabel } from "@/lib/format";
+import { isKeyboardClick } from "@/lib/motion";
+import type { OpenRequest } from "./EvidenceStrip";
 import styles from "./Report.module.css";
 
 interface Props {
   report: Report;
-  onViewFrame: (index: number) => void;
+  /** Opens the frame viewer. A text button has no thumbnail, so the viewer just fades in (no ghost). */
+  onViewFrame: (request: OpenRequest) => void;
 }
 
 export function ViolationsList({ report, onViewFrame }: Props) {
@@ -35,7 +38,13 @@ export function ViolationsList({ report, onViewFrame }: Props) {
               {v.frameIndices.length} qualifying flash{v.frameIndices.length === 1 ? "" : "es"}, worst window at x{" "}
               {v.window.x}, y {v.window.y} ({v.window.w} × {v.window.h} px).
             </span>{" "}
-            <button type="button" className="btn btn-small" onClick={() => onViewFrame(first)}>
+            <button
+              type="button"
+              className="btn btn-small"
+              onClick={(event) =>
+                onViewFrame({ index: first, origin: null, keyboard: isKeyboardClick(event), opener: event.currentTarget })
+              }
+            >
               View frame {first}
             </button>
           </li>

@@ -2,13 +2,14 @@
 
 import type { Culprit, Report } from "@/lib/api";
 import { percent } from "@/lib/format";
-import { useSafeToggle } from "@/lib/useSafeToggle";
+import { isKeyboardClick, useLargeAreaGate } from "@/lib/motion";
 import styles from "./Report.module.css";
 
 interface Props {
   report: Report;
   selectedRank: number | null;
-  onSelect: (rank: number | null) => void;
+  /** `instant` is true when the keyboard made the choice: the outline then jumps instead of gliding. */
+  onSelect: (rank: number | null, instant: boolean) => void;
 }
 
 /** Why the table is empty, in the user's terms. */
@@ -43,12 +44,16 @@ function minimalSetText(c: Culprit): string {
 export default function CulpritsTable({ report, selectedRank, onSelect }: Props) {
   // SAFETY: one throttle for every row and button here, so neither a held
   // Enter nor fast clicking (on one row or alternating rows) can make the
-  // outline on the heatmap blink faster than 3 Hz.
-  const safe = useSafeToggle();
+  // outline on the heatmap blink faster than 3 Hz. It is the report's shared
+  // large-area gate: a selection changes the same figure as the heatmap overlay
+  // and the data table, and separate gates let a round-robin of the three
+  // change it about 8 times a second (self-audit F3c).
+  const safe = useLargeAreaGate();
 
   if (report.culprits.length === 0) return <p>{emptyMessage(report)}</p>;
 
-  const toggle = (rank: number) => safe.run(() => onSelect(selectedRank === rank ? null : rank));
+  const toggle = (rank: number, instant: boolean) =>
+    safe.run(() => onSelect(selectedRank === rank ? null : rank, instant));
 
   return (
     <>
@@ -81,7 +86,7 @@ export default function CulpritsTable({ report, selectedRank, onSelect }: Props)
                 <tr
                   key={c.rank}
                   className={`${styles.culpritRow} ${isSelected ? styles.selectedRow : ""}`}
-                  onClick={() => toggle(c.rank)}
+                  onClick={() => toggle(c.rank, false)}
                 >
                   <td className="num">{c.rank}</td>
                   <td>
@@ -96,7 +101,7 @@ export default function CulpritsTable({ report, selectedRank, onSelect }: Props)
                       onKeyDown={safe.onKeyDown}
                       onClick={(event) => {
                         event.stopPropagation(); // the row's own click would toggle twice
-                        toggle(c.rank);
+                        toggle(c.rank, isKeyboardClick(event));
                       }}
                     >
                       Outline
