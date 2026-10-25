@@ -123,6 +123,42 @@ TIMELINE_CLOCK_JS = r"""
 #: Note added by strategy A, which installs ``TIMELINE_CLOCK_JS``.
 TIMELINE_CLOCK_NOTE = "document.timeline.currentTime reads the fake clock (performance.now()), not the real one"
 
+# ADR-029: a browser runs requestAnimationFrame callbacks once per frame it draws. Playwright's fake clock
+# runs them every 16 ms instead, which drifts against FlashTrace's 16.667 ms frames and moved the state of
+# a rAF-driven page by up to two frames (an exact 3 Hz page measured 4 per second). This init script keeps
+# the callbacks in a queue; strategy A runs the queue once per captured frame, at that frame's clock time,
+# before it seeks the animations and takes the picture. Callbacks requested while the queue runs wait for
+# the next frame, as in a browser.
+RAF_SYNC_JS = r"""
+(() => {
+  if (window.__ftRaf) return;
+  const queue = new Map();  // id -> callback, kept in the order they were requested
+  let nextId = 1;
+  window.requestAnimationFrame = function requestAnimationFrame(callback) {
+    const id = nextId++;
+    queue.set(id, callback);
+    return id;
+  };
+  window.cancelAnimationFrame = function cancelAnimationFrame(id) { queue.delete(id); };
+  window.__ftRaf = {
+    flush(timestamp) {
+      const due = Array.from(queue.values());
+      queue.clear();
+      for (const callback of due) {
+        try { callback(timestamp); } catch (error) {
+          // A browser reports the error and carries on with the other callbacks.
+          if (typeof reportError === 'function') reportError(error); else console.error(error);
+        }
+      }
+      return due.length;
+    },
+  };
+})();
+"""
+
+#: Note added by strategy A, which installs ``RAF_SYNC_JS``.
+RAF_SYNC_NOTE = "requestAnimationFrame callbacks run once per captured frame, at that frame's clock time"
+
 # Strategy A pauses every animation and SVG timeline and seeks it per frame, so the browser's own record
 # of what the page asked for is lost: a page's pause() on an animation we already paused changes nothing
 # we can see. These wrappers write the page's requests onto the object instead:

@@ -42,7 +42,7 @@ How it works, in plain words:
    script can move are hidden (see ``capture/page_scripts.py``).
 
 Time base. ``t`` above is virtual time since the page loaded. Without an interaction script frame ``i``
-sits at ``t_i = i * 1000 / fps`` ms. With one, the script's virtual time (the pre-roll ``p``) comes first,
+sits at ``t_i = (i + 1/4) * 1000 / fps`` ms (ADR-029). With one, the script's virtual time (the pre-roll ``p``) comes first,
 frame ``i`` sits at ``p + t_i``, and animations started during the script keep running into the frames,
 exactly as the page's JavaScript clock does. The seek pass also runs at every pump of the interaction
 script, so an animation the script waits for finishes at a virtual time, not a real one.
@@ -71,6 +71,8 @@ from playwright.sync_api import BrowserContext, Page
 from capture.page_scripts import (
     ANIMATION_RECORDER_JS,
     PAGE_HELPERS_JS,
+    RAF_SYNC_JS,
+    RAF_SYNC_NOTE,
     SEEDED_RANDOM_JS,
     SEEDED_RANDOM_NOTE,
     TIMELINE_CLOCK_JS,
@@ -79,6 +81,7 @@ from capture.page_scripts import (
 from capture.strategies import network_wait
 from capture.strategies.base import (
     DOUBLE_SHOT_REAL_GAP_MS,
+    SAMPLE_PHASE,
     CaptureSettings,
     CaptureStrategy,
     FrameSink,
@@ -141,6 +144,9 @@ MAX_FINISH_ROUNDS = 8
 # (capture/page_scripts.py) supplies ``ftScopes`` (the document, every shadow root and every
 # same-origin frame), ``ftOwnCall`` and the ablation helpers. Arguments:
 #   tMs     virtual milliseconds since the page loaded at which this pass runs (see "Time base" above);
+#   anchorMs  the start of this pass's frame slot (tMs minus the quarter-frame sample phase, ADR-029):
+#           an animation first seen in this pass starts its clock here, so later samples never fall
+#           exactly on a state switch that is a whole number of frames after its start;
 #   stage   'pre-roll' (interaction pump), 'frame0' or 'later' (any frame after frame 0);
 #   walk    true to also walk every element for undeclared open shadow roots (costly: first pass only);
 #   suppress, limits  the ablation selectors and the real-time limits (ms) of the waits.
@@ -158,6 +164,18 @@ _SEEK_FRAME_BODY = r"""
                   videoSeekTimeouts: 0, videoWaitSkipped: 0, mediaWaits: 0, mediaTimeouts: 0, perfNow: 0,
                   rebase: W.__ftClockRebase || 'missing' };
   const late = stage === 'later';  // after frame 0
+
+  // ADR-029: animation-frame callbacks run now, once per pass, at this pass's clock time, before any
+  // animation is seeked (a browser runs them just before it draws). Same-origin frames run theirs too.
+  const flushAnimationFrames = (win) => {
+    let ran = 0;
+    try { if (win.__ftRaf) ran += win.__ftRaf.flush(win.performance.now()); } catch (e) { /* cross-origin */ }
+    for (let k = 0; k < win.frames.length; k++) {
+      try { ran += flushAnimationFrames(win.frames[k]); } catch (e) { /* cross-origin frame */ }
+    }
+    return ran;
+  };
+  stats.rafCallbacks = flushAnimationFrames(W);
 
   // Where to look (ADR-022).
   const scopes = ftScopes(W, walk);
@@ -249,7 +267,7 @@ _SEEK_FRAME_BODY = r"""
     if (late) stats.newAnimations++;
     const pagePaused = animation.playState === 'paused' && !suppressed;
     animation.__ftId = registry.nextId++;
-    animation.__ft = { offset: tMs, phase: takePageSeek(animation), held: null, last: null, pausedAt: null, pagePaused };
+    animation.__ft = { offset: anchorMs, phase: takePageSeek(animation), held: null, last: null, pausedAt: null, pagePaused };
     if (pagePaused) return leaveAlone(animation);
     fresh.push(animation);
     return true;
@@ -263,7 +281,7 @@ _SEEK_FRAME_BODY = r"""
     const ft = animation.__ft;
     const now = animation.currentTime;
     if (animation.playbackRate > 0 && typeof ft.last === 'number' && typeof now === 'number' && now < ft.last) {
-      Object.assign(ft, { offset: tMs, phase: null });
+      Object.assign(ft, { offset: anchorMs, phase: null });
     }
     stats.readopted++;
     fresh.push(animation);
@@ -275,14 +293,14 @@ _SEEK_FRAME_BODY = r"""
     if (ft.pagePaused) {
       if (animation.playState === 'paused') return leaveAlone(animation);
       // The page resumed it: from now on we drive it, continuing from where it stood.
-      Object.assign(ft, { pagePaused: false, offset: tMs, phase: ft.pausedAt, held: null });
+      Object.assign(ft, { pagePaused: false, offset: anchorMs, phase: ft.pausedAt, held: null });
       fresh.push(animation);
       return true;
     }
     const seek = takePageSeek(animation);
     if (seek !== null) {
       // The page moved it to a new time: its clock restarts here, from that time (a held one stays held).
-      Object.assign(ft, { offset: tMs, phase: seek, held: ft.held === null ? null : 0 });
+      Object.assign(ft, { offset: anchorMs, phase: seek, held: ft.held === null ? null : 0 });
       stats.pageSeeks++;
       fresh.push(animation);
     } else if (animation.playState === 'running') readopt(animation, fresh);
@@ -424,7 +442,7 @@ _SEEK_FRAME_BODY = r"""
     const ft = svg.__ft;
     if (ft.pagePaused) {
       if (svg.animationsPaused()) { ft.phase = svg.getCurrentTime() * 1000; stats.svgPagePaused++; return false; }
-      Object.assign(ft, { pagePaused: false, offset: tMs, held: null });
+      Object.assign(ft, { pagePaused: false, offset: anchorMs, held: null });
     } else if (!svg.animationsPaused()) stats.svgResumed++;
     const hold = svg.__ftPageWantsPaused === true;
     if (hold) stats.svgHeld++;
@@ -441,7 +459,7 @@ _SEEK_FRAME_BODY = r"""
     for (const { root } of scopes) {
       for (const svg of root.querySelectorAll('svg')) {
         if (svg.ownerSVGElement !== null || typeof svg.setCurrentTime !== 'function' || svg.__ftSmilHeld) continue;
-        if (!svg.__ft) svg.__ft = { offset: tMs, phase: 0, held: null, pagePaused: svg.animationsPaused() };
+        if (!svg.__ft) svg.__ft = { offset: anchorMs, phase: 0, held: null, pagePaused: svg.animationsPaused() };
         if (driveSvg(svg)) stats.svgTimelines++;
       }
     }
@@ -503,7 +521,7 @@ _SEEK_FRAME_BODY = r"""
 """
 
 SEEK_FRAME_JS = (
-    "async ({ tMs, stage, walk, suppress, limits }) => {\n"
+    "async ({ tMs, anchorMs, stage, walk, suppress, limits }) => {\n"
     + PAGE_HELPERS_JS
     + _SEEK_FRAME_BODY
     + "}\n"
@@ -662,7 +680,7 @@ class WaapiStepStrategy(CaptureStrategy):
         self._settings = settings
         context.clock.install(time=0)
         context.clock.pause_at(0)
-        for script in (CLOCK_REBASE_JS, SEEDED_RANDOM_JS, TIMELINE_CLOCK_JS, ANIMATION_RECORDER_JS):
+        for script in (CLOCK_REBASE_JS, SEEDED_RANDOM_JS, TIMELINE_CLOCK_JS, RAF_SYNC_JS, ANIMATION_RECORDER_JS):
             context.add_init_script(script)
 
     def prepare_page(self, page: Page, settings: CaptureSettings) -> None:
@@ -689,6 +707,7 @@ class WaapiStepStrategy(CaptureStrategy):
             SEEK_FRAME_JS,
             {
                 "tMs": t_ms,
+                "anchorMs": t_ms if stage == "pre-roll" else t_ms - SAMPLE_PHASE * 1000 / self._settings.fps,
                 "stage": stage,
                 "walk": walk,
                 "suppress": [] if stage == "pre-roll" else list(self._settings.suppress_selectors),
@@ -769,8 +788,8 @@ class WaapiStepStrategy(CaptureStrategy):
 
         for index in range(total):
             target_ms = int(round(settings.frame_time_ms(index)))
-            # Frame 0 still issues run_for(0): it fires timers already due at virtual 0 so the page
-            # is in the same state whether or not a due timer happened to fire during setup.
+            # Frame 0 issues run_for(round(t_0)) (a quarter-frame, ADR-029): it also fires timers already due
+            # at virtual 0, so the page is in the same state whether or not one fired during setup.
             self._advance_clock(target_ms - clock_ms)
             clock_ms = target_ms
             pass_ms = self._preroll_ms + settings.frame_time_ms(index)  # virtual time since load
@@ -802,7 +821,9 @@ class WaapiStepStrategy(CaptureStrategy):
         notes = tally.notes() + [
             SEEDED_RANDOM_NOTE,
             TIMELINE_CLOCK_NOTE,
-            f"fake clock stepped in whole ms: frame i sits at round(i*1000/{fps}) ms, animations seeked to the exact time",
+            RAF_SYNC_NOTE,
+            f"fake clock stepped in whole ms: frame i sits at round((i + {SAMPLE_PHASE})*1000/{fps}) ms, "
+            "animations seeked to the exact time (ADR-029)",
         ]
         return StrategyOutcome(
             deterministic=not failures and not uncertain,

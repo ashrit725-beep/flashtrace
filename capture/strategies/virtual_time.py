@@ -541,7 +541,8 @@ class VirtualTimeStrategy(CaptureStrategy):
 
         for index in range(total):
             t_ms = settings.frame_time_ms(index)
-            if index > 0 and not self._advance(page, t_ms - settings.frame_time_ms(index - 1)):
+            previous_ms = settings.frame_time_ms(index - 1) if index > 0 else 0.0  # frame 0 sits a quarter-frame in
+            if not self._advance(page, t_ms - previous_ms):
                 failures.append(f"virtual time stopped answering before frame {index}")
                 break
             try:
@@ -555,7 +556,7 @@ class VirtualTimeStrategy(CaptureStrategy):
                 deterministic &= self._check_frame(page, settings, index, t_ms, png, digest, failures)
                 now = self._page_now_ms()
                 clock_at_frame0 = now if clock_at_frame0 is None else clock_at_frame0
-                expected = clock_at_frame0 + t_ms
+                expected = clock_at_frame0 + (t_ms - settings.frame_time_ms(0))
                 if abs(now - expected) > CLOCK_TOLERANCE_MS:
                     deterministic = False
                     failures.append(f"page clock read {now:.1f} ms at frame {index}, expected {expected:.1f} ms")

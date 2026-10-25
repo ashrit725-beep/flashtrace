@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>FlashTrace test page: 5 Hz CSS strobe</title>
+<style>
+  /* 400 x 300 px box, white <-> black every 100 ms (5 flashes per second). Its switches land on whole
+     frames (100 ms = 6 frames), the case that once measured 6 per second (ADR-029). */
+  html, body { margin: 0; height: 768px; background: #fff; }
+  #box { position: absolute; left: 100px; top: 100px; width: 400px; height: 300px;
+         animation: strobe 0.2s steps(1, end) infinite; }
+  @keyframes strobe { 0% { background: #fff; } 50% { background: #000; } 100% { background: #fff; } }
+</style>
+</head>
+<body><div id="box"></div></body>
+</html>

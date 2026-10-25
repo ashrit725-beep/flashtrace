@@ -293,3 +293,28 @@ switches are appended.
 and a new browser test captures a marquee page four times at once and requires identical hashes. Rendering is
 done on the CPU, which also removes GPU differences between machines. Frame hashes differ from those recorded
 before this ADR (expected; the full benchmark is re-run).
+
+## ADR-029 — Sample a quarter-frame into each slot; run animation-frame callbacks once per captured frame (2026-10-25)
+
+**Context.** Two measurement errors were found by checking reported rates against pages whose true rate is known.
+(1) The demo's loader strobes at exactly 5 Hz, but FlashTrace reported 6 per second: its events were 12, 24, 37,
+48, 60, 73 … frames, not every 12. The loader switches state every 100 ms, so many switches fell exactly on a
+sample instant, and Chromium decides such instants with floating-point seconds (0.6 / 0.2 = 2.9999999999999996),
+showing the old state at some of them. One transition in three arrived a frame late, so six flashes fitted in one
+second. Strategy A also anchored each animation's clock at the sample instant where it was first seen, which kept
+every later sample on those switch instants. (2) An exact 3 Hz benchmark page driven by `requestAnimationFrame`
+reported 4 per second (expected PASS, got FAIL): Playwright's fake clock fires animation-frame callbacks every
+16 ms, which drifts against 16.667 ms frames, so event gaps were 19, 20 and 21 frames instead of 20.
+**Decision.** Frame `i` shows the page at `(i + 1/4) / fps` (`capture.strategies.base.SAMPLE_PHASE`). At 60 fps a
+quarter-frame offset is never a whole millisecond or a third of one, so it never coincides with the state switch of
+a CSS or Web Animations animation whose timing is whole milliseconds or thirds; for all rates up to 3 per second and
+the 2.5 per second fix target this holds for every frame. An animation first seen in a pass starts its clock at the
+start of that frame slot (`anchorMs`), not at the sample instant. An init script (`RAF_SYNC_JS`) queues
+`requestAnimationFrame` callbacks, and strategy A runs the queue once per captured frame at that frame's clock time,
+before seeking animations and taking the picture, as a browser runs them once per drawn frame. Strategy B advances to
+the quarter-frame before frame 0; strategy C (real time) keeps its grid because its timestamps come from the real
+clock.
+**Consequences.** Measured after the change: the demo reports 5 per second with every gap 12 frames; the 3 Hz rAF
+benchmark page reports 3 per second with every gap 20 frames and passes; the rAF and CSS test pages now agree frame
+for frame. Every frame hash changes once (expected). Reports still label frame `i` as `t = i / fps`, the start of its
+slot.

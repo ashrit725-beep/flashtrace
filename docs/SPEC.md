@@ -235,7 +235,9 @@ output (float64 throughout, fixed operation order).
 ### 5.1 Input
 
 * `frames`: `uint8[T, H, W, 3]` sRGB (R, G, B order), T ≥ 2.
-* `fps`: frames per second of *animation time* (default 60). Frame `i` is at `t_i = i / fps` seconds.
+* `fps`: frames per second of *animation time* (default 60). Frame `i` stands for the time slot
+  `[i / fps, (i + 1) / fps)` and shows the page a quarter of the way into it, at `t_i = (i + 1/4) / fps` seconds
+  (ADR-029). Reports label frames by their slot start, `i / fps`.
 * `viewport`: `(W_css, H_css)`; `frames` are at device scale factor 1 so `W == W_css`. A frame width that differs
   from the viewport width is rejected with `ValueError` (the window size is derived from the viewport width).
 * `red_rule`: `"wcag22"` (default) or `"wcag21-legacy"` (comparison only).
@@ -386,7 +388,8 @@ independent of the PNG encoder). `hash = sha256(concatenation of all frameHashes
   `page.clock` at virtual time 0 (controls `Date`, timers, `requestAnimationFrame`, `performance.now`). Pause
   every animation from `document.getAnimations()` (including same-origin frames) and, per frame, set each
   animation's `currentTime = t_i − startOffset`, seek `<video>` elements to `t_i` and wait for `seeked`, then
-  `clock.run_for(1000/fps)` so JS/rAF animations advance, then screenshot (`animations="allow"`). Animations
+  `clock.run_for(1000/fps)` so JS animations advance, run the page's `requestAnimationFrame` callbacks once
+  at that clock time (as a browser does once per drawn frame; ADR-029), then screenshot (`animations="allow"`). Animations
   discovered after frame 0 are treated as starting at the frame in which they first appear. Animations inside
   shadow roots (open or closed, recorded by an init script that wraps `attachShadow`) are driven the same way;
   SVG SMIL timelines are paused and set with `setCurrentTime`; an animation the page resumes later is

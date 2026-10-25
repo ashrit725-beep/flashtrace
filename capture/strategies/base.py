@@ -30,6 +30,9 @@ ProgressCallback = Callable[[int, int], None]
 #: between the two pictures instead of slipping through by luck.
 DOUBLE_SHOT_REAL_GAP_MS = 100
 
+# Where inside its 1/fps time slot each frame is sampled (ADR-029): a quarter of the way in.
+SAMPLE_PHASE = 0.25
+
 
 @dataclass(frozen=True)
 class CaptureSettings:
@@ -55,8 +58,16 @@ class CaptureSettings:
         return int(round(self.duration_s * self.fps))
 
     def frame_time_ms(self, index: int) -> float:
-        """Animation time of frame ``index`` in milliseconds (SPEC 5.1: ``t_i = i / fps``)."""
-        return index * 1000 / self.fps
+        """Animation time of frame ``index`` in milliseconds: a quarter of the way into its time slot.
+
+        Frame ``i`` stands for the slot from ``i / fps`` to ``(i + 1) / fps`` seconds and shows the page at
+        ``(i + 1/4) / fps`` (SPEC 5.1, ADR-029). Sampling exactly at ``i / fps`` put many sample times on
+        the exact instant a CSS animation switches state (200 ms = 12 frames); Chromium then shows the old
+        state at some of those instants and the new one at others (0.6 / 0.2 = 2.9999999999999996), which
+        moved some transitions a frame late and made a 5 Hz strobe measure 6 per second. A quarter-frame
+        offset is never a whole millisecond or a third of one at 60 fps, so it never lands on such a switch.
+        """
+        return (index + SAMPLE_PHASE) * 1000 / self.fps
 
 
 @dataclass

@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>FlashTrace test page: exactly 3 Hz with requestAnimationFrame</title>
+<style>
+  html, body { margin: 0; height: 768px; background: #fff; }
+  #box { position: absolute; left: 100px; top: 100px; width: 400px; height: 300px; background: #000; }
+</style>
+</head>
+<body>
+<div id="box"></div>
+<script>
+  // Exactly 3 flashes per second: the state flips every 1/6 s, read from the clock in each animation frame.
+  // WCAG 2.3.1 allows "no more than three" per second, so this page must PASS (ADR-029).
+  const box = document.getElementById('box');
+  function draw() {
+    const state = Math.floor(performance.now() / 1000 * 6) % 2;
+    box.style.background = state ? '#fff' : '#000';
+    requestAnimationFrame(draw);
+  }
+  requestAnimationFrame(draw);
+</script>
+</body>
+</html>
