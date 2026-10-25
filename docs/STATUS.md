@@ -49,3 +49,13 @@ No number here is an estimate; measured figures also live in docs/RESULTS.md wit
   checks for `libvpx`.
 * Measured: first full 200-page run is in progress in a clean worktree of commit 8674c95; its numbers will appear in
   docs/RESULTS.md only.
+
+### M3 — first full benchmark (2026-10-25)
+
+* Ran: `flashtrace bench --n 200 --seed 1 --duration 10 --workers 4 --determinism-sample 20` in a clean worktree
+  of commit 8674c95; the generated docs/RESULTS.md is committed unchanged as the M3 record.
+* Passed: clear-case verdict accuracy and violation-type agreement as listed in docs/RESULTS.md.
+* Failed: determinism, 9 of 20 re-run pages identical. Root cause found and fixed in ADR-025 (threaded animation
+  under load); after the fix the same 20 pages gave 20/20 identical under 4 workers. The full benchmark is
+  re-run at M9; until then docs/RESULTS.md shows the pre-fix numbers.
+* Not measured yet: attribution accuracy (M4/M5).
