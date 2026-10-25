@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>FlashTrace test page: scrolling marquee</title>
+<style>
+  /* A long line of text slides through a 400 px clipped strip at 120 px/s (2 px per frame at 60 fps).
+     Not a flash. It exists because, under machine load, Chromium's compositor thread once drew newly
+     revealed slices of this kind of layer differently from run to run (ADR-025). */
+  html, body { margin: 0; height: 768px; overflow: hidden; background: #fff; font-family: system-ui, sans-serif; }
+  #strip { position: fixed; left: 124px; top: 644px; width: 400px; height: 40px; overflow: hidden; background: #f4f1ea; }
+  #strip span { display: inline-block; white-space: nowrap; font-size: 20px; line-height: 40px; color: #333;
+                animation: slide 10s linear infinite; }
+  @keyframes slide { from { transform: translateX(400px); } to { transform: translateX(-800px); } }
+</style>
+</head>
+<body>
+<div id="strip"><span>Scrolling text moves across this strip at 120 pixels per second. It is dark text on a light background and it is not a flash. Scrolling text moves across this strip at 120 pixels per second. It is dark text on a light background and it is not a flash.</span></div>
+</body>
+</html>

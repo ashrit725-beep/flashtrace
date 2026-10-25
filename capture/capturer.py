@@ -38,6 +38,23 @@ ProgressCallback = Callable[[int, int], None]
 #: Where frames go when the caller does not say (a fresh sub-directory per capture).
 DEFAULT_OUTPUT_ROOT = Path(".flashtrace") / "captures"
 
+# Chromium switches every FlashTrace capture runs under (ADR-025). Each one removes a way for real
+# time or machine load to reach the pixels; all were found by capturing the same page several times
+# at once and comparing frame hashes.
+RENDERING_SWITCHES: tuple[str, ...] = (
+    "--disable-gpu",                  # draw with the CPU: no GPU driver timing or rounding
+    "--disable-gpu-compositing",      # put layers together on the CPU as well
+    "--disable-gpu-rasterization",    # turn shapes and text into pixels on the CPU as well
+    "--disable-threaded-animation",   # the compositor thread must not keep its own copy of an animation
+                                      # that FlashTrace has paused and seeks (the measured root cause)
+    "--disable-partial-raster",       # re-draw whole tiles, so a tile never depends on what it held before
+)
+
+
+def launch_chromium(browser_type: Any, extra: tuple[str, ...] | list[str] = ()) -> Browser:
+    """Start headless Chromium with FlashTrace's rendering switches plus any strategy-specific ones."""
+    return browser_type.launch(headless=True, args=[*RENDERING_SWITCHES, *extra])
+
 #: Milliseconds Playwright may spend loading the page before the capture is an error.
 NAVIGATION_TIMEOUT_MS = 30_000
 
@@ -372,7 +389,7 @@ def capture(
     if browser is not None:
         return _capture_with_browser(browser, settings, names, auto, target_dir, progress, started)
     with sync_playwright() as playwright:
-        own_browser = playwright.chromium.launch(headless=True)
+        own_browser = launch_chromium(playwright.chromium)
         try:
             return _capture_with_browser(own_browser, settings, names, auto, target_dir, progress, started)
         finally:
@@ -428,7 +445,7 @@ def _browser_for(attempt: _Attempt, browser: Browser) -> tuple[Browser, bool]:
     if not switches or not attempt.strategy.needs_launch_args(browser):
         return browser, False
     try:
-        dedicated = browser.browser_type.launch(headless=True, args=list(switches))
+        dedicated = launch_chromium(browser.browser_type, switches)
     except PlaywrightError as exc:
         attempt.notes.append(f"could not launch a dedicated Chromium with {' '.join(switches)}: {_first_line(exc)}; using the shared browser")
         return browser, False

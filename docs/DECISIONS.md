@@ -272,3 +272,24 @@ meteors, shimmer and beams; `MotionConfig reducedMotion="user"` plus the CSS med
 every screen must PASS. FlashTrace audits itself.
 **Consequences.** More code in `web/` to explain; one extra dependency; the self-audit turns the safety rule into a
 measured result instead of a promise.
+
+## ADR-025 — Chromium runs with five rendering switches so machine load cannot reach the pixels (2026-10-25)
+
+**Context.** The first full benchmark (commit 8674c95, 200 pages, 4 worker processes) found that only 9 of 20
+pages gave identical frame hashes on a second run, although every capture reported `deterministic`. Every
+differing page contained the scrolling-marquee distractor; every page without it was identical. Frames kept from
+four simultaneous captures showed no shift in the text: a single 7 px-wide slice of newly revealed text was drawn
+differently and then moved with the layer. Measured with four concurrent 10 s captures of that page: software
+rendering alone (`--disable-gpu`, `--disable-gpu-compositing`, `--disable-gpu-rasterization`) fixed sequential runs
+but not concurrent ones (a 20-page benchmark under load: 10/20 identical); larger tiles or disabling partial raster
+alone did not fix it; **every switch set containing `--disable-threaded-animation` gave four identical runs**.
+Strategy A pauses and seeks animations from the page; with threaded animation the compositor thread keeps its own
+copy of a transform animation, and under load its raster timing leaks into the image.
+**Decision.** `capture.capturer.launch_chromium` starts every Chromium FlashTrace uses with
+`--disable-gpu --disable-gpu-compositing --disable-gpu-rasterization --disable-threaded-animation
+--disable-partial-raster` (partial raster off so a tile never depends on its previous contents). Strategy-specific
+switches are appended.
+**Consequences.** Measured after the change: the same 20-page benchmark under 4 workers gave 20/20 identical pages,
+and a new browser test captures a marquee page four times at once and requires identical hashes. Rendering is
+done on the CPU, which also removes GPU differences between machines. Frame hashes differ from those recorded
+before this ADR (expected; the full benchmark is re-run).

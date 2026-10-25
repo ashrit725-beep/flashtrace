@@ -29,8 +29,10 @@ def browser() -> Iterator["Browser"]:  # noqa: F821 - imported lazily so non-bro
     """One headless Chromium for the whole session (launch costs ~0.5 s; contexts are per capture)."""
     from playwright.sync_api import sync_playwright
 
+    from capture.capturer import launch_chromium
+
     with sync_playwright() as playwright:
-        instance = playwright.chromium.launch(headless=True)
+        instance = launch_chromium(playwright.chromium)
         try:
             yield instance
         finally:
