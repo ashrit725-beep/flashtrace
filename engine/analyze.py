@@ -33,7 +33,7 @@ from engine.cells import (
     window_cells_full,
     window_px,
 )
-from engine.constants import CELL_PX, RED_RULES, RUN_REVERSAL_TOLERANCE
+from engine.constants import CELL_PX, EVENT_FRAME_TOLERANCE, RED_RULES, RUN_REVERSAL_TOLERANCE
 from engine.rate import find_advisories, find_violations, timeline, trailing_counts, window_counts
 from engine.transitions import (
     FlashPairer,
@@ -316,6 +316,20 @@ def _frame_stats(general: _TypeResult, red: _TypeResult, fps: int) -> FrameStats
     )
 
 
+def _violation_cells(violation: Violation, masks: np.ndarray) -> np.ndarray:
+    """Cells that flashed in one violation's events: the union of E[t] over its event frames.
+
+    In: the violation and the bool masks [T, cells_y, cells_x] of its flash type.
+    Out: bool [cells_y, cells_x].  E[t] = M[t-1] | M[t] (SPEC 5.6 step 1, ADR-019), so each
+    event frame also brings in the completions of the frame before it.
+    """
+    cells = np.zeros(masks.shape[1:], dtype=bool)
+    for t in violation.frame_indices:
+        first = max(0, t - EVENT_FRAME_TOLERANCE)  # frames before frame 0 count as empty
+        cells |= masks[first : t + 1].any(axis=0)
+    return cells
+
+
 def _assemble(
     general: _TypeResult,
     red: _TypeResult,
@@ -334,6 +348,8 @@ def _assemble(
     )
     bins = [TimelineBin(t=sec, general_flashes=g, red_flashes=r)
             for sec, g, r in timeline(general.area.qualifying, red.area.qualifying, fps)]
+    masks_by_type = {"general": general.masks, "red": red.masks}
+    violation_cells = [_violation_cells(v, masks_by_type[v.type]) for v in violations]
     return AnalysisResult(
         frame_count=frame_count,
         fps=fps,
@@ -352,6 +368,7 @@ def _assemble(
         red_max_rate=red.max_rate,
         qualifying_general=[int(f) for f in np.flatnonzero(general.area.qualifying)],
         qualifying_red=[int(f) for f in np.flatnonzero(red.area.qualifying)],
+        violation_cells=violation_cells,
     )
 
 

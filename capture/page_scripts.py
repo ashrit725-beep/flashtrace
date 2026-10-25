@@ -24,8 +24,16 @@ Two kinds of script live here.
   - ``ftScopes`` lists every place animations can live: each same-origin window's document (frames,
     ``<object>`` and ``<embed>`` documents included) plus every shadow root;
   - ``ftOwnCall`` marks a call as FlashTrace's own, so the recorder does not take it for the page's;
-  - ``ftIsSuppressed`` says whether a node is on or inside an element suppressed for an ablation;
+  - ``ftQueryDeep`` finds the elements a FlashTrace selector names, including ``host >>> inner``
+    selectors for elements inside shadow roots and same-origin frames (``capture/inspect.py``);
+  - ``ftIsSuppressed`` says whether an element is itself suppressed for an ablation, and ``ftIsHidden``
+    whether a node cannot be seen because of one;
   - ``ftApplySuppression`` performs the ablation set-up of ADR-013.
+
+Suppression stops only what the suppressed element itself does: its own animations, its own picture (a
+media element) or its own paint (an element that only page script changes). Its children and the inside
+of its shadow root keep running, because they are candidates of their own: a wrapper around a flashing
+element must not get the credit for that element's flashes (ADR-013, SPEC section 7).
 
 Nothing here reads the real clock or the network (``TIMELINE_CLOCK_JS`` reads the fake one); every helper
 gives the same answer for the same page.
@@ -40,8 +48,15 @@ RANDOM_SEED = 0x2F6E2B1
 #: Attribute put on every element that matches a suppressed selector (ADR-013).
 SUPPRESSED_ATTRIBUTE = "data-ft-suppressed"
 
-#: Attribute put on every media element hidden because it is on or inside a suppressed element.
+#: Attribute put on a suppressed media element (video, canvas, img, svg, iframe): it is hidden whole.
 SUPPRESSED_MEDIA_ATTRIBUTE = "data-ft-suppressed-media"
+
+#: Attribute put on a suppressed element that has no animation of its own: its own paint is hidden, its
+#: children stay visible.
+SUPPRESSED_PAINT_ATTRIBUTE = "data-ft-suppressed-paint"
+
+#: Separator of a selector that steps inside a shadow root or a same-origin frame: ``host >>> inner``.
+DEEP_SELECTOR_SEPARATOR = " >>> "
 
 SHADOW_ROOT_RECORDER_JS = r"""
 (() => {
@@ -230,16 +245,52 @@ PAGE_HELPERS_JS = r"""
     try { return fn(); } finally { target.__ftOwnCall = false; }
   };
 
-  // True when node is a suppressed element or sits inside one, looking through shadow roots (to
-  // their host) and through same-origin frames (to their <iframe> element).
-  const ftIsSuppressed = (node) => {
+  // True when node is an element suppressed for an ablation (ADR-013). Only the element itself counts:
+  // its children and the elements inside its shadow root are candidates of their own, so suppressing
+  // a wrapper must not stop what they do.
+  const ftIsSuppressed = (node) => Boolean(node) && node.nodeType === 1 && node.hasAttribute('data-ft-suppressed');
+
+  // True when node cannot be seen because of an ablation: its own paint is hidden, or it is (or sits
+  // inside) a media element hidden whole, looking through shadow roots (to their host) and same-origin
+  // frames (to their <iframe> element). Detection and the media wait skip such nodes.
+  const ftIsHidden = (node) => {
+    if (node && node.nodeType === 1 && node.hasAttribute('data-ft-suppressed-paint')) return true;
     for (let n = node; n; ) {
-      if (n.nodeType === 1 && n.hasAttribute('data-ft-suppressed')) return true;
+      if (n.nodeType === 1 && n.hasAttribute('data-ft-suppressed-media')) return true;
       if (n.parentNode) { n = n.parentNode; continue; }
       if (n.host) { n = n.host; continue; }
       try { n = n.defaultView ? n.defaultView.frameElement : null; } catch (e) { n = null; }
     }
     return false;
+  };
+
+  // Every shadow root in scopes (closed ones included), keyed by its host element.
+  const ftShadowRootsByHost = (scopes) => {
+    const byHost = new Map();
+    for (const { root } of scopes) { if (root.host) byHost.set(root.host, root); }
+    return byHost;
+  };
+
+  // The elements a FlashTrace selector names (capture/inspect.py writes them). A plain CSS selector is
+  // matched in the top document. ' >>> ' steps inside an element: the part after it is matched in the
+  // shadow root of every element the part before it matched, or in the document of a same-origin
+  // frame. So 'live-banner >>> div' is the <div> inside <live-banner>'s shadow root, and the steps can
+  // repeat. An invalid CSS part throws a SyntaxError, exactly as querySelectorAll does.
+  const ftQueryDeep = (selector, scopes) => {
+    const shadowRoots = ftShadowRootsByHost(scopes);
+    const inside = (el) => {
+      if (shadowRoots.has(el)) return shadowRoots.get(el);
+      try {  // a frame element's document; null for any other element and for a cross-origin frame
+        return el.contentDocument || (typeof el.getSVGDocument === 'function' ? el.getSVGDocument() : null);
+      } catch (e) { return null; }
+    };
+    let roots = [scopes[0].root];  // ftScopes lists the top document first
+    let found = [];
+    for (const part of selector.split('>>>').map((text) => text.trim())) {
+      found = roots.flatMap((root) => Array.from(root.querySelectorAll(part)));
+      roots = found.map(inside).filter(Boolean);
+    }
+    return found;
   };
 
   // The outermost <svg> around an SVG element: SMIL timelines belong to that element.
@@ -249,19 +300,39 @@ PAGE_HELPERS_JS = r"""
     return svg;
   };
 
-  // One <style> per document or shadow root hides the media marked for an ablation.
+  // The ablation's hiding rules, put once into every document or shadow root that needs them.
+  //  1. A suppressed media element is hidden whole: everything it shows is its own picture. An element
+  //     marked for its own paint is hidden too (its background, border, text and ::before/::after).
+  //  2. visibility is inherited, so the children of an element hidden for its own paint get 'visible'
+  //     back. :where() gives the rule zero specificity, so a visibility the page sets on a child
+  //     itself (a class, an id rule, an inline style) still wins.
+  //  3. The same inside a shadow root, for the top-level elements of a host hidden for its own paint.
+  const FT_HIDE_CSS = [
+    '[data-ft-suppressed-media], [data-ft-suppressed-paint] { visibility: hidden !important; }',
+    ':where([data-ft-suppressed-paint]) > * { visibility: visible; }',
+    ':where(:host([data-ft-suppressed-paint])) > * { visibility: visible; }',
+  ].join('\n');
   const ftAddHideRule = (root) => {
     if (root.__ftHideRule) return;
     const doc = root.nodeType === 9 ? root : root.ownerDocument;
     const style = doc.createElementNS('http://www.w3.org/1999/xhtml', 'style');
-    style.textContent = '[data-ft-suppressed-media] { visibility: hidden !important; }';
+    style.textContent = FT_HIDE_CSS;
     (root.nodeType === 9 ? (root.head || root.documentElement) : root).appendChild(style);
     root.__ftHideRule = style;
   };
 
-  // Strategies B and C apply the ablation once, before frame 0: animations and CSS transitions on (or
-  // inside) a suppressed element are paused where they stand, so they hold their frame-0 state
-  // (ADR-013 (a)). Strategy A holds them itself at the exact frame-0 time (waapi_step.py).
+  // Hides el with one of the two attributes above. The rules go into el's own document or shadow root
+  // and, when el hosts a shadow root, into that root as well (rule 3).
+  const ftHide = (el, attribute, shadowRoots) => {
+    el.setAttribute(attribute, '1');
+    ftAddHideRule(el.getRootNode());
+    if (shadowRoots.has(el)) ftAddHideRule(shadowRoots.get(el));
+  };
+
+  // Strategies B and C apply the ablation once, before frame 0: animations and CSS transitions of a
+  // suppressed element (its own, ::before/::after included) are paused where they stand, so they hold
+  // their frame-0 state (ADR-013 (a)). Strategy A holds them itself at the exact frame-0 time
+  // (waapi_step.py).
   const ftPauseSuppressedAnimations = (root) => {
     let paused = 0;
     for (const animation of root.getAnimations()) {
@@ -275,27 +346,19 @@ PAGE_HELPERS_JS = r"""
 
   const FT_MEDIA = 'video, canvas, img, svg, iframe';
 
-  // True when nothing on or inside el can be stopped by the capturer: no Web Animation, CSS animation
-  // or transition, and no SMIL animation element inside it or aimed at it. Whatever moves such an
-  // element is page script, so hiding it is the only way to suppress it (ADR-013 (b)).
-  const ftMovedOnlyByScript = (el) => {
-    try { if (el.getAnimations({ subtree: true }).length) return false; } catch (e) { return false; }
+  // True when el has an animation of its own that the capturer can hold: a Web Animation, CSS animation
+  // or transition whose target is el (on el itself or on its ::before/::after box), or a SMIL element
+  // aimed at el. Animations of its children do not count: they belong to the children. An element
+  // without one is changed only by page script, so hiding its paint is the only way to suppress it
+  // (ADR-013 (b)).
+  const ftHasOwnAnimation = (el) => {
+    let animations = [];
+    try { animations = el.getAnimations({ subtree: true }); } catch (e) { return true; }  // unknown: do not hide
+    if (animations.some((animation) => animation.effect && animation.effect.target === el)) return true;
     for (const smil of el.getRootNode().querySelectorAll('animate, set, animateTransform, animateMotion, animateColor')) {
-      if (el.contains(smil) || (smil.targetElement && el.contains(smil.targetElement))) return false;
+      if (smil.targetElement === el) return true;
     }
-    return true;
-  };
-
-  // <video>, <canvas>, <img>, <svg> and <iframe> on or inside a suppressed element are hidden.
-  const ftHideSuppressedMedia = (root) => {
-    let hidden = 0;
-    for (const el of root.querySelectorAll(FT_MEDIA)) {
-      if (el.hasAttribute('data-ft-suppressed-media') || !ftIsSuppressed(el)) continue;
-      el.setAttribute('data-ft-suppressed-media', '1');
-      hidden++;
-    }
-    if (hidden) ftAddHideRule(root);
-    return hidden;
+    return false;
   };
 
   // A suppressed outermost <svg> keeps its SMIL timeline paused at time 0.
@@ -326,34 +389,35 @@ PAGE_HELPERS_JS = r"""
     return removed;
   };
 
-  // Marks every element matching a suppressed selector with data-ft-suppressed. A newly marked element
-  // that only script can move (ftMovedOnlyByScript) is also marked for hiding. Fills counts.
+  // Marks every element a suppressed selector names (ftQueryDeep) with data-ft-suppressed, then hides
+  // what the capturer cannot hold (ADR-013 (b)): a media element whole, and an element without an
+  // animation of its own for its own paint only, so its children stay visible. Fills counts.
   const ftMarkSuppressed = (selectors, scopes, counts) => {
-    const matched = new Set();
-    for (const { root } of scopes) {
-      for (const selector of selectors) {
-        let elements = [];
-        try { elements = root.querySelectorAll(selector); } catch (e) {
-          if (!counts.invalidSelectors.includes(selector)) counts.invalidSelectors.push(selector);
-          continue;
-        }
-        for (const el of elements) {
-          matched.add(selector);
-          if (el.hasAttribute('data-ft-suppressed')) continue;
-          el.setAttribute('data-ft-suppressed', '1');
-          counts.elements++;
-          if (el.matches(FT_MEDIA) || !ftMovedOnlyByScript(el)) continue;  // media is hidden below
-          el.setAttribute('data-ft-suppressed-media', '1');
-          ftAddHideRule(root);
+    const shadowRoots = ftShadowRootsByHost(scopes);
+    for (const selector of selectors) {
+      let elements = [];
+      try { elements = ftQueryDeep(selector, scopes); } catch (e) {
+        if (!counts.invalidSelectors.includes(selector)) counts.invalidSelectors.push(selector);
+        continue;
+      }
+      if (!elements.length && !counts.unmatchedSelectors.includes(selector)) counts.unmatchedSelectors.push(selector);
+      for (const el of elements) {
+        if (ftIsSuppressed(el)) continue;  // marked by an earlier pass or an earlier selector
+        el.setAttribute('data-ft-suppressed', '1');
+        counts.elements++;
+        if (el.matches(FT_MEDIA)) {
+          ftHide(el, 'data-ft-suppressed-media', shadowRoots);
+          counts.media++;
+        } else if (!ftHasOwnAnimation(el)) {
+          ftHide(el, 'data-ft-suppressed-paint', shadowRoots);
           counts.scripted++;
         }
       }
     }
-    counts.unmatchedSelectors = selectors.filter((s) => !matched.has(s) && !counts.invalidSelectors.includes(s));
   };
 
-  // Ablation set-up (ADR-013): mark every element matching a suppressed selector, then stop what
-  // animates on or inside it. pauseAnimations: true when the set-up runs only once (strategies B and
+  // Ablation set-up (ADR-013): mark every element a suppressed selector names, then stop what the
+  // element itself animates. pauseAnimations: true when the set-up runs only once (strategies B and
   // C); strategy A passes false and holds the animations itself. Safe to call again: only new work is
   // counted.
   const ftApplySuppression = (selectors, scopes, pauseAnimations) => {
@@ -362,7 +426,6 @@ PAGE_HELPERS_JS = r"""
     ftMarkSuppressed(selectors, scopes, counts);
     for (const { root } of scopes) {
       if (pauseAnimations) counts.animations += ftPauseSuppressedAnimations(root);
-      counts.media += ftHideSuppressedMedia(root);
       counts.svgTimelines += ftHoldSuppressedSvgs(root);
       counts.smilElements += ftRemoveSuppressedSmil(root);
     }

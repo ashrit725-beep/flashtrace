@@ -251,3 +251,52 @@ def test_write_report_format(fail_job: AnalysedJob, tmp_path: Path) -> None:
     assert text.endswith("}\n")
     assert "caf\u00e9" in text  # ensure_ascii=False
     assert text == json.dumps(json.loads(text), sort_keys=True, indent=2, ensure_ascii=False) + "\n"
+
+
+# --------------------------------------------------------------------------------------- attribution and fix notes
+def tile(rank: int, overlap: float) -> dict[str, object]:
+    """A culprit in report.schema.json's shape: a plain div with no animation."""
+    return {"rank": rank, "selector": f"#t{rank}", "nodeType": "div", "ftId": None,
+            "rect": {"x": 40.0 + 104 * rank, "y": 40.0, "w": 100.0, "h": 200.0}, "animation": None,
+            "overlap": overlap, "ablationDelta": None, "inMinimalSet": False}
+
+
+def test_attribution_notes_copy_an_incomplete_inspection(tmp_path: Path) -> None:
+    job = analysed_job(tmp_path, square_wave(4), 2 * FPS)
+    (job.job_dir / "attribution.json").write_text(json.dumps({
+        "inspectionNotes": ["Math.random replaced by a fixed-seed generator (mulberry32, seed 0x2f6e2b1)",
+                            "inspection reached 1 of 2 target frame(s)"],
+        "notes": ["a key capture.attribute never writes"],
+        "limitations": [], "selectorWarnings": ["#a matched 2 elements"], "error": None}), encoding="utf-8")
+    limitations = report_for(job)["limitations"]
+    assert ("attribution: inspection reached 1 of 2 target frame(s), so violations whose frame was not reached "
+            "have no culprits") in limitations
+    assert "attribution: selector #a matched 2 elements" in limitations
+    # The routine set-up notes are the capture's own (already in its block); the dead "notes" key is not read.
+    assert not any("Math.random replaced" in item or "never writes" in item for item in limitations)
+
+
+def test_attribution_file_name_is_the_one_capture_attribute_writes() -> None:
+    from capture.attribute import ATTRIBUTION_JSON_NAME
+    from cli.report import ATTRIBUTION_NOTES_NAME
+
+    assert ATTRIBUTION_NOTES_NAME == ATTRIBUTION_JSON_NAME
+
+
+def test_report_says_why_its_culprits_got_no_fixes(fail_job: AnalysedJob) -> None:
+    from cli.html_report import render_html
+    from cli.main import fix_listing
+    from cli.report import FIX_NOTE_PREFIX
+
+    report = report_for(fail_job, culprits=[tile(rank, 0.25) for rank in range(1, 5)], fixes=[])
+    report["settings"]["attribute"] = "bbox"  # the synthetic job's settings say "none"
+    validate_report(report)
+    notes = [item for item in report["limitations"] if item.startswith(FIX_NOTE_PREFIX)]
+    assert len(notes) == 1 and "IoU of at least 0.5; the best overlap here is 0.25" in notes[0]
+    reason = notes[0][len(FIX_NOTE_PREFIX):]
+    assert fix_listing(report) == [f"This report has no fixes: {reason}"]
+    assert "No fixes in this report: no culprit qualified for a fix." in render_html(report, base_dir=fail_job.job_dir)
+    # A culprit that qualifies, or no culprits at all: no such note.
+    assert not any(item.startswith(FIX_NOTE_PREFIX) for item in report_for(fail_job, culprits=[tile(1, 0.9)])["limitations"])
+    assert fix_listing(report_for(fail_job)) == [
+        "This report has no fixes: the audit ran without attribution (use --attribute bbox or ablate)."]

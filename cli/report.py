@@ -64,6 +64,17 @@ SPEC_LIMITATIONS: tuple[str, ...] = (
     "`docs/RESULTS.md`, produced by `flashtrace bench`, with date and commit hash.",
 )
 
+# The file capture.attribute writes into the job directory (its ATTRIBUTION_JSON_NAME; a test checks that the
+# two agree).  Named here too because cli.report must not load the capture package (Playwright), and
+# server/jobs.py imports it from here.
+ATTRIBUTION_NOTES_NAME = "attribution.json"
+# An attribution.json "inspectionNotes" entry that is copied into the limitations: the inspection page did
+# not reach every violation's frame, so those violations have no culprits.  The other inspection notes are
+# the capture set-up's routine notes, which the report's capture block already carries.
+INCOMPLETE_INSPECTION_NOTE = re.compile(r"^inspection reached \d+ of \d+ target frame")
+# Limitation lines that say why a report with culprits has no fixes start with this (cli/main.py looks for it).
+FIX_NOTE_PREFIX = "fixes: "
+
 EVIDENCE_NAME_PATTERN = re.compile(r"^\d{6}\.png$")
 WALL_CLOCK_NOTE = re.compile(r"^frame loop took \d")
 
@@ -243,6 +254,64 @@ def capture_limitations(capture: Mapping[str, Any], fps: int) -> list[str]:
     return notes
 
 
+def _attribution_items(data: Mapping[str, Any]) -> list[Any]:
+    """The sentences of one attribution.json object that belong in the report's limitations."""
+    items = list(data.get("limitations") or [])
+    items += [f"attribution: selector {warning}" for warning in data.get("selectorWarnings") or []
+              if isinstance(warning, str)]
+    items += [f"attribution: {note.strip()}, so violations whose frame was not reached have no culprits"
+              for note in data.get("inspectionNotes") or []
+              if isinstance(note, str) and INCOMPLETE_INSPECTION_NOTE.match(note.strip())]
+    if isinstance(data.get("error"), str) and data["error"].strip():
+        items.append(f"attribution stopped early, so the culprit list may be incomplete: {data['error'].strip()}")
+    return items
+
+
+def attribution_notes(job_dir: str | Path) -> list[str]:
+    """Notes the attribution step left in ``<job>/attribution.json`` (empty when there is none).
+
+    capture.attribute writes an object: its "limitations" sentences, its "selectorWarnings" (a culprit
+    selector that matched more than one element, which a CSS fix would also change), the
+    "inspectionNotes" entry saying the inspection did not reach every violation's frame, and its
+    "error" (attribution stopped early) are copied.  A plain list of sentences is accepted too.
+    Anything that is not a non-empty string is ignored, and repeats are dropped.
+    """
+    path = Path(job_dir) / ATTRIBUTION_NOTES_NAME
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return [f"{ATTRIBUTION_NOTES_NAME} could not be read, so attribution notes are missing from this report."]
+    if isinstance(data, Mapping):
+        items = _attribution_items(data)
+    else:
+        items = list(data) if isinstance(data, list) else []
+    notes: list[str] = []
+    for item in items:
+        if isinstance(item, str) and item.strip() and item.strip() not in notes:
+            notes.append(item.strip())
+    return notes
+
+
+def fix_notes(culprits: Sequence[Mapping[str, Any]], fixes: Sequence[Mapping[str, Any]]) -> list[str]:
+    """Why a report that names culprits has no fixes, when no culprit met capture.fix's rule (else empty)."""
+    if not culprits or fixes:
+        return []
+    from capture.fix import unfixed_note  # imported here: the capture package loads Playwright
+
+    note = unfixed_note(culprits)
+    return [FIX_NOTE_PREFIX + note] if note else []
+
+
+def report_limitations(capture: Mapping[str, Any], fps: int, job_dir: str | Path,
+                       culprits: Sequence[Mapping[str, Any]] = (),
+                       fixes: Sequence[Mapping[str, Any]] = ()) -> list[str]:
+    """SPEC section 10, then what this capture adds, then the attribution and fix steps' notes."""
+    return (list(SPEC_LIMITATIONS) + capture_limitations(capture, fps) + attribution_notes(job_dir)
+            + fix_notes(culprits, fixes))
+
+
 def standard_assumptions(viewport: tuple[int, int], window: tuple[int, int], red_rule: str) -> list[str]:
     """Assumptions that hold for every report with these settings (ADR-002, 003, 007, 020)."""
     width, height = viewport
@@ -345,11 +414,32 @@ def build_report(
         "culprits": [dict(c) for c in culprits or []],
         "fixes": [dict(f) for f in fixes or []],
         "evidenceFrames": copy_evidence(analysis, Path(job_dir)) if analysis is not None else [],
-        "limitations": list(SPEC_LIMITATIONS) + capture_limitations(capture, settings.fps),
+        "limitations": report_limitations(capture, settings.fps, job_dir, culprits or [], fixes or []),
         "assumptions": standard_assumptions(settings.viewport, window, settings.red_rule) + list(assumptions or []),
         "disclaimer": DISCLAIMER,
     }
     return report
+
+
+def with_attribution(
+    report: Mapping[str, Any],
+    culprits: Sequence[Mapping[str, Any]],
+    fixes: Sequence[Mapping[str, Any]],
+    mode: str,
+    job_dir: str | Path,
+) -> dict[str, Any]:
+    """A copy of ``report`` with new culprits and fixes from attribution mode ``mode``.
+
+    Used when attribution is re-run on a finished job (cli.audit.reattribute): the frames, verdict and
+    evidence stay as they were; the attribution notes in the limitations are read again.
+    """
+    updated = copy.deepcopy(dict(report))
+    updated["culprits"] = [dict(c) for c in culprits]
+    updated["fixes"] = [dict(f) for f in fixes]
+    updated["settings"]["attribute"] = mode
+    updated["limitations"] = report_limitations(updated["capture"], int(updated["settings"]["fps"]), job_dir,
+                                                culprits, fixes)
+    return updated
 
 
 # --------------------------------------------------------------------------------------- output

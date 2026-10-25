@@ -175,6 +175,11 @@ class AnalysisResult:
     red_max_rate: int
     qualifying_general: list[int] = field(default_factory=list)  # frames of qualifying general events
     qualifying_red: list[int] = field(default_factory=list)      # frames of qualifying red events
+    # One bool [cells_y, cells_x] per entry of ``violations`` (same order): the cells that flashed in
+    # that violation's events, i.e. the union of the event masks E[t] = M[t-1] | M[t] over its
+    # ``frame_indices`` (SPEC 5.6 step 1).  Attribution compares element boxes with these cells
+    # (SPEC 7).  Not part of to_dict(): the report carries the heatmap instead.
+    violation_cells: list[np.ndarray] = field(default_factory=list)
 
     @property
     def verdict(self) -> str:

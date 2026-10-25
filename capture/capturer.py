@@ -263,11 +263,13 @@ def _suppression_note(selectors: tuple[str, ...], counts: dict[str, Any], every_
 def _apply_suppression(page: Page, attempt: _Attempt, settings: CaptureSettings) -> None:
     """Ablation set-up (ADR-013), after the page has settled and before detection and frame 0.
 
-    Elements matching ``settings.suppress_selectors`` get ``data-ft-suppressed="1"``. Their animations
-    and CSS transitions keep their frame-0 state: strategy A holds them itself every frame, the other
-    strategies pause them here. Media on or inside them is hidden, and so is a suppressed element that
-    has no animation at all (page script moves it); their SVG timelines are held at 0
-    (``capture/page_scripts.py``). An invalid selector is the caller's mistake: ValueError.
+    Elements matching ``settings.suppress_selectors`` get ``data-ft-suppressed="1"``. Their own
+    animations and CSS transitions keep their frame-0 state: strategy A holds them itself every frame,
+    the other strategies pause them here. A suppressed media element is hidden whole, and a suppressed
+    element without an animation of its own (page script moves it) has its own paint hidden while its
+    children stay visible; a suppressed outermost SVG's timeline is held at 0. Children of a suppressed
+    element are not suppressed (``capture/page_scripts.py``). An invalid selector is the caller's
+    mistake: ValueError.
     """
     every_frame = attempt.strategy.reapplies_suppression
     counts: dict[str, Any] = page.evaluate(
@@ -365,8 +367,9 @@ def capture(
     a caller that captures many times (ablation, fix verification) reuse one Chromium process; each
     capture still gets a fresh context. Frames are written to ``out_dir`` (default: a new directory
     under ``.flashtrace/captures/``). ``suppress_selectors`` is the ablation hook of ADR-013: elements
-    matching any of these CSS selectors keep their frame-0 state in the capture, or are hidden when
-    only script moves them (see ``_apply_suppression``).
+    matching any of these CSS selectors (matched in the top document; ``host >>> inner`` steps into a
+    shadow root or same-origin frame) keep their frame-0 state in the capture, or are hidden when only
+    script moves them (see ``_apply_suppression``).
     """
     _validate_arguments(duration_s, fps, viewport, strategy, suppress_selectors)
     started = time.perf_counter()

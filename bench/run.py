@@ -6,7 +6,8 @@ Steps:
    ``flashtrace audit``, in a pool of worker processes started with the "spawn" method.  Results are
    kept in page order; a page whose audit raises becomes an ERROR outcome and the run goes on.
 3. Audit the first ``determinism_sample`` pages a second time and compare frame hashes and report
-   fingerprints.
+   fingerprints.  With ``ablate_sample`` K > 0, audit the first K pages that FAILed again with
+   attribute="ablate" (capture duration ``ablate_duration``) and score that sample separately.
 4. Score (bench/score.py), then write the per-page JSON next to the Markdown summary (``--out`` with a
    .json suffix: docs/RESULTS.json for the official run), a convenience copy at
    <work_dir>/results.json, and the Markdown summary itself (bench/results_md.py; docs/RESULTS.md by
@@ -24,6 +25,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -72,6 +74,10 @@ class BenchConfig:
     command_line: str
     quiet: bool
     keep_frames: bool
+    # Ablation sample (attribution stage 2): after the main pass, the first ``ablate_sample`` pages whose
+    # verdict was FAIL are audited again with attribute="ablate" at ``ablate_duration`` seconds.
+    ablate_sample: int = 0
+    ablate_duration: float | None = None
 
     def problems(self) -> list[str]:
         found = []
@@ -81,7 +87,16 @@ class BenchConfig:
             found.append(f"--workers must be at least 1, got {self.workers}")
         if self.determinism_sample < 0:
             found.append(f"--determinism-sample cannot be negative, got {self.determinism_sample}")
+        if self.ablate_sample < 0:
+            found.append(f"--ablate-sample cannot be negative, got {self.ablate_sample}")
+        if self.ablate_duration is not None and not self.ablate_duration > 0:
+            found.append(f"--ablate-duration must be a positive number of seconds, got {self.ablate_duration}")
         return found
+
+    @property
+    def ablation_seconds(self) -> float:
+        """Capture duration of the ablation sample: --ablate-duration, else the main duration."""
+        return self.ablate_duration if self.ablate_duration is not None else self.duration_s
 
 
 def first_line(exc: BaseException) -> str:
@@ -130,16 +145,29 @@ def ensure_truth(config: BenchConfig) -> dict[str, Any]:
 def audit_page(task: dict[str, Any]) -> dict[str, Any]:
     """Audit one page (runs in a worker process).  Never raises: a failure is an ERROR outcome."""
     measurements: dict[str, float] = {}
+    started = time.perf_counter()
     try:
         report, job_dir, _code = run_audit(task["path"], task["settings"], work_dir=task["workDir"],
                                            measurements=measurements)
     except Exception as exc:  # noqa: BLE001 - one page must never abort the run
         return {"id": task["id"], "verdict": "ERROR", "error": first_line(exc)}
+    # Whole audit, attribution included (time.perf_counter); capture and analysis are also timed apart.
+    measurements["audit_s"] = time.perf_counter() - started
     if not task["keepFrames"]:
         # Evidence stills were already copied into evidence/; the full frame set is only needed again
         # for debugging, and 600 PNGs per page add up over 200 pages.
         shutil.rmtree(job_dir / FRAMES_DIR_NAME, ignore_errors=True)
     return outcome_from_report(task["id"], report, job_dir, measurements)
+
+
+def attribution_recaptures(job_dir: Path) -> int | None:
+    """Ablation re-captures recorded in the job's attribution.json (None when attribution did not run)."""
+    from capture.attribute import ATTRIBUTION_JSON_NAME  # here, so importing bench.run does not load Playwright
+
+    record_path = job_dir / ATTRIBUTION_JSON_NAME
+    if not record_path.is_file():
+        return None
+    return int(json.loads(record_path.read_text(encoding="utf-8")).get("recaptures", 0))
 
 
 def outcome_from_report(page_id: str, report: dict[str, Any], job_dir: Path,
@@ -162,6 +190,8 @@ def outcome_from_report(page_id: str, report: dict[str, Any], job_dir: Path,
         "captureWallS": measurements.get("capture_s", 0.0),
         "analysisWallS": measurements.get("analysis_s", 0.0),
         "culprits": [{"selector": c["selector"], "inMinimalSet": bool(c["inMinimalSet"])} for c in report["culprits"]],
+        "auditWallS": measurements.get("audit_s", 0.0),
+        "attributionRecaptures": attribution_recaptures(job_dir),
         "jobDir": str(job_dir),
     }
 
@@ -222,7 +252,10 @@ def compare_runs(first: Sequence[dict[str, Any]], second: Sequence[dict[str, Any
 def row_for(entry: dict[str, Any], outcome: dict[str, Any] | None) -> dict[str, Any]:
     """One result row: the page's truth parameters + what FlashTrace said (SKIP when not audited)."""
     row: dict[str, Any] = {"id": entry["id"], **{key: entry[key] for key in TRUTH_FIELDS},
-                           "expected": entry["expected"], "truthCulprits": list(entry["culprits"])}
+                           "expected": entry["expected"], "truthCulprits": list(entry["culprits"]),
+                           # Element rectangles: the minimal-set score checks what suppressing them leaves.
+                           "truthElements": [{"selector": e["selector"], "rect": e["rect"]}
+                                             for e in entry.get("elements", [])]}
     if outcome is None:
         row.update({"verdict": "SKIP", "reason": entry["expected"].get("skipReason", "")})
     else:
@@ -280,17 +313,27 @@ def run_bench(
     command_line: str | None = None,
     quiet: bool = False,
     keep_frames: bool = False,
+    ablate_sample: int = 0,
+    ablate_duration: float | None = None,
 ) -> dict[str, Any]:
-    """Run the benchmark and write the per-page JSON + the Markdown summary.  Returns the results dict."""
+    """Run the benchmark and write the per-page JSON + the Markdown summary.  Returns the results dict.
+
+    ``attribute`` ("none", "bbox", "ablate") runs attribution on every page that FAILs in the main pass.
+    ``ablate_sample`` K > 0 then audits the first K FAIL pages again with attribute="ablate" at
+    ``ablate_duration`` seconds (default: ``duration``) and scores them separately.
+    """
     config = BenchConfig(n=n, seed=seed, duration_s=float(duration), fps=fps, workers=workers, attribute=attribute,
                          determinism_sample=determinism_sample, out=Path(out), regenerate=regenerate,
                          pages=Path(pages), truth=Path(truth), work_dir=Path(work_dir),
                          command_line=command_line or shlex.join([Path(sys.argv[0]).name] + sys.argv[1:]),
-                         quiet=quiet, keep_frames=keep_frames)
+                         quiet=quiet, keep_frames=keep_frames, ablate_sample=ablate_sample,
+                         ablate_duration=None if ablate_duration is None else float(ablate_duration))
     problems = config.problems() + AuditSettings(duration_s=config.duration_s, fps=fps, attribute=attribute).problems()
     if problems:
         raise AuditInputError("; ".join(problems))
     find_attributor(attribute)  # fail once, up front, instead of once per page
+    if config.ablate_sample:
+        find_attributor("ablate")
     truth_data = ensure_truth(config)
     # The truth file's window numbers assume one viewport (1024x768); audit at exactly that size.
     width, height = (int(v) for v in truth_data["window"]["viewportPx"])
@@ -301,7 +344,8 @@ def run_bench(
     first, second = audit_all(config, audited, settings, processes)
     outcomes = {o["id"]: o for o in first}
     rows = [row_for(e, outcomes.get(e["id"])) for e in entries]
-    results = build_results(config, settings, rows, compare_runs(first, second), processes)
+    sample = ablation_sample(config, audited, first, settings)
+    results = build_results(config, settings, rows, compare_runs(first, second), processes, sample)
     results["resultsJsonSha256"] = write_outputs(config, results)
     results["summaryLines"] = summary_lines(results)
     return results
@@ -329,6 +373,31 @@ def audit_all(config: BenchConfig, audited: list[dict[str, Any]], settings: Audi
     return first, second
 
 
+def ablation_sample(config: BenchConfig, audited: list[dict[str, Any]], first: list[dict[str, Any]],
+                    settings: AuditSettings) -> dict[str, Any] | None:
+    """Audit the first ``config.ablate_sample`` pages that FAILed in the main pass again, with ablation.
+
+    Each sampled page gets a fresh audit (baseline capture plus ablation re-captures) at
+    ``config.ablation_seconds``, so the re-captures and the baseline they are compared with have the same
+    length.  Returns the settings used and one row per sampled page, or None when no sample was asked for.
+    """
+    if not config.ablate_sample:
+        return None
+    failed = {o["id"] for o in first if o["verdict"] == "FAIL"}
+    chosen = [e for e in audited if e["id"] in failed][:config.ablate_sample]
+    ablate_settings = AuditSettings(duration_s=config.ablation_seconds, viewport=settings.viewport, fps=settings.fps,
+                                    red_rule=settings.red_rule, attribute="ablate", strategy=settings.strategy)
+    outcomes: list[dict[str, Any]] = []
+    if chosen:
+        tasks = page_tasks(chosen, config.truth.parent, ablate_settings, config.work_dir / "ablate", config.keep_frames)
+        context = multiprocessing.get_context("spawn")
+        with context.Pool(processes=pool_size(config.workers, len(tasks))) as pool:
+            outcomes = run_tasks(pool, tasks, "ablate", config)
+    by_id = {o["id"]: o for o in outcomes}
+    return {"requested": config.ablate_sample, "duration": config.ablation_seconds,
+            "rows": [row_for(e, by_id.get(e["id"])) for e in chosen]}
+
+
 def results_json_path(out: Path) -> Path:
     """Where the per-page JSON goes: next to the Markdown, same name, .json suffix.
 
@@ -341,7 +410,8 @@ def results_json_path(out: Path) -> Path:
 
 
 def build_results(config: BenchConfig, settings: AuditSettings, rows: list[dict[str, Any]],
-                  determinism: dict[str, Any], processes: int) -> dict[str, Any]:
+                  determinism: dict[str, Any], processes: int,
+                  sample: dict[str, Any] | None = None) -> dict[str, Any]:
     audited = [r for r in rows if r["verdict"] != "SKIP"]
     return {
         "date": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
@@ -353,12 +423,15 @@ def build_results(config: BenchConfig, settings: AuditSettings, rows: list[dict[
             "viewport": list(settings.viewport), "strategy": settings.strategy, "redRule": settings.red_rule,
             "attribute": config.attribute, "workers": config.workers, "poolProcesses": processes,
             "determinismSample": config.determinism_sample, "truth": str(config.truth), "pages": str(config.pages),
+            "ablateSample": config.ablate_sample,
+            "ablateDuration": config.ablation_seconds if config.ablate_sample else None,
         },
         "counts": {"pages": len(rows), "audited": len(audited), "skipped": len(rows) - len(audited),
                    "errors": sum(1 for r in audited if r["verdict"] == "ERROR")},
-        "scores": score_all(rows, config.duration_s, config.attribute),
+        "scores": score_all(rows, config.duration_s, config.attribute, sample),
         "determinism": determinism,
         "rows": rows,
+        "ablationSample": sample,
         "resultsJson": str(results_json_path(config.out)),
         "resultsMd": str(config.out),
     }
@@ -392,5 +465,21 @@ def summary_lines(results: dict[str, Any]) -> list[str]:
         f"clear-case verdict accuracy: {ratio_text(accuracy['correct'], accuracy['total'])}",
         f"determinism: {det['identical']}/{det['compared']} compared pages identical on a second run "
         f"({det['notCompared']} of {det['total']} sampled pages not compared)",
+        *attribution_summary_lines(scores),
         f"results: {results['resultsMd']} and {results['resultsJson']} (sha256 {results['resultsJsonSha256']})",
     ]
+
+
+def attribution_summary_lines(scores: dict[str, Any]) -> list[str]:
+    """Top-1 (main pass) and ablation-sample lines, only for what was measured."""
+    lines = []
+    main = scores["attribution"]
+    if main["measured"]:
+        lines.append(f"attribution ({main['mode']}): top-1 culprit in truth on "
+                     f"{ratio_text(main['top1']['agree'], main['top1']['total'])} FAIL pages")
+    sample = scores["ablationSample"]
+    if sample["measured"]:
+        lines.append(f"ablation sample ({sample['pages']} pages at {sample['duration']:g} s): top-1 "
+                     f"{ratio_text(sample['top1']['agree'], sample['top1']['total'])}, minimal set "
+                     f"{ratio_text(sample['minimalSet']['agree'], sample['minimalSet']['total'])}")
+    return lines

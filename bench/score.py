@@ -7,10 +7,11 @@ Markdown names the file and its sha256) and is unit-tested on hand-made outcomes
 A *row* is one benchmark page::
 
     {"id": "bench-0001", "mechanism": "css", "expected": {verdict, types, advisory, boundary,
-     boundaryReasons}, "truthCulprits": ["#flash-1"], "verdict": "PASS" | "FAIL" | "INCONCLUSIVE" |
-     "ERROR" | "SKIP", "violationTypes": [...], "advisory": bool, "culprits": [{"selector",
-     "inMinimalSet"}], "strategy": "waapi_step" | ... | "none" (capture failed), "captureWallS": float,
-     "analysisWallS": float}
+     boundaryReasons}, "truthCulprits": ["#flash-1"], "truthElements": [{"selector", "rect"}],
+     "rateHz": 4, "verdict": "PASS" | "FAIL" | "INCONCLUSIVE" | "ERROR" | "SKIP", "violationTypes": [...],
+     "advisory": bool, "culprits": [{"selector", "inMinimalSet"}], "strategy": "waapi_step" | ... |
+     "none" (capture failed), "captureWallS": float, "analysisWallS": float, "auditWallS": float,
+     "attributionRecaptures": int | None}
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ import statistics
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from bench.params import CELL_PX, QUALIFYING_CELLS
 from bench.truth import (
     AREA_BAND,
     AREA_LIMIT,
@@ -170,21 +172,88 @@ def advisory_agreement(rows: Sequence[Row], duration_s: float) -> dict[str, Any]
             "note": "clear pages expected to PASS only"}
 
 
+def attribution_pages(rows: Sequence[Row]) -> list[Row]:
+    """Pages on which attribution is scored: expected FAIL, audited FAIL, and the truth names culprits."""
+    return [row for row in rows
+            if expected_verdict(row) == "FAIL" and row["verdict"] == "FAIL" and row.get("truthCulprits")]
+
+
+def top1_correct(row: Row) -> bool:
+    """The first-ranked culprit is one of the truth culprits (a FAIL page without culprits is wrong)."""
+    culprits = row.get("culprits") or []
+    return bool(culprits) and culprits[0]["selector"] in row["truthCulprits"]
+
+
+def truth_element_cells(row: Row) -> dict[str, int]:
+    """Flashing cells of each truth element.  Bench rectangles are cell aligned (ADR-014), so w*h / 16 is exact."""
+    return {str(e["selector"]): int(e["rect"]["w"] // CELL_PX) * int(e["rect"]["h"] // CELL_PX)
+            for e in row.get("truthElements") or []}
+
+
+def passes_without(row: Row, cells: Mapping[str, int], removed: set[str]) -> bool:
+    """Would the page pass with the ``removed`` truth elements suppressed?
+
+    Every truth element of a page sits inside one 85 x 64-cell window (ADR-014), so the cells left are the
+    cells one window sees.  WCAG 2.2 glossary: the flash passes when the area is "no more than ... 25% of
+    any 10 degree visual field" (at most QUALIFYING_CELLS cells), or when there are "no more than three
+    general flashes and / or no more than three red flashes within any one-second period".
+    """
+    left = sum(count for selector, count in cells.items() if selector not in removed)
+    return left <= QUALIFYING_CELLS or float(row["rateHz"]) <= MAX_FLASHES_PER_SECOND
+
+
+def minimal_set_correct(row: Row) -> bool:
+    """The culprits marked inMinimalSet form a valid minimal set according to the truth geometry.
+
+    Valid: every marked selector is a truth culprit, and suppressing the marked ones makes the page pass.
+    Minimal: putting back any single member makes it fail again.  Plain set equality with the truth
+    culprits would be wrong: elements that flash in sync can be explained by several different minimal sets.
+    """
+    chosen = {str(c["selector"]) for c in row.get("culprits") or [] if c["inMinimalSet"]}
+    cells = truth_element_cells(row)
+    if not chosen or not chosen <= set(row["truthCulprits"]) or not cells:
+        return False
+    if not passes_without(row, cells, chosen):
+        return False
+    return all(not passes_without(row, cells, chosen - {member}) for member in chosen)
+
+
+def agreement(rows: Sequence[Row], test: Any) -> dict[str, Any]:
+    """{agree, total, accuracy} of ``test(row)`` over ``rows``."""
+    agree = sum(1 for row in rows if test(row))
+    return {"agree": agree, "total": len(rows), "accuracy": fraction(agree, len(rows))}
+
+
 def attribution_scores(rows: Sequence[Row], attribute: str) -> dict[str, Any]:
-    """Top-1 and minimal-set agreement with truth.culprits, on pages whose report has culprits."""
-    with_culprits = [row for row in rows if row.get("culprits") and row.get("truthCulprits")]
-    if not with_culprits:
-        why = f"attribution: {attribute}" if attribute == "none" else "no report contained culprits"
-        return {"measured": False, "note": f"not measured ({why})"}
-    top1 = sum(1 for row in with_culprits if row["culprits"][0]["selector"] in row["truthCulprits"])
-    minimal = sum(
-        1 for row in with_culprits
-        if {c["selector"] for c in row["culprits"] if c["inMinimalSet"]} == set(row["truthCulprits"])
-    )
-    total = len(with_culprits)
-    return {"measured": True, "pages": total,
-            "top1": {"agree": top1, "total": total, "accuracy": fraction(top1, total)},
-            "minimalSet": {"agree": minimal, "total": total, "accuracy": fraction(minimal, total)}}
+    """Top-1 accuracy (bbox or ablate) and minimal-set accuracy (ablate only) of the main pass."""
+    if attribute == "none":
+        return {"measured": False, "note": "not measured (attribution: none)"}
+    scored = attribution_pages(rows)
+    result: dict[str, Any] = {"measured": True, "mode": attribute, "pages": len(scored),
+                              "top1": agreement(scored, top1_correct)}
+    if attribute == "ablate":
+        result["minimalSet"] = agreement(scored, minimal_set_correct)
+    else:
+        result["minimalSet"] = {"measured": False, "note": "needs ablation (attribution: ablate)"}
+    return result
+
+
+def ablation_sample_scores(sample: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Scores of the ablation sample run after the main pass (bench --ablate-sample K --ablate-duration D).
+
+    ``sample`` holds the settings used and one row per sampled page (pages whose main-pass verdict was
+    FAIL).  A sampled page whose ablation audit did not FAIL at duration D is counted, not scored.
+    """
+    if not sample or not sample.get("requested"):
+        return {"measured": False, "note": "not measured (no ablation sample requested)"}
+    rows = list(sample["rows"])
+    scored = attribution_pages(rows)
+    recaptures = [int(row["attributionRecaptures"]) for row in scored if row.get("attributionRecaptures") is not None]
+    return {"measured": True, "requested": int(sample["requested"]), "duration": float(sample["duration"]),
+            "sampled": len(rows), "pages": len(scored), "notFail": len(rows) - len(scored),
+            "pageIds": [str(row["id"]) for row in rows], "top1": agreement(scored, top1_correct),
+            "minimalSet": agreement(scored, minimal_set_correct), "recaptures": runtime_stats([float(r) for r in recaptures]),
+            "auditWall": runtime_stats([float(row["auditWallS"]) for row in scored if row.get("auditWallS") is not None])}
 
 
 def runtime_stats(values: Sequence[float]) -> dict[str, float] | None:
@@ -213,7 +282,8 @@ def runtime_scores(rows: Sequence[Row]) -> dict[str, Any]:
             "failedCaptures": len(answered) - len(measured)}
 
 
-def score_all(rows: Sequence[Row], duration_s: float, attribute: str) -> dict[str, Any]:
+def score_all(rows: Sequence[Row], duration_s: float, attribute: str,
+              ablation_sample: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Every score in one dict (what results.json and RESULTS.md report)."""
     return {
         "clear": clear_case_scores(rows),
@@ -222,5 +292,6 @@ def score_all(rows: Sequence[Row], duration_s: float, attribute: str) -> dict[st
         "types": type_agreement(rows),
         "advisory": advisory_agreement(rows, duration_s),
         "attribution": attribution_scores(rows, attribute),
+        "ablationSample": ablation_sample_scores(ablation_sample),
         "runtime": runtime_scores(rows),
     }

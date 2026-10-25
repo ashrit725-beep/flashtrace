@@ -192,7 +192,7 @@ _SEEK_FRAME_BODY = r"""
     // A video loads while networkState is 2 (NETWORK_LOADING); readyState 2 (HAVE_CURRENT_DATA) means a
     // picture is available. A video with preload="none" never loads and simply shows its poster.
     const loading = el.localName === 'img' ? !el.complete : el.networkState === 2 && el.readyState < 2 && !el.error;
-    return loading && !ftIsSuppressed(el) && inViewport(el);
+    return loading && !ftIsHidden(el) && inViewport(el);
   };
   const arrival = (el) => el.localName === 'img'
     ? el.decode().then(() => 'ok', () => 'ok')  // decode() settles once the image is loaded and decoded, or failed
@@ -719,9 +719,13 @@ class WaapiStepStrategy(CaptureStrategy):
         notes: list[str] = []
         page.evaluate(START_INTERACTION_JS, script)
         deadline = time.monotonic() + INTERACTION_REAL_CAP_S
+        # Virtual time already walked before the script: 0 for a capture; capture/inspect.py walks
+        # strategy B's pre-roll first when it inspects a page that B captured.
+        start = self._preroll_ms
         pumped = 0
         while True:
-            self._tally.add_preroll(*self._seek_pass(page, pumped, "pre-roll", walk=pumped == 0))
+            now = start + pumped
+            self._tally.add_preroll(*self._seek_pass(page, now, "pre-roll", walk=now == 0))
             state: dict[str, Any] = page.evaluate(INTERACTION_STATE_JS)
             if state["state"] == "done":
                 break
@@ -736,7 +740,7 @@ class WaapiStepStrategy(CaptureStrategy):
                 )
             self._advance_clock(INTERACTION_PUMP_MS)
             pumped += INTERACTION_PUMP_MS
-        self._preroll_ms = pumped
+        self._preroll_ms = start + pumped
         if pumped:
             notes.append(f"interaction script consumed {pumped} ms of virtual time before frame 0")
         return notes

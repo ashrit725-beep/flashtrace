@@ -11,7 +11,9 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from bench.params import QUALIFYING_CELLS, WINDOW_CELLS
 from bench.score import EXPECTED_VERDICTS, GOT_VERDICTS
+from bench.truth import MAX_FLASHES_PER_SECOND
 from cli.report import DISCLAIMER
 
 FULL_RUN_PAGES = 200
@@ -144,14 +146,60 @@ def advisory_section(scores: Mapping[str, Any]) -> list[str]:
             "second, which never fails, and on a failing page the advisory adds nothing.", "", text]
 
 
-def attribution_section(scores: Mapping[str, Any]) -> list[str]:
-    a = scores["attribution"]
+MINIMAL_SET_RULE = (
+    "A minimal set counts as correct when every element marked as in the minimal set is a truth culprit, "
+    f"suppressing them leaves at most {QUALIFYING_CELLS} flashing cells of the truth elements (25% of the "
+    f"{WINDOW_CELLS[0]} x {WINDOW_CELLS[1]}-cell window) or a rate of {MAX_FLASHES_PER_SECOND} per second or "
+    "less, and putting back any one of them makes the page fail again. It is not compared with the truth "
+    "list for equality: elements that flash in sync can be explained by more than one minimal set."
+)
+
+
+def main_attribution_lines(a: Mapping[str, Any]) -> list[str]:
+    """Attribution of the main pass (--attribute bbox or ablate), on pages expected and audited FAIL."""
     if not a["measured"]:
-        return ["## Attribution", "", a["note"].capitalize()]
-    return ["## Attribution", "",
-            f"Top-1 culprit in the truth culprits: {ratio_text(a['top1']['agree'], a['top1']['total'])}",
-            f"Minimal culprit set equal to the truth culprits: "
-            f"{ratio_text(a['minimalSet']['agree'], a['minimalSet']['total'])}"]
+        return [a["note"].capitalize()]
+    lines = [f"Main pass, attribution mode {a['mode']}, scored on the {a['pages']} pages expected to FAIL that "
+             "FlashTrace also failed.", "",
+             f"Top-1 culprit in the truth culprits: {ratio_text(a['top1']['agree'], a['top1']['total'])}"]
+    minimal = a["minimalSet"]
+    if minimal.get("measured", True):
+        lines.append(f"Minimal culprit set correct: {ratio_text(minimal['agree'], minimal['total'])}")
+    else:
+        lines.append(f"Minimal culprit set: {minimal['note']}")
+    return lines
+
+
+def ablation_sample_lines(s: Mapping[str, Any]) -> list[str]:
+    """The separate ablation sample (--ablate-sample K --ablate-duration D), with its size and settings."""
+    if not s["measured"]:
+        return [s["note"].capitalize()]
+    lines = [f"Ablation sample: the first {s['requested']} pages that FAILed in the main pass were audited again "
+             f"with attribute ablate at {s['duration']:g} s per capture. Sampled {s['sampled']}; scored {s['pages']} "
+             f"(the ones that FAILed again at that duration; {s['notFail']} did not). This is a small sample, not "
+             "the whole benchmark.", "",
+             f"Top-1 culprit in the truth culprits: {ratio_text(s['top1']['agree'], s['top1']['total'])}",
+             f"Minimal culprit set correct: {ratio_text(s['minimalSet']['agree'], s['minimalSet']['total'])}"]
+    if s.get("recaptures"):
+        r = s["recaptures"]
+        lines.append(f"Re-captures per page: mean {r['mean']:.1f}, min {r['min']:g}, max {r['max']:g} ({r['count']} pages)")
+    if s.get("auditWall"):
+        w = s["auditWall"]
+        lines.append(f"Wall time per sampled audit, baseline and ablation together (s): mean {w['mean']:.1f}, "
+                     f"median {w['median']:.1f}, max {w['max']:.1f} ({w['count']} pages)")
+    if s["pageIds"]:
+        lines.append(f"Sampled pages: {', '.join(s['pageIds'])}")
+    return lines
+
+
+def attribution_section(scores: Mapping[str, Any]) -> list[str]:
+    lines = ["## Attribution", ""] + main_attribution_lines(scores["attribution"])
+    sample = scores.get("ablationSample")
+    if sample is not None:
+        lines += [""] + ablation_sample_lines(sample)
+    if scores["attribution"].get("mode") == "ablate" or (sample or {}).get("measured"):
+        lines += ["", MINIMAL_SET_RULE]
+    return lines
 
 
 def determinism_section(results: Mapping[str, Any]) -> list[str]:

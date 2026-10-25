@@ -3,6 +3,7 @@ and one end-to-end run (bench/run.py) on four freshly generated pages in a tempo
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import shutil
@@ -12,7 +13,7 @@ from typing import Any
 import pytest
 
 from bench import run, score
-from bench.results_md import REQUIRED_HEADINGS, mismatch_rows, render_results_md, title
+from bench.results_md import REQUIRED_HEADINGS, attribution_section, mismatch_rows, render_results_md, title
 from bench.run import compare_runs, load_ready_truth, row_for, run_bench
 from cli.jobs import AuditSettings
 from cli.report import capture_block
@@ -101,17 +102,95 @@ def test_advisory_agreement_needs_a_long_capture() -> None:
         assert long["measured"] is True and (long["agree"], long["total"]) == (2, 2)
 
 
+def attributed_row(page_id: str, chosen: tuple[str, ...], top: str = "#flash-1", got: str = "FAIL",
+                   rate_hz: float = 4) -> dict[str, Any]:
+    """A FAIL page with three truth elements of 900, 1 800 and 600 cells (3 300 in one window)."""
+    culprits = [{"selector": top, "inMinimalSet": top in chosen}]
+    culprits += [{"selector": s, "inMinimalSet": True} for s in chosen if s != top]
+    row = make_row(page_id, "FAIL", got, culprits=culprits)
+    row["rateHz"] = rate_hz
+    row["truthCulprits"] = ["#flash-1", "#flash-2", "#flash-3"]
+    # Cell-aligned rectangles (ADR-014): 30x30, 60x30 and 20x30 cells.
+    row["truthElements"] = [{"selector": "#flash-1", "rect": {"x": 0, "y": 0, "w": 120, "h": 120}},
+                            {"selector": "#flash-2", "rect": {"x": 124, "y": 0, "w": 240, "h": 120}},
+                            {"selector": "#flash-3", "rect": {"x": 368, "y": 0, "w": 80, "h": 120}}]
+    return row
+
+
 def test_attribution_scoring() -> None:
     assert score.attribution_scores(ROWS, "none") == {"measured": False, "note": "not measured (attribution: none)"}
     rows = [
-        make_row("a", "FAIL", "FAIL", culprits=[{"selector": "#flash-1", "inMinimalSet": True},
-                                                 {"selector": "#flash-2", "inMinimalSet": True}]),
-        make_row("b", "FAIL", "FAIL", culprits=[{"selector": "#decoy", "inMinimalSet": True},
-                                                 {"selector": "#flash-1", "inMinimalSet": False}]),
+        attributed_row("valid", ("#flash-1", "#flash-2")),            # leaves 600 cells; each member is needed
+        attributed_row("not-minimal", ("#flash-1", "#flash-2", "#flash-3")),  # #flash-3 is not needed
+        attributed_row("decoy", ("#decoy", "#flash-2"), top="#decoy"),  # top-1 wrong, set holds a non-culprit
+        attributed_row("too-small", ("#flash-2",)),                    # leaves 1 500 cells > 1 360: still fails
+        attributed_row("missed", (), got="PASS"),                      # not scored: FlashTrace did not FAIL
     ]
     result = score.attribution_scores(rows, "ablate")
-    assert result["top1"] == {"agree": 1, "total": 2, "accuracy": 0.5}
-    assert result["minimalSet"] == {"agree": 1, "total": 2, "accuracy": 0.5}
+    assert result["mode"] == "ablate" and result["pages"] == 4
+    assert result["top1"] == {"agree": 3, "total": 4, "accuracy": 0.75}
+    assert result["minimalSet"] == {"agree": 1, "total": 4, "accuracy": 0.25}
+    bbox = score.attribution_scores(rows, "bbox")
+    assert bbox["top1"]["agree"] == 3 and bbox["minimalSet"]["measured"] is False
+
+
+def test_minimal_set_is_judged_by_truth_geometry_not_set_equality() -> None:
+    # Two different minimal sets explain the same page: {#flash-1, #flash-2} and {#flash-2, #flash-3}.
+    assert score.minimal_set_correct(attributed_row("a", ("#flash-1", "#flash-2")))
+    assert score.minimal_set_correct(attributed_row("b", ("#flash-2", "#flash-3"), top="#flash-2"))
+    assert not score.minimal_set_correct(attributed_row("c", ()))  # nothing marked
+    # A FAIL page without any culprit still counts in the top-1 total, as wrong.
+    empty = make_row("d", "FAIL", "FAIL")
+    assert score.attribution_pages([empty]) == [empty] and not score.top1_correct(empty)
+
+
+def test_ablation_sample_scores_report_size_and_settings() -> None:
+    assert score.ablation_sample_scores(None)["measured"] is False
+    sample_rows = [attributed_row("s1", ("#flash-1", "#flash-2")), attributed_row("s2", (), got="PASS")]
+    sample_rows[0].update(attributionRecaptures=5, auditWallS=12.0)
+    result = score.ablation_sample_scores({"requested": 3, "duration": 3.0, "rows": sample_rows})
+    assert (result["requested"], result["duration"], result["sampled"], result["pages"], result["notFail"]) == (3, 3.0, 2, 1, 1)
+    assert result["top1"]["agree"] == 1 and result["minimalSet"] == {"agree": 1, "total": 1, "accuracy": 1.0}
+    assert result["recaptures"]["mean"] == 5.0 and result["auditWall"]["max"] == 12.0
+    assert result["pageIds"] == ["s1", "s2"]
+    text = "\n".join(attribution_section({"attribution": score.attribution_scores(sample_rows, "bbox"),
+                                          "ablationSample": result}))
+    assert "first 3 pages that FAILed in the main pass" in text and "at 3 s per capture" in text
+    assert "Sampled 2; scored 1" in text and "Minimal culprit set correct: 1/1 (100.0%)" in text
+    assert "not compared with the truth list for equality" in text
+
+
+def test_ablation_sample_takes_the_first_fail_pages(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    seen: list[dict[str, Any]] = []
+
+    class FakePool:
+        def __init__(self, processes: int) -> None:
+            pass
+
+        def __enter__(self) -> FakePool:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+        def imap(self, func: Any, tasks: list[dict[str, Any]], chunksize: int = 1) -> Any:
+            seen.extend(tasks)
+            return (dict(outcome(t["id"], verdict="FAIL"), culprits=[]) for t in tasks)
+
+    monkeypatch.setattr(run.multiprocessing, "get_context", lambda method: type("C", (), {"Pool": lambda self, processes: FakePool(processes)})())
+    config = dataclasses.replace(bench_config(tmp_path, tmp_path / "R.md", "x"), ablate_sample=2, ablate_duration=3.0)
+    audited = [{"id": f"p{i}", "file": f"pages/p{i}.html", "mechanism": "css", "rateHz": 4, "areaFraction": 0.6,
+                "areaFractionActual": 0.6, "deltaLActual": 0.5, "red": False, "elementCount": 1,
+                "expected": {"verdict": "FAIL"}, "culprits": ["#flash-1"], "elements": []} for i in range(4)]
+    first = [outcome("p0", verdict="PASS"), outcome("p1", verdict="FAIL"), outcome("p2", verdict="FAIL"),
+             outcome("p3", verdict="FAIL")]
+    sample = run.ablation_sample(config, audited, first, AuditSettings())
+    assert sample is not None and [row["id"] for row in sample["rows"]] == ["p1", "p2"]
+    assert all(t["settings"].attribute == "ablate" and t["settings"].duration_s == 3.0 for t in seen)
+    assert sample["requested"] == 2 and sample["duration"] == 3.0
+    assert run.ablation_sample(bench_config(tmp_path, tmp_path / "R.md", "x"), audited, first, AuditSettings()) is None
+    bad = dataclasses.replace(config, ablate_sample=-1, ablate_duration=0.0)
+    assert len(bad.problems()) == 2
 
 
 def test_runtime_stats_skip_errors_and_skips() -> None:

@@ -20,6 +20,7 @@ from typing import Any
 
 import numpy as np
 
+from cli.report import FIX_NOTE_PREFIX
 from engine.constants import MAX_FLASHES_PER_SECOND
 from engine.types import heatmap_from_base64
 
@@ -28,6 +29,14 @@ VERDICT_STYLES: dict[str, tuple[str, str, str]] = {
     "PASS": ("✓", "pass", "no WCAG 2.3.1 violation detected under the tested conditions"),
     "FAIL": ("✗", "fail", "the WCAG 2.3.1 flash thresholds were exceeded"),
     "INCONCLUSIVE": ("?", "inconclusive", "FlashTrace could not reach a verdict"),
+}
+
+# Fix state -> (glyph, CSS class, word).  Word and glyph together, so the state never rests on colour.
+FIX_BADGES: dict[str, tuple[str, str, str]] = {
+    "verified": ("✓", "ok", "Verified"),
+    "failed": ("✗", "no", "Not verified"),
+    "manual": ("–", "manual", "Not auto-applied"),
+    "untried": ("○", "untried", "Not yet verified"),
 }
 
 # Heatmap: at most this many squares across, and four sequential greys from light to dark.
@@ -77,6 +86,11 @@ figcaption { color: var(--muted); margin-top: 4px; }
 button { font: inherit; padding: 6px 14px; color: var(--ink); background: var(--paper); border: 1px solid var(--ink); border-radius: 4px; cursor: pointer; }
 button:focus-visible, a:focus-visible, summary:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
 .muted { color: var(--muted); }
+.badge { display: inline-block; white-space: nowrap; padding: 1px 8px; border: 2px solid currentColor; border-radius: 4px; font-weight: 600; }
+.badge-ok { color: #0b4a1f; background: #edf6ef; }
+.badge-no { color: #7a0010; background: #fbecee; }
+.badge-manual, .badge-untried { color: var(--muted); border-style: dashed; }
+.measure { font-size: 0.9em; white-space: nowrap; }
 footer { margin-top: 40px; padding-top: 12px; border-top: 1px solid var(--rule); color: var(--muted); }
 """
 
@@ -410,6 +424,23 @@ def _heatmap_section(report: Mapping[str, Any]) -> str:
 
 
 # --------------------------------------------------------------------------------------- culprits and fixes
+def css_code(css: str) -> str:
+    """A fix's CSS as escaped <code>.  '@' is written as the entity &#64; (it displays the same), so the
+    page's source never contains '@keyframes': a plain-text check can then still prove that the page
+    itself declares no animation (SPEC 9.1)."""
+    return f"<code>{esc(css).replace('@', '&#64;')}</code>"
+
+
+def _animation_text(animation: Mapping[str, Any] | None) -> str:
+    """'ft-blink, 250 ms' / 'unnamed, duration unknown' / 'none'."""
+    if not animation:
+        return "none"
+    name = str(animation.get("name") or "unnamed")
+    duration = animation.get("duration")
+    timing = f"{float(duration):g} ms" if isinstance(duration, (int, float)) else "duration unknown"
+    return f"{name}, {timing}"
+
+
 def _culprits_section(report: Mapping[str, Any]) -> str:
     culprits = report["culprits"]
     if not culprits:
@@ -418,22 +449,59 @@ def _culprits_section(report: Mapping[str, Any]) -> str:
         return _section("h-culprits", "Likely causes", f"<p>No culprits: {esc(why)}.</p>")
     rows = [(
         esc(c["rank"]), f'<code>{esc(c["selector"])}</code>', esc(c["nodeType"]),
+        esc(_animation_text(c.get("animation"))),
+        esc(f'x {c["rect"]["x"]:g}, y {c["rect"]["y"]:g}, {c["rect"]["w"]:g}x{c["rect"]["h"]:g} px'),
         esc(f'{float(c["overlap"]):.2f}'),
         esc("not run" if c["ablationDelta"] is None else f'{float(c["ablationDelta"]):g}'),
         yes_no(c["inMinimalSet"]),
     ) for c in culprits]
-    headers = ("Rank", "Selector", "Element", "Overlap", "Flashes removed when suppressed", "In minimal set")
-    return _section("h-culprits", "Likely causes", _table("Culprits", headers, rows, numeric=(0, 3, 4)))
+    headers = ("Rank", "Selector", "Element", "Animation", "Box", "Overlap", "Flashes removed when suppressed",
+               "In minimal set")
+    return _section("h-culprits", "Likely causes", _table("Culprits", headers, rows, numeric=(0, 5, 6)))
+
+
+def fix_state(fix: Mapping[str, Any]) -> str:
+    """'verified', 'failed' (re-captured, did not pass), 'manual' (area: never applied) or 'untried'."""
+    if fix["verified"]:
+        return "verified"
+    if fix["kind"] == "area":
+        return "manual"
+    return "failed" if fix["after"] is not None else "untried"
+
+
+def fix_badge(fix: Mapping[str, Any]) -> str:
+    glyph, css_class, word = FIX_BADGES[fix_state(fix)]
+    return f'<span class="badge badge-{css_class}"><span aria-hidden="true">{esc(glyph)}</span> {esc(word)}</span>'
+
+
+def measurement_html(measured: Mapping[str, Any] | None) -> str:
+    """A before/after measurement as a few short lines (verdict first)."""
+    if measured is None:
+        return '<span class="muted">not measured</span>'
+    lines = [
+        f'<strong>{esc(measured["verdict"])}</strong>',
+        esc(f'general {measured["generalMaxRatePerSec"]:g}/s, red {measured["redMaxRatePerSec"]:g}/s'),
+        esc(f'qualifying: {measured["qualifyingGeneral"]} general, {measured["qualifyingRed"]} red'),
+        esc(f'deterministic: {"yes" if measured["deterministic"] else "no"}'),
+    ]
+    return f'<span class="measure">{"<br>".join(lines)}</span>'
 
 
 def _fixes_section(report: Mapping[str, Any]) -> str:
     fixes = report["fixes"]
     if not fixes:
-        return _section("h-fixes", "Suggested fixes", "<p>No fixes in this report.</p>")
-    rows = [(esc(f["culprit"]), esc(f["kind"]), f'<code>{esc(f["css"])}</code>', esc(f["rationale"]),
-             yes_no(f["verified"])) for f in fixes]
-    headers = ("Culprit rank", "Kind", "CSS", "Why", "Verified by re-capture")
-    return _section("h-fixes", "Suggested fixes", _table("Fixes", headers, rows, numeric=(0,)))
+        stated = [note[len(FIX_NOTE_PREFIX):] for note in report["limitations"] if note.startswith(FIX_NOTE_PREFIX)]
+        why = f": {esc(stated[0])}" if stated else "."
+        return _section("h-fixes", "Suggested fixes", f"<p>No fixes in this report{why}</p>")
+    rows = [(esc(number), esc(f["culprit"]), esc(f["kind"]), css_code(f["css"]), esc(f["rationale"]),
+             measurement_html(f["before"]), measurement_html(f["after"]), fix_badge(f))
+            for number, f in enumerate(fixes, start=1)]
+    headers = ("Fix", "Culprit rank", "Kind", "CSS", "Why", "Before", "After (re-capture with the fix)",
+               "Verified")
+    intro = ("<p>Each fix is a CSS override derived from this audit's measurements. \"Verified\" means the page was "
+             "captured again with that fix injected and FlashTrace found no 2.3.1 violation under deterministic "
+             "capture; verify a fix with <code>flashtrace fix REPORT --apply N --verify</code>.</p>")
+    return _section("h-fixes", "Suggested fixes", intro + _table("Fixes", headers, rows, numeric=(0, 1)))
 
 
 def _list_section(section_id: str, title: str, items: Sequence[str]) -> str:

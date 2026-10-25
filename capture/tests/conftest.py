@@ -24,9 +24,15 @@ def pages_dir() -> Path:
     return PAGES_DIR
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="package")
 def browser() -> Iterator["Browser"]:  # noqa: F821 - imported lazily so non-browser runs need no Playwright
-    """One headless Chromium for the whole session (launch costs ~0.5 s; contexts are per capture)."""
+    """One headless Chromium for the capture tests; each capture still gets a fresh context.
+
+    Package scope, not session: it is closed when the last test in capture/tests has run. While its
+    Playwright is open, the sync API refuses to start another one in this thread, so a session-wide
+    instance would break every later test that opens its own (cli, tests/test_ui_self_audit.py).
+    Tests in this package that run the pipeline in-process must pass this browser along.
+    """
     from playwright.sync_api import sync_playwright
 
     from capture.capturer import launch_chromium

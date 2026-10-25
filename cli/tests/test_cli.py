@@ -6,29 +6,23 @@ so they cover argument parsing, capture, analysis, report writing and exit codes
 
 from __future__ import annotations
 
-import importlib.util
 import io
 import json
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 import pytest
+from typer.testing import CliRunner
 
-from cli.audit import (
-    ATTRIBUTION_UNAVAILABLE,
-    AttributionUnavailable,
-    AuditInputError,
-    exit_code_for,
-    run_audit,
-)
+from cli.audit import AuditInputError, exit_code_for, find_attributor, run_audit
 from cli.jobs import AuditSettings
-from cli.main import ProgressPrinter, load_demo_server
+from cli.main import ProgressPrinter, app, load_demo_server
 from cli.report import DISCLAIMER
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PAGES = REPO_ROOT / "capture" / "pages"
-HAS_ATTRIBUTION = importlib.util.find_spec("capture.attribute") is not None
 
 
 def flashtrace(*args: str, work_dir: Path) -> subprocess.CompletedProcess[str]:
@@ -79,18 +73,46 @@ def test_huge_duration_exits_2_before_any_job(tmp_path: Path) -> None:
     assert not (tmp_path / "jobs").exists()
 
 
-@pytest.mark.skipif(HAS_ATTRIBUTION, reason="capture.attribute exists now")
-def test_attribution_not_available_yet(tmp_path: Path) -> None:
-    result = flashtrace("audit", str(PAGES / "static.html"), "--attribute", "bbox", work_dir=tmp_path)
-    assert result.returncode == 2
-    assert stderr_lines(result) == [f"error: {ATTRIBUTION_UNAVAILABLE}"]
+def test_find_attributor_is_capture_attribute() -> None:
+    from capture.attribute import attribute
+
+    assert find_attributor("none") is None
+    assert find_attributor("bbox") is attribute and find_attributor("ablate") is attribute
 
 
-def test_fix_and_serve_are_not_built_yet(tmp_path: Path) -> None:
-    fix = flashtrace("fix", "report.json", "--apply", "1", "--verify", work_dir=tmp_path)
-    assert fix.returncode == 2 and "milestone M6" in fix.stderr and stderr_lines(fix)[-1] == DISCLAIMER
-    serve = flashtrace("serve", work_dir=tmp_path)
-    assert serve.returncode == 2 and "milestone M8" in serve.stderr and stderr_lines(serve)[-1] == DISCLAIMER
+def test_fix_with_a_missing_report_is_one_line_exit_2(tmp_path: Path) -> None:
+    fix = flashtrace("fix", str(tmp_path / "report.json"), "--apply", "1", "--verify", work_dir=tmp_path)
+    assert fix.returncode == 2 and len(stderr_lines(fix)) == 1
+    assert stderr_lines(fix)[0].startswith("error: cannot read report") and "Traceback" not in fix.stderr
+
+
+def test_serve_passes_its_options_to_server_app(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # A stand-in server.app module: the command must import it lazily and call serve() with the options.
+    calls: list[dict[str, object]] = []
+    fake = types.ModuleType("server.app")
+    fake.serve = lambda **kwargs: calls.append(kwargs)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "server.app", fake)
+    result = CliRunner().invoke(app, ["serve", "--port", "8123", "--work-dir", str(tmp_path), "--allow-local-files"])
+    assert result.exit_code == 0, result.output
+    assert calls == [{"port": 8123, "work_dir": tmp_path, "allow_local_files": True}]
+    defaults = CliRunner().invoke(app, ["serve"])
+    assert defaults.exit_code == 0 and calls[-1] == {"port": 8001, "work_dir": None, "allow_local_files": False}
+
+
+def test_audit_defaults_to_bbox_attribution() -> None:
+    import typer.main
+
+    audit = typer.main.get_command(app).commands["audit"]  # type: ignore[attr-defined]
+    option = next(p for p in audit.params if p.name == "attribute")
+    assert option.default.value == "bbox"
+
+
+def test_progress_printer_prints_phases() -> None:
+    stream = io.StringIO()
+    printer = ProgressPrinter(stream)
+    printer.phase("attributing (bbox)")
+    printer.phase("attributing", 3, 6)
+    assert stream.getvalue().splitlines() == ["attributing (bbox)", "attributing 3/6"]
 
 
 def test_demo_server_can_be_imported_without_starting() -> None:
@@ -109,9 +131,6 @@ def test_run_audit_rejects_bad_input_before_creating_a_job(tmp_path: Path) -> No
         run_audit(str(PAGES / "static.html"), AuditSettings(script=str(tmp_path / "no.js")), work_dir=tmp_path)
     with pytest.raises(AuditInputError):
         run_audit((tmp_path / "gone.html").as_uri(), AuditSettings(), work_dir=tmp_path)
-    if not HAS_ATTRIBUTION:
-        with pytest.raises(AttributionUnavailable):
-            run_audit(str(PAGES / "static.html"), AuditSettings(attribute="ablate"), work_dir=tmp_path)
     assert not (tmp_path / "jobs").exists()
 
 
@@ -129,7 +148,7 @@ def test_progress_printer_writes_short_lines_off_a_terminal() -> None:
 def test_css_keyframes_page_fails(tmp_path: Path) -> None:
     out, html = tmp_path / "out" / "report.json", tmp_path / "out" / "report.html"
     result = flashtrace("audit", str(PAGES / "css_keyframes.html"), "--duration", "1.5", "--quiet",
-                        "--out", str(out), "--html", str(html), work_dir=tmp_path)
+                        "--attribute", "none", "--out", str(out), "--html", str(html), work_dir=tmp_path)
     assert result.returncode == 1, result.stderr
     report = json.loads(out.read_text(encoding="utf-8"))
     assert report["verdict"] == "FAIL"
@@ -148,7 +167,8 @@ def test_css_keyframes_page_fails(tmp_path: Path) -> None:
 @pytest.mark.browser
 def test_static_page_passes_with_json_on_stdout(tmp_path: Path) -> None:
     # Two seconds: SPEC 6.4 needs at least 2*fps frames before a PASS can be reported.
-    result = flashtrace("audit", str(PAGES / "static.html"), "--duration", "2", "--json", work_dir=tmp_path)
+    result = flashtrace("audit", str(PAGES / "static.html"), "--duration", "2", "--json", "--attribute", "none",
+                        work_dir=tmp_path)
     assert result.returncode == 0, result.stderr
     report = json.loads(result.stdout)
     assert report["verdict"] == "PASS" and report["capture"]["deterministic"] is True
@@ -160,7 +180,8 @@ def test_static_page_passes_with_json_on_stdout(tmp_path: Path) -> None:
 
 @pytest.mark.browser
 def test_one_second_capture_is_too_short_for_pass(tmp_path: Path) -> None:
-    result = flashtrace("audit", str(PAGES / "static.html"), "--duration", "1", "--json", "--quiet", work_dir=tmp_path)
+    result = flashtrace("audit", str(PAGES / "static.html"), "--duration", "1", "--json", "--quiet",
+                        "--attribute", "none", work_dir=tmp_path)
     assert result.returncode == 1, result.stderr
     report = json.loads(result.stdout)
     assert report["verdict"] == "INCONCLUSIVE" and "only 60 frames" in report["reason"]
@@ -169,12 +190,12 @@ def test_one_second_capture_is_too_short_for_pass(tmp_path: Path) -> None:
 @pytest.mark.browser
 def test_realtime_capture_is_inconclusive_unless_no_fail(tmp_path: Path) -> None:
     result = flashtrace("audit", str(PAGES / "static.html"), "--strategy", "realtime", "--duration", "2",
-                        "--json", "--quiet", work_dir=tmp_path)
+                        "--json", "--quiet", "--attribute", "none", work_dir=tmp_path)
     assert result.returncode == 1, result.stderr
     report = json.loads(result.stdout)
     assert report["verdict"] == "INCONCLUSIVE" and report["capture"]["strategy"] == "realtime"
     assert "non-deterministic capture" in report["reason"]
     relaxed = flashtrace("audit", str(PAGES / "static.html"), "--strategy", "realtime", "--duration", "1",
-                         "--no-fail", "--quiet", work_dir=tmp_path)
+                         "--no-fail", "--quiet", "--attribute", "none", work_dir=tmp_path)
     assert relaxed.returncode == 0, relaxed.stderr
     assert stderr_lines(relaxed)[0].startswith("INCONCLUSIVE: ")

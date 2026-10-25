@@ -17,8 +17,9 @@ a GIF whose first frame is larger than that. An image whose bytes cannot be read
 claim determinism for frames a GIF moved on the real clock.
 
 The scan looks in the document, in every shadow root (open or closed, recorded by the init script in
-``capture/page_scripts.py``; ADR-022) and in every same-origin frame. Elements suppressed for an
-ablation (ADR-013) are skipped: they are hidden, so they cannot reach the screen.
+``capture/page_scripts.py``; ADR-022) and in every same-origin frame. Elements an ablation hid
+(ADR-013; ``ftIsHidden``) are skipped: they cannot reach the screen. A suppressed element that is
+still visible (its animations are only held) is scanned like any other.
 
 Local files are read only when the audited page is itself a local file *and* local files are allowed;
 for an ``http(s)`` page the local file system is never touched (no read, no existence check).
@@ -272,16 +273,16 @@ _SCAN_PAGE_BODY = r"""
   const scanImages = (win, root, base) => {
     for (const el of root.querySelectorAll(IMAGE_ELEMENTS)) {
       const src = elementImageUrl(el);
-      if (src && !ftIsSuppressed(el)) addImage(src, resolveUrl(src, base), el.localName, cssPath(el));
+      if (src && !ftIsHidden(el)) addImage(src, resolveUrl(src, base), el.localName, cssPath(el));
     }
     for (const el of root.querySelectorAll('*')) {
-      if (!ftIsSuppressed(el)) scanStyleImages(win, el, base);
+      if (!ftIsHidden(el)) scanStyleImages(win, el, base);
     }
   };
 
   const scanCanvasesAndFrames = (root) => {
     for (const canvas of root.querySelectorAll('canvas')) {
-      if (ftIsSuppressed(canvas)) continue;
+      if (ftIsHidden(canvas)) continue;
       const types = canvas.__ftContextTypes || [];
       if (types.some(t => t === 'webgl' || t === 'webgl2' || t === 'experimental-webgl')) {
         result.webglCanvases.push(cssPath(canvas));
@@ -289,7 +290,7 @@ _SCAN_PAGE_BODY = r"""
       if (canvas.__ftOffscreen) result.offscreenCanvases.push(cssPath(canvas));
     }
     for (const frame of root.querySelectorAll('iframe, frame')) {
-      if (ftIsSuppressed(frame)) continue;
+      if (ftIsHidden(frame)) continue;
       let accessible = false;
       try { accessible = !!frame.contentDocument; } catch (e) { accessible = false; }
       if (!accessible) result.crossOriginFrames.push(frame.getAttribute('src') || frame.src || '(no src)');

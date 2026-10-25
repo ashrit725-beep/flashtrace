@@ -35,3 +35,6 @@ packages = ["engine", "engine.schema", "capture", "cli", "server", "bench"]
 testpaths = ["tests", "engine/tests", "capture/tests", "server/tests", "bench/tests", "cli/tests"]
 pythonpath = ["."]
 addopts = "-q"
+markers = [
+  "browser: needs headless Chromium (deselect with -m 'not browser')",
+]

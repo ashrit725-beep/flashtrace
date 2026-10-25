@@ -122,3 +122,47 @@ def test_block_max_keeps_the_hottest_cell() -> None:
     grid[4, 4] = 7
     grid[0, 1] = 2
     assert block_max(grid, 2).tolist() == [[2, 0, 0], [0, 0, 0], [0, 0, 7]]
+
+
+def report_with_fixes(job: AnalysedJob) -> dict[str, object]:
+    """The FAIL report with one culprit and four fixes in the four states the page can show."""
+    measured = {"verdict": "FAIL", "generalMaxRatePerSec": 4, "redMaxRatePerSec": 0, "qualifyingGeneral": 7,
+                "qualifyingRed": 0, "deterministic": True}
+    passed = dict(measured, verdict="PASS", generalMaxRatePerSec=2, qualifyingGeneral=4)
+    culprit = {"rank": 1, "selector": "#box", "nodeType": "div", "ftId": "ft-3",
+               "rect": {"x": 100.0, "y": 0.0, "w": 400.0, "h": 256.0},
+               "animation": {"name": "ft-blink", "duration": 250, "keyframes": []},
+               "overlap": 0.75, "ablationDelta": None, "inMinimalSet": False}
+
+    def fix(kind: str, css: str, after: dict[str, object] | None, verified: bool) -> dict[str, object]:
+        return {"culprit": 1, "kind": kind, "css": css, "rationale": f"{kind} because", "before": measured,
+                "after": after, "verified": verified}
+
+    fixes = [fix("rate", "#box { animation-duration: 400ms !important; }", passed, True),
+             fix("luminance", "@keyframes ft-fix-1-lum { 0% { background-color: #545454; } } "
+                              "#box { animation-name: ft-fix-1-lum !important; }", measured, False),
+             fix("red", "#box { filter: saturate(0.6) !important; }", None, False),
+             fix("area", "/* not auto-applied: changes layout */ #box { transform: scale(0.437); }", None, False)]
+    return report_for(job, culprits=[culprit], fixes=fixes)
+
+
+def test_culprits_and_fixes_tables_show_measurements_and_badges(fail_job: AnalysedJob) -> None:
+    report = report_with_fixes(fail_job)
+    from cli.report import validate_report
+
+    validate_report(report)
+    page = render_html(report, base_dir=fail_job.job_dir)
+    assert "ft-blink, 250 ms" in page and "x 100, y 0, 400x256 px" in page
+    for word, glyph in (("Verified", "✓"), ("Not verified", "✗"), ("Not yet verified", "○"), ("Not auto-applied", "–")):
+        assert f'<span aria-hidden="true">{glyph}</span> {word}</span>' in page
+    assert "general 4/s, red 0/s" in page and "general 2/s, red 0/s" in page and "not measured" in page
+    assert "flashtrace fix REPORT --apply N --verify" in page
+
+
+def test_fix_css_is_shown_but_the_page_declares_no_animation(fail_job: AnalysedJob) -> None:
+    page = render_html(report_with_fixes(fail_job), base_dir=fail_job.job_dir)
+    # The luminance fix's text is displayed (with '@' as an entity), yet the page source holds no
+    # '@keyframes' and no 'animation:' declaration, so nothing on the page can move (SPEC 9.1).
+    assert "&#64;keyframes ft-fix-1-lum" in page
+    for moving in ("@keyframes", "animation:", "transition:"):
+        assert moving not in page
