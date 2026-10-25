@@ -29,6 +29,7 @@ from engine.constants import (
     LEGACY_RED_MIN_DELTA,
     RED_MIN_DELTA_UV,
     RED_SATURATION_MIN_RATIO,
+    RUN_REVERSAL_TOLERANCE,
 )
 
 # A rule looks at the two end states of a run (a = where the run started,
@@ -88,7 +89,7 @@ def red_rule_legacy(
 class Transition:
     """One group of cells that all made a transition at the same frame, same direction."""
 
-    frame: int        # the frame at which the run reached its extremum
+    frame: int        # the run's stamp frame: where it reached its extremum, ignoring gains <= tolerance
     sign: int         # +1 the signal rose, -1 it fell
     cells: np.ndarray  # int indices (row-major cell ids), ascending, no duplicates
 
@@ -96,27 +97,37 @@ class Transition:
 class RunTracker:
     """Find peaks and valleys of N signals at once, one frame at a time.
 
-    Per cell the tracker remembers three things (SPEC 5.4, ADR-004):
+    Per cell the tracker remembers (SPEC 5.4, ADR-004, ADR-018):
 
       base      - value, aux and frame of the previous extremum (where the
                   current run started),
       direction - 0 nothing has moved yet, +1 rising, -1 falling,
-      ext       - value, aux and frame of the best extremum seen so far in
-                  the current run (the highest point while rising, the lowest
-                  while falling).
+      ext       - value and aux of the best extremum seen so far in the
+                  current run (the highest point while rising, the lowest
+                  while falling),
+      stamp     - frame and value of the frame the transition will be
+                  stamped with: where the signal arrived at its extremum,
+      settled   - True once the signal has stood still or wobbled back
+                  since the stamp, i.e. it has arrived.
 
-    On each new frame with value s:
-      rising:  s > ext           -> the run continues; ext = (s, aux, t)
-               s < ext - tol     -> the run ENDED at ext: evaluate rule(base, ext),
-                                    emit a Transition(ext.frame, +1) if it holds,
-                                    then base = ext, direction = -1, ext = (s, aux, t)
-               otherwise         -> plateau or sub-tolerance wobble: nothing changes
-      falling: the mirror image
-      flat:    s > base + tol    -> start rising, ext = (s, aux, t)
-               s < base - tol    -> start falling
+    On each new frame with value s (rising; falling is the mirror image):
+      s < ext - tol      -> the run ENDED: evaluate rule(base, ext), emit a
+                            Transition(stamp.frame, +1) if it holds, then
+                            base = ext, direction = -1, ext = stamp = s at t
+      s > ext            -> the run continues; ext = (s, aux).  The stamp
+                            moves to t if the signal has not settled yet, or
+                            if s > stamp + tol (a real step, not noise)
+      otherwise          -> plateau, or a reversal of at most tol: the run
+                            goes on and the signal is now settled
+    flat (nothing has moved yet): s > base + tol starts a rise at t,
+    s < base - tol starts a fall.
 
-    Emitted transitions are timestamped at the extremum frame, which is always
-    EARLIER than the frame that revealed the reversal.
+    tol is the signal's reversal tolerance (RUN_REVERSAL_TOLERANCE, ADR-018).
+    The rule always sees the true extremum (ext).  The stamp follows a smooth
+    fade all the way to its peak or valley, but once the signal has arrived,
+    wobble no larger than tol can neither end the run nor move its stamp.
+    For a square wave the stamp is the FIRST frame showing the new state; it
+    is always EARLIER than the frame that revealed the reversal.
     """
 
     def __init__(self, n_cells: int, rule: Rule, tolerance: float) -> None:
@@ -132,8 +143,10 @@ class RunTracker:
         self.base_frame: np.ndarray = np.zeros(self.n_cells, dtype=np.int64)
         self.base_aux: dict[str, np.ndarray] = {}
         self.ext_val: np.ndarray = np.zeros(self.n_cells, dtype=np.float64)
-        self.ext_frame: np.ndarray = np.zeros(self.n_cells, dtype=np.int64)
         self.ext_aux: dict[str, np.ndarray] = {}
+        self.stamp_val: np.ndarray = np.zeros(self.n_cells, dtype=np.float64)
+        self.stamp_frame: np.ndarray = np.zeros(self.n_cells, dtype=np.int64)
+        self.settled: np.ndarray = np.zeros(self.n_cells, dtype=bool)
         self._started: bool = False
         self._finished: bool = False
         self._last_t: int = -1
@@ -161,23 +174,42 @@ class RunTracker:
         """The first frame is both the base and the extremum of every cell."""
         self.base_val[:] = s
         self.ext_val[:] = s
+        self.stamp_val[:] = s
         self.base_frame[:] = t
-        self.ext_frame[:] = t
+        self.stamp_frame[:] = t
         self.base_aux = {k: np.array(v, dtype=np.float64) for k, v in sorted(aux.items())}
         self.ext_aux = {k: np.array(v, dtype=np.float64) for k, v in sorted(aux.items())}
         self._started = True
 
-    def _set_extremum(self, mask: np.ndarray, t: int, s: np.ndarray, aux: dict[str, np.ndarray]) -> None:
-        """For the masked cells, the current frame becomes the run's extremum."""
+    def _set_extremum(self, mask: np.ndarray, s: np.ndarray, aux: dict[str, np.ndarray]) -> None:
+        """For the masked cells, the current value becomes the run's extremum."""
         self.ext_val[mask] = s[mask]
-        self.ext_frame[mask] = t
         for key in self.ext_aux:
             self.ext_aux[key][mask] = np.asarray(aux[key], dtype=np.float64)[mask]
+
+    def _move_stamps(
+        self, t: int, s: np.ndarray, new_run: np.ndarray, extend: np.ndarray, big_step: np.ndarray,
+        paused: np.ndarray,
+    ) -> None:
+        """Decide per cell whether frame t becomes the frame its run is stamped with (ADR-018).
+
+        A run that starts at t is stamped at t.  While the signal is still
+        arriving (not settled) every new extremum moves the stamp, so a smooth
+        fade is followed all the way to its peak or valley.  Once the signal
+        has paused or wobbled back by no more than the tolerance it has
+        settled: then only a big step (more than the tolerance beyond the
+        stamp value) moves the stamp, and the signal counts as arriving again.
+        """
+        restamp = new_run | big_step | (extend & ~self.settled)
+        self.stamp_val[restamp] = s[restamp]
+        self.stamp_frame[restamp] = t
+        self.settled[restamp] = False
+        self.settled[paused] = True
 
     def _promote_extremum_to_base(self, mask: np.ndarray) -> None:
         """For the masked cells, the run that just ended becomes the start of the next."""
         self.base_val[mask] = self.ext_val[mask]
-        self.base_frame[mask] = self.ext_frame[mask]
+        self.base_frame[mask] = self.stamp_frame[mask]
         for key in self.base_aux:
             self.base_aux[key][mask] = self.ext_aux[key][mask]
 
@@ -197,7 +229,7 @@ class RunTracker:
         # Different cells may have reached their extremum on different frames;
         # one Transition per distinct frame.  A stable sort keeps cell ids
         # ascending inside each group, so the output order is fully determined.
-        frames = self.ext_frame[hits]
+        frames = self.stamp_frame[hits]
         order = np.argsort(frames, kind="stable")
         hits, frames = hits[order], frames[order]
         unique_frames, starts, counts = np.unique(frames, return_index=True, return_counts=True)
@@ -221,11 +253,16 @@ class RunTracker:
         falling = self.direction == -1
         flat = self.direction == 0
 
-        # Runs that end now: the signal turned around by more than the tolerance.
+        # Runs that end now: the signal turned around by more than the tolerance (ADR-018).
         end_rise = rising & (s < self.ext_val - tol)
         end_fall = falling & (s > self.ext_val + tol)
-        # Runs that push on to a new extremum (strict: a plateau keeps the old frame).
+        # Runs that push on to a new extremum, by any amount: the rule must see
+        # the true peak or valley.
         extend = (rising & (s > self.ext_val)) | (falling & (s < self.ext_val))
+        # Runs that went beyond their stamp value by MORE than the tolerance: a real step, not noise.
+        big_step = (rising & (s > self.stamp_val + tol)) | (falling & (s < self.stamp_val - tol))
+        # Runs that stood still or wobbled back by no more than the tolerance: the signal has arrived.
+        paused = (rising | falling) & ~extend & ~end_rise & ~end_fall
         # Cells that have not moved yet and now leave the tolerance band.
         start_rise = flat & (s > self.base_val + tol)
         start_fall = flat & (s < self.base_val - tol)
@@ -238,13 +275,15 @@ class RunTracker:
         self.direction[end_fall] = 1
         self.direction[start_rise] = 1
         self.direction[start_fall] = -1
-        self._set_extremum(ended | extend | start_rise | start_fall, t, s, aux)
+        new_run = ended | start_rise | start_fall  # these cells start a run at frame t
+        self._set_extremum(new_run | extend, s, aux)
+        self._move_stamps(t, s, new_run, extend, big_step, paused)
         return emitted
 
     def finish(self, t_last: int) -> list[Transition]:
         """Close every run still open after the last frame (ADR-004).
 
-        The transition is timestamped at the run's extremum frame, exactly as
+        The transition is timestamped at the run's stamp frame, exactly as
         in update(); ``t_last`` is checked to be the last frame fed in.
         """
         if self._finished:
@@ -261,14 +300,16 @@ class RunTracker:
 
 
 class FlashPairer:
-    """Pair each cell's transitions into flashes (SPEC 5.5, ADR-005).
+    """Pair each cell's transitions into flashes (SPEC 5.5, ADR-005, ADR-018).
 
     WCAG 2.2 glossary: a flash is "a pair of opposing changes".  Transitions
-    are paired in order, non-overlapping (1st+2nd, 3rd+4th, ...).  A cell's
-    pending transition is remembered by its sign; when the opposite sign
-    arrives the pair is complete and the flash is counted at that frame.
-    Two same-sign transitions in a row (possible when a sub-threshold run sits
-    between them) simply replace the pending one.
+    are paired in order, non-overlapping (1st+2nd, 3rd+4th, ...), and only
+    opposing transitions pair.  A cell's pending transition is remembered by
+    its sign; when the opposite sign arrives the pair is complete and the
+    flash is counted at that frame.  Two same-sign transitions in a row are
+    possible when a run below the threshold sits between them (rise, small
+    dip, rise); the newer one then replaces the pending one (ADR-018), so a
+    flash is always one rise and one fall.
     """
 
     def __init__(self, n_cells: int) -> None:
@@ -291,16 +332,22 @@ class FlashPairer:
 
 
 def _aux_frame(aux: dict[str, np.ndarray], t: int) -> dict[str, np.ndarray]:
+    """Frame t of every aux series, each as a one-cell array."""
     return {k: v[t : t + 1] for k, v in aux.items()}
 
 
 def detect_transitions_1d(
     signal: np.ndarray,
     rule: Rule = general_rule,
-    tolerance: float = 0.005,
+    tolerance: float = RUN_REVERSAL_TOLERANCE["L"],
     aux: dict[str, np.ndarray] | None = None,
 ) -> list[tuple[int, int]]:
-    """Transitions of ONE cell's time series as (frame, sign) pairs, in frame order."""
+    """Transitions of ONE cell's time series as (frame, sign) pairs, in frame order.
+
+    For tests and teaching: analyze() never calls this.  It drives the same
+    RunTracker with a single cell, so a hand-written series can be checked
+    against the rules (the tests compare it with the N-cell tracker).
+    """
     series = np.asarray(signal, dtype=np.float64).reshape(-1)
     aux_series = {k: np.asarray(v, dtype=np.float64).reshape(-1) for k, v in (aux or {}).items()}
     for key, arr in aux_series.items():
@@ -320,10 +367,14 @@ def detect_transitions_1d(
 def flash_frames_1d(
     signal: np.ndarray,
     rule: Rule = general_rule,
-    tolerance: float = 0.005,
+    tolerance: float = RUN_REVERSAL_TOLERANCE["L"],
     aux: dict[str, np.ndarray] | None = None,
 ) -> list[int]:
-    """Frames at which ONE cell completes a flash (transitions paired in order)."""
+    """Frames at which ONE cell completes a flash (transitions paired in order).
+
+    For tests and teaching, like detect_transitions_1d(): the same RunTracker
+    and FlashPairer that analyze() uses, seen through a single cell.
+    """
     pairer = FlashPairer(1)
     frames: list[int] = []
     for frame, sign in detect_transitions_1d(signal, rule, tolerance, aux):

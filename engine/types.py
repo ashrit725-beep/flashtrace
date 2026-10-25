@@ -39,7 +39,9 @@ class Violation:
     end: int                   # last frame of the last failing one-second window
     type: str                  # "general" or "red"
     max_rate_per_sec: int      # highest one-second count inside the span
-    window: Rect               # the 341x256 px (scaled) window of the largest event, CSS px
+    window: Rect               # the scored window of the largest event, in CSS px, made of whole
+                               # cells (85x64 cells = 340x256 px at 1024 px wide; windowPx holds
+                               # the nominal 341x256, ADR-006; clipped to a short viewport, ADR-019)
     frame_indices: list[int]   # frames of the qualifying events inside the span
 
     def to_dict(self) -> dict[str, object]:
@@ -77,7 +79,12 @@ class Advisory:
 
 @dataclass
 class TimelineBin:
-    """Qualifying events in the whole second starting at ``t`` seconds."""
+    """Qualifying events in the second starting at ``t`` seconds.
+
+    Bin k covers frames [k*fps, (k+1)*fps).  The last bin may cover only part
+    of a second when the capture ends early; it holds its raw count, so the
+    bins always add up to the event totals (ADR-021).
+    """
 
     t: float
     general_flashes: int
@@ -97,13 +104,13 @@ class FrameStats:
 
     general_cells: np.ndarray        # int64: cells completing a general flash at t
     red_cells: np.ndarray            # int64: cells completing a red flash at t
-    general_area_max: np.ndarray     # float64: best window fraction of the general event
+    general_area_max: np.ndarray     # float64: best window's share of the full window, E[t] = M[t-1] | M[t]
     red_area_max: np.ndarray         # float64
     general_window_y: np.ndarray     # int64: top-left cell of that best window
     general_window_x: np.ndarray     # int64
     red_window_y: np.ndarray         # int64
     red_window_x: np.ndarray         # int64
-    general_qualifying: np.ndarray   # bool: a qualifying general event is counted at t
+    general_qualifying: np.ndarray   # bool: a qualifying general event is counted at t (ADR-019)
     red_qualifying: np.ndarray       # bool
     general_trailing_1s: np.ndarray  # int64: qualifying general events in [t-fps+1, t]
     red_trailing_1s: np.ndarray      # int64
@@ -156,7 +163,7 @@ class AnalysisResult:
     viewport: tuple[int, int]        # (width, height) in CSS px
     cell_px: int
     grid: tuple[int, int]            # (cells_y, cells_x)
-    window_cells: tuple[int, int]    # (wy, wx)
+    window_cells: tuple[int, int]    # (wy, wx) of the scanned window, clamped to the grid
     window_px: tuple[int, int]       # (w, h) in CSS px
     red_rule: str
     frame_stats: FrameStats

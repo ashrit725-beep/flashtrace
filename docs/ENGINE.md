@@ -22,9 +22,12 @@ frame (bytes)  ->  linear light  ->  4x4 px cell averages  ->  per-cell signals 
    -> sliding one-second counts  ->  verdict, violations, advisories, timeline, heatmap
 ```
 
-Frames are processed one at a time (streaming). Between frames the engine only remembers a few numbers per
-cell, so a 10-second capture never has to sit in memory at once. Every number is a 64-bit float or integer
-and every step runs in a fixed order, so the same frames always produce byte-identical output.
+Frames are processed one at a time (streaming): a frame is dropped as soon as its cell signals have been read,
+so the frames of a 10-second capture never sit in memory together. What the engine does keep is, for the
+whole capture, one true/false per cell per frame for each flash type ("did this cell complete a flash at this
+frame?", needed by the area step after the last frame), plus a few numbers per cell for the run trackers.
+Every number is a 64-bit float or integer and every step runs in a fixed order, so the same frames always
+produce byte-identical output.
 
 ## `engine/constants.py` - every threshold, with its source
 
@@ -49,8 +52,8 @@ L = 0.2126 * R_linear + 0.7152 * G_linear + 0.0722 * B_linear
 ```
 
 Because a byte can only take 256 values, the formula is evaluated once per value into a lookup table
-(`SRGB8_TO_LINEAR`); converting a frame is then just "look each byte up", which is fast and guarantees equal
-bytes always give the exact same float.
+(`SRGB8_TO_LINEAR`); converting a frame is then just "look each byte up", which runs the power function 256
+times instead of once per byte and guarantees equal bytes always give the exact same float.
 
 **Worked example, the grey `#808080` (128, 128, 128):** 128 / 255 = 0.50196. That is above 0.04045, so
 linear = ((0.50196 + 0.055) / 1.055) ^ 2.4 = 0.52793 ^ 2.4 = 0.21586. All three channels are the same, so
@@ -58,20 +61,31 @@ L = (0.2126 + 0.7152 + 0.0722) x 0.21586 = **0.2159**. Mid-grey is only about a 
 
 For the red rule the module also computes, per colour:
 
-* the **redness ratio** R / (R + G + B) on the sRGB-encoded (byte-scale) components. Pure red is 1.0,
-  white is 0.333, black is defined as 0 (ADR-003);
+* the **redness ratio** R / (R + G + B). The colour is first converted back to sRGB and **rounded to whole
+  0-255 values** (R8, G8, B8), because the brief defines the ratio on 0-255 components and because the
+  round trip through linear light is not exact in floating point: without the rounding, byte 12 comes back
+  as 11.999999999999998, and (240, 30, 30), whose ratio is exactly 240 / 300 = 0.8, measured
+  0.7999999999999999, just under the inclusive ">= 0.8" (ADR-003, ADR-020). Pure red is 1.0, white is 1/3, (204, 51, 0) is exactly 0.8. The
+  ratio is 0 for black (R8 + G8 + B8 = 0) and for any colour with **R8 below 16**: a red that dark has no
+  visible hue, and without this floor an invisible one-step change rgb(0,0,0) <-> rgb(1,0,0) would count as
+  a red flash. 16 is the smallest red that the pre-2022 rule ((R - G - B) x 320 > 20) could ever count
+  against black (ADR-020);
 * the **CIE 1976 (u', v') chromaticity**, "which hue, ignoring brightness", via the XYZ matrix printed in
-  the Understanding document. Pure black would divide 0 by 0, so it is given the white point (0.1978,
-  0.4683): black counts as colourless, like white and grey (ADR-011). Example: sRGB red has
-  (u', v') = (0.4508, 0.5229); its distance to the white point is 0.259, which is more than the 0.2 that
-  WCAG requires, so red <-> black, red <-> white and red <-> grey all count as a colour change.
+  the Understanding document. Pure black would divide 0 by 0, so it is given the white point, which the code
+  computes from the same matrix (about (0.1978, 0.4683)), so black and white get exactly the same numbers:
+  black counts as colourless, like white and grey (ADR-011). Example: sRGB red has (u', v') = (0.4508,
+  0.5229); its distance to the white point is 0.259, which is more than the 0.2 that WCAG requires, so
+  red <-> black, red <-> white and red <-> grey all count as a colour change. (204, 51, 0) is 0.214 from the
+  white point, so it too makes a red transition against black, white or grey;
+* the **legacy red value** (comparison mode only): max(0, R8 - G8 - B8) / 255 x 320, on the same whole
+  values.
 
 ## `engine/cells.py` - 4x4 pixel cells
 
 **In:** one frame, uint8 [height, width, 3]. **Out:** mean linear colour per cell, and the five signals.
 
-A 1024x768 frame has 786 432 pixels; tracking each one over time would be slow and would not match how the
-criterion is written (it is about regions, not pixels). The frame is cut into 4x4 pixel cells and each cell
+A 1024x768 frame has 786 432 pixels; tracking each one over time would mean sixteen times as many numbers
+and would not match how the criterion is written (it is about regions, not pixels). The frame is cut into 4x4 pixel cells and each cell
 becomes the *average linear colour* of its 16 pixels: 256 x 192 = 49 152 cells. Averaging happens after
 linearising (ADR-002) because luminance is linear in light: a cell's L is then exactly the mean of its
 pixels' L. Pixels beyond the last whole cell (at most 3 per edge) are dropped.
@@ -79,7 +93,10 @@ pixels' L. Pixels beyond the last whole cell (at most 3 per edge) are dropped.
 From each cell's mean colour the module reads the five per-cell signals: `L`, `ratio`, `u`, `v` and the
 legacy red value `rv` (used only in the comparison mode). It also sizes the WCAG window: 341x256 CSS px at a
 1024 px wide viewport is 85 x 64 cells (341 / 4 = 85.25 rounds to 85); other widths scale proportionally
-(ADR-007).
+(ADR-007), and halves round up (64.5 becomes 65). Two sizes come out of this: `window_cells_full` is the
+whole window (85 x 64 = 5 440 cells at 1024 px wide), and `window_cells` is that window clamped to the grid,
+which is what gets slid over the frame. They differ only when the viewport is smaller than the window, for
+example a 1024 x 100 banner (25 cell rows), where the scanned window is 85 x 25 cells.
 
 ## `engine/transitions.py` - peaks, valleys, transitions, flashes
 
@@ -89,15 +106,16 @@ WCAG defines a *transition* as "the change ... between adjacent peaks and valley
 measurement against time" and says "A flash consists of two opposing transitions". So per cell the engine
 needs the turning points of its signal over time.
 
-`RunTracker` keeps three facts per cell: where the current *run* started (the previous turning point), the
-direction it is going (up, down, or not moved yet), and the most extreme value seen so far in this run. On
-each new frame:
+`RunTracker` keeps a few facts per cell: where the current *run* started (the previous turning point), the
+direction it is going (up, down, or not moved yet), the most extreme value seen so far in this run, and the
+frame the run will be stamped with (plus whether the signal has settled there). On each new frame:
 
 * if the signal pushes further in the run's direction, that frame becomes the new extremum;
-* if it turns back by more than a tiny tolerance (0.005 in luminance, one twentieth of the threshold), the
-  run has ended at the extremum. The rule for that signal is asked whether start -> extremum was a
-  transition; the next run begins at the extremum;
-* a flat stretch or a wobble smaller than the tolerance changes nothing.
+* if it turns back by more than a tiny tolerance (0.005 in luminance and in the redness ratio, 1.0 in the
+  legacy red value; one twentieth of the threshold), the run has ended at the extremum. The rule for that
+  signal is asked whether start -> extremum was a transition; the next run begins at the extremum (ADR-018);
+* a flat stretch, or a wobble no larger than the tolerance, changes nothing. A wobble that small could never
+  be a transition itself; ignoring it stops anti-aliasing noise from cutting a slow fade into pieces.
 
 Rules (each comparison in the code sits beside the W3C sentence it implements):
 
@@ -106,10 +124,19 @@ Rules (each comparison in the code sits beside the W3C sentence it implements):
   ends is > 0.2;
 * **red (legacy comparison mode):** at least one end has ratio >= 0.8 **and** the red value changes by > 20.
 
-A transition is stamped with the frame where the extremum was first reached. `FlashPairer` then pairs each
-cell's transitions in order, first with second, third with fourth; a flash is counted at the frame of its
-second (completing) transition (ADR-005). The engine does all of this for all 49 152 cells at once with a
-handful of array operations per frame rather than a loop over cells.
+A transition is stamped with the frame where the signal **arrived** at its extremum, i.e. the first frame
+showing the new state, not the last frame of a plateau (ADR-018). While the signal keeps moving, the stamp
+follows each new extremum, so a smooth fade is stamped at the bottom of its valley. Once the signal stands
+still or wobbles back, it has arrived: from then on a further gain moves the stamp only if it goes more than
+the tolerance beyond the stamped value. Without that, noise of a fraction of a byte on a flat colour would move
+the stamp to wherever the noise happened to peak, and one flash would be spread over several frames.
+`FlashPairer` then pairs each cell's transitions in
+order, first with second, third with fourth, and only a rise with a fall; a flash is counted at the frame of
+its second (completing) transition (ADR-005). Two rises in a row can happen when a change too small to be a
+transition sits between them (rise, small dip, rise); the newer rise then replaces the waiting one, so a
+flash is always one rise and one fall (ADR-018). The engine does all of this for all 49 152 cells at once
+with a handful of array operations per frame rather than a loop over cells. (`detect_transitions_1d` and
+`flash_frames_1d` run the same tracker on a single cell; they exist for the tests and for teaching.)
 
 **Worked example, a 4 Hz black/white square wave at 60 fps.** Four cycles per second means the screen
 changes state every 7.5 frames: black for frames 0-7, white 8-14, black 15-22, white 23-29, black 30-37,
@@ -127,16 +154,40 @@ any 10 degree visual field", and a "341 x 256 pixel rectangle anywhere on the di
 stands in for that field. "Anywhere" means every position of that rectangle must be tried. The engine
 does this with an *integral image*: a running total so that "how many flashing cells are in this window?"
 is answered with four look-ups for every possible position. The best position is recorded (ties go to the
-top-left-most). Steps per frame (SPEC 5.6):
+top-left-most). Steps per frame (SPEC 5.6, ADR-019):
 
-1. cells completing a flash one frame apart are treated as one event (`E[t] = M[t] or M[t+1]`);
-2. `area_max[t]` = flashing cells in the best window / cells in a window (85 x 64 = 5 440);
-3. the event qualifies if `area_max > 0.25` (strictly greater: exactly 25 % passes);
-4. an event that qualifies on several consecutive frames is counted once, at the first of them.
+1. cells completing a flash one frame apart are treated as one event, looking backwards:
+   `E[t] = M[t-1] or M[t]` (frame 0 has nothing before it);
+2. `area_max[t]` = flashing cells in the best window / cells in the **full** window (85 x 64 = 5 440 at
+   1024 px wide). On a viewport too short for the window, only the part that fits is slid over the frame,
+   but the share is still taken of 5 440 cells, because WCAG's 25 % is an absolute area (21 824 px), not a
+   quarter of whatever happens to be on screen;
+3. the frame qualifies if `area_max > 0.25` (strictly greater: exactly 25 % passes);
+4. counting: an event counted at frame `t` *claims* the completions of frames `t` and `t+1` (step 1's
+   tolerance). Going forward through the frames, a qualifying frame that is not claimed is scored again
+   using only the completions of `t-1` and `t` that no earlier event has claimed; if that share is still over
+   25 %, an event is counted at `t`. So one flash is counted once even when its cells finish on two
+   neighbouring frames (a smooth fade over dim and bright cells does this: they reach their extreme byte one
+   frame apart). The price: two separate regions that qualify one frame apart are also counted once.
 
-**Example continued.** Every cell flashes at frame 15, so every window is 100 % full: the event qualifies.
-Because of step 1 it already qualifies on frame 14 (the frame before the completing transition), so it is
-counted at 14. Qualifying general events: frames 14, 29, 44, 59, 74, ...
+**Example continued.** Every cell completes a flash at frame 15, so every window is 100 % full on frames 15
+and 16 (step 1 carries frame 15 into frame 16). Frame 15 counts an event, which claims frames 15 and 16, so
+frame 16 is not counted again. The event sits at frame 15, the frame that shows the new (black) state.
+Qualifying general events: frames 15, 30, 45, 60, 75.
+
+**A faster example.** A 30 Hz strobe at 60 fps changes colour on every frame, so every cell completes a flash
+every 2 frames (2, 4, 6, ...). The event at 2 claims frames 2 and 3; frame 4 brings new, unclaimed
+completions, so it is the next event, and so on: 30 events in every second. Frequencies above half the frame
+rate cannot be seen in the frames at all.
+
+**A split flash.** A 3 Hz smooth pulse whose left half peaks at byte 120 and right half at byte 255
+completes the left half on one frame and the right half on the next. Three frames in a row are over 25 %
+(the pair of completion frames and the one after), but the event on the first frame claims both completion
+frames, so each flash counts once: 3 per second, a PASS.
+
+**A short page.** On a 1024 x 100 viewport (25 cell rows) a flashing block of 24 x 25 = 600 cells covers
+600 / 5 440 = 11 % of the window: it does not qualify, even though it fills 28 % of the 85 x 25 cells that fit
+on screen.
 
 ## `engine/rate.py` - more than three in any second?
 
@@ -153,13 +204,16 @@ in any window is one subtraction, so every possible window start is checked.
   **not** a WCAG rule (ADR-009); it is reported with the label "advisory - not a WCAG 2.3.1 criterion" and
   never changes the verdict.
 * `timeline`: events per second, for the chart. Bin `k` covers frames `[k*fps, (k+1)*fps)`; a trailing
-  partial second gets its own bin, so every qualifying event appears in exactly one bin and the bins always
-  sum to the totals.
+  partial second gets its own bin with its raw count (ADR-021), so every qualifying event appears in exactly
+  one bin and the bins always sum to the totals.
 
-**Example finished.** The window of frames 0-59 contains the events at 14, 29, 44 and 59: four, which is
-more than three, so the capture **FAILs** with `generalMaxRatePerSec = 4`. The same wave at 3 Hz changes
-state every 10 frames, completes flashes at 20, 40, 60, 80, ... and never puts more than three in any
-sixty-frame window: **PASS**, reported as "no 2.3.1 violation detected under the tested conditions".
+**Example finished.** The window of frames 0-59 contains the events at 15, 30 and 45: three. The window of
+frames 1-60 contains 15, 30, 45 and 60: four, which is more than three, so the capture **FAILs** with
+`generalMaxRatePerSec = 4`. In a 90-frame (1.5 s) capture the failing window starts run from 1 to 30, so the
+violation spans frames 1-89 and lists the events 15, 30, 45, 60, 75; the timeline has two bins, 3 events in
+second 0 (frames 0-59) and 2 in the partial second 1 (frames 60-89). The same wave at 3 Hz changes state every
+10 frames, completes flashes at 20, 40, 60, 80, ... and never puts more than three in any sixty-frame window:
+**PASS**, reported as "no 2.3.1 violation detected under the tested conditions".
 
 ## `engine/types.py` - the result and its JSON
 
@@ -174,16 +228,23 @@ cell (stored as base64 little-endian 16-bit integers so it is compact and reprod
 
 Two sizes appear in the output and they differ by design: `windowPx` is the nominal WCAG window (341 x 256
 CSS px at a 1024 px wide viewport), while each violation's `window` rectangle is the window that was actually
-scored, in whole cells (85 x 64 cells = 340 x 256 px). ADR-006 records this 0.3 % difference.
+scored, in whole cells (85 x 64 cells = 340 x 256 px). ADR-006 records this 0.3 % difference. On a viewport
+shorter than the window the rectangle is clipped to the viewport (85 x 25 cells = 340 x 100 px on a
+1024 x 100 page), while the area share is still measured against the full window (ADR-019).
 
 ## `engine/analyze.py` - putting it together
 
-`analyze(frames, fps, viewport, red_rule)` runs the streaming pass (colour -> cells -> signals -> trackers
--> pairers -> masks and heatmap), then the area and rate passes, and assembles the result. It accepts a
-whole array or a generator of frames, rejects anything that is not uint8 [H, W, 3], fewer than two frames
-or an unknown red rule, and reports progress through an optional callback. `evidence_frame_indices` picks a
-small, deterministic set of frames to save as still images: frame 0 and, per violation, its first event
-frame and the one before it.
+`analyze(frames, fps, viewport, red_rule)` reads as the pipeline stages, each a small named helper:
+`_check_arguments` (red rule and fps), `_resolve_viewport` (the viewport, or the frame size when none is
+given), `_geometry` (cell grid, scanned window and full window), `_stream` (colour -> cells -> signals ->
+trackers -> pairers -> masks and heatmap, one frame at a time), `_score_type` (area, rate, violations and
+advisories for one flash type) and `_assemble` (the `AnalysisResult`). It accepts a whole array or a
+generator of frames and rejects anything that is not uint8 [H, W, 3], fewer than two frames, an unknown red
+rule, or a frame width that differs from the viewport width (frames must be at device scale factor 1, SPEC
+5.1). It reports progress through an optional callback. `evidence_frame_indices` picks a small,
+deterministic set of frames to save as still images: frame 0 and, per violation, its first event frame and
+the one before it. Because an event is counted on the frame where its flash completes, the two show the
+state just before and just after the change (frames 14 and 15 in the 4 Hz example: white, then black).
 
 ## Determinism and speed
 
@@ -191,8 +252,8 @@ Same input, same output, every time: float64 throughout, no randomness, no threa
 and a lookup table instead of per-pixel arithmetic. The acceptance tests (SPEC 5.10 item 9) analyse the
 same scene twice and compare the JSON byte for byte. Runtime figures are deliberately not quoted on this
 page: SPEC section 10 reserves them for `docs/RESULTS.md`, which `flashtrace bench` produces with a date and
-commit hash. The cost per frame is dominated by the 4x4 cell averaging and the tracker's array operations,
-both of which are O(cells) and independent of what the page shows.
+commit hash. The 4x4 cell averaging and the tracker's array operations both do a fixed amount of work per
+cell, whatever the page shows.
 
 ## What the engine deliberately does not do
 
@@ -200,4 +261,5 @@ both of which are O(cells) and independent of what the page shows.
   averaging already smooths such patterns towards grey, which makes the engine lenient, not strict, there.
 * It does not model a physical display, viewing distance or HDR; it measures what headless Chromium drew.
 * It does not sum general and red flashes together; WCAG counts them separately and so does the engine.
-* It never says "WCAG compliant". It reports what it measured, under the conditions it was given.
+* It cannot see flashing faster than half the frame rate (30 Hz at 60 fps): such content is not in the frames.
+* It never claims compliance. It reports what it measured, under the conditions it was given.

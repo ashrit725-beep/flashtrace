@@ -1,6 +1,6 @@
 """Strategies B (``virtual_time``) and C (``realtime``) and the A -> B -> C fall-through (SPEC 6.2, 6.3).
 
-Pure tests cover the screencast resampling rule. Browser tests (``-m browser``) capture the synthetic
+Pure tests cover the screencast resampling rule and strategy A's network wait. Browser tests (``-m browser``) capture the synthetic
 pages and *measure* what each strategy does on this machine; a B test that cannot run because the
 platform lacks BeginFrameControl is skipped with the measured reason, never passed silently.
 """
@@ -8,11 +8,17 @@ platform lacks BeginFrameControl is skipped with the measured reason, never pass
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from pathlib import Path
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
+from playwright.sync_api import Browser
+from playwright.sync_api import Error as PlaywrightError
 
-from capture import capture
+from capture import CaptureResult, capture
+from capture.strategies import network_wait
 from capture.strategies import virtual_time as vt
 from capture.strategies.realtime import resample_indices
 
@@ -22,7 +28,7 @@ CENTRE_XY = (300, 250)
 CONTROLLABLE_PAGES = ("css_keyframes.html", "waapi.html", "raf.html")
 
 
-def centre_states(frames) -> list[str]:
+def centre_states(frames: Iterable[np.ndarray]) -> list[str]:
     """'black' / 'white' / 'other[...]' for the probe pixel of every frame."""
     states = []
     for frame in frames:
@@ -69,15 +75,115 @@ def test_unknown_strategy_name_is_rejected_before_any_browser_work() -> None:
         capture("ignored.html", strategy="no_such_strategy")
 
 
+# ------------------------------------------------------------------------------- pure: network wait (strategy A)
+class _StandInRequest:
+    def __init__(self, url: str) -> None:
+        self.url = url
+
+
+class _StandInNetworkPage:
+    """Records the handlers NetworkTracker registers; each wait_for_timeout runs one scheduled action."""
+
+    def __init__(self) -> None:
+        self.handlers: dict[str, object] = {}
+        self.scheduled: list[object] = []
+        self.waits = 0
+
+    def on(self, event: str, handler: object) -> None:
+        self.handlers[event] = handler
+
+    def wait_for_timeout(self, _ms: float) -> None:
+        self.waits += 1
+        if self.scheduled:
+            self.scheduled.pop(0)()
+
+
+def test_network_wait_returns_once_requests_finish() -> None:
+    page = _StandInNetworkPage()
+    tracker = network_wait.NetworkTracker()
+    tracker.attach(page)
+    request = _StandInRequest("http://127.0.0.1/a.png")
+    page.handlers["request"](request)
+    assert tracker.in_flight == 1
+    page.scheduled = [lambda: None, lambda: page.handlers["requestfinished"](request)]
+    tracker.wait_for_idle(page)
+    assert tracker.in_flight == 0 and page.waits == 2
+    assert tracker.take_abandoned() == []
+    tracker.wait_for_idle(page)  # nothing in flight: no waiting at all
+    assert page.waits == 2
+
+
+def test_network_wait_gives_up_on_a_request_that_never_finishes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(network_wait, "NETWORK_WAIT_MS", 0)
+    page = _StandInNetworkPage()
+    tracker = network_wait.NetworkTracker()
+    tracker.attach(page)
+    page.handlers["request"](_StandInRequest("http://127.0.0.1/stream"))
+    tracker.wait_for_idle(page)
+    assert tracker.in_flight == 0
+    assert tracker.take_abandoned() == ["http://127.0.0.1/stream"]
+    assert tracker.take_abandoned() == []  # each request is reported once
+
+
+# ------------------------------------------------------------------------------- pure: BeginFrameControl probe
+class _StandInSession:
+    """Records detach() calls; answers the two DevTools commands the probe sends."""
+
+    def __init__(self, log: list[str], refuse: bool) -> None:
+        self._log, self._refuse = log, refuse
+
+    def send(self, method: str, _params: dict[str, object] | None = None) -> dict[str, object]:
+        if method == "Target.createTarget" and self._refuse:
+            raise PlaywrightError("BeginFrameControl is not supported on this stand-in")
+        return {"targetInfo": {"browserContextId": "stand-in"}}
+
+    def detach(self) -> None:
+        self._log.append("detach")
+
+
+class _StandInBrowser:
+    """Just enough of a Playwright Browser for ``begin_frame_unavailable``; counts contexts and sessions."""
+
+    def __init__(self, version: str, refuse: bool) -> None:
+        self.browser_type = SimpleNamespace(name="chromium")
+        self.version = version
+        self.log: list[str] = []
+        self._refuse = refuse
+
+    def _session(self, *_args: object) -> _StandInSession:
+        self.log.append("session")
+        return _StandInSession(self.log, self._refuse)
+
+    def new_context(self) -> SimpleNamespace:
+        self.log.append("context")
+        return SimpleNamespace(new_page=lambda: object(), new_cdp_session=self._session, close=lambda: None)
+
+    def new_browser_cdp_session(self) -> _StandInSession:
+        return self._session()
+
+
+@pytest.mark.parametrize("refuse", [False, True])
+def test_begin_frame_probe_remembers_both_answers_and_detaches_its_sessions(monkeypatch: pytest.MonkeyPatch, refuse: bool) -> None:
+    monkeypatch.setattr(vt, "_BEGIN_FRAME_PROBED", {})
+    browser = _StandInBrowser(version=f"stand-in-{refuse}", refuse=refuse)
+    first = vt.begin_frame_unavailable(browser)  # type: ignore[arg-type]
+    second = vt.begin_frame_unavailable(browser)  # type: ignore[arg-type]
+    assert first == second
+    assert (first is None) is (not refuse)
+    # One probe only (the second answer came from memory), and both of its sessions were detached.
+    assert browser.log.count("context") == 1
+    assert browser.log.count("session") == 2 == browser.log.count("detach")
+
+
 # ------------------------------------------------------------------------------- browser: B
 @pytest.fixture(scope="module")
-def begin_frame_reason(browser) -> str | None:
+def begin_frame_reason(browser: Browser) -> str | None:
     """Measured once per session: ``None`` when BeginFrameControl works, else Chromium's own error."""
     return vt.begin_frame_unavailable(browser)
 
 
 @pytest.mark.browser
-def test_begin_frame_support_is_probed_without_hanging(browser, begin_frame_reason: str | None) -> None:
+def test_begin_frame_support_is_probed_without_hanging(browser: Browser, begin_frame_reason: str | None) -> None:
     print(f"[measured] BeginFrameControl: {'supported' if begin_frame_reason is None else begin_frame_reason}")
     if begin_frame_reason is not None:
         assert begin_frame_reason.startswith(vt.BEGIN_FRAME_UNAVAILABLE)
@@ -86,7 +192,7 @@ def test_begin_frame_support_is_probed_without_hanging(browser, begin_frame_reas
 
 
 @pytest.mark.browser
-def test_budget_mode_self_test_is_measured_once(browser, begin_frame_reason: str | None) -> None:
+def test_budget_mode_self_test_is_measured_once(browser: Browser, begin_frame_reason: str | None) -> None:
     """The budget-only self-test answers (and remembers) whether rendering stands still at a fixed virtual instant."""
     verdict = vt.budget_mode_unusable(browser)
     print(f"[measured] budget-only virtual time: {'usable' if verdict is None else verdict}")
@@ -94,14 +200,14 @@ def test_budget_mode_self_test_is_measured_once(browser, begin_frame_reason: str
     assert vt.budget_mode_unusable(browser) == verdict
 
 
-def _capture_b(pages_dir: Path, page: str, out: Path, browser, duration_s: float):
+def _capture_b(pages_dir: Path, page: str, out: Path, browser: Browser, duration_s: float) -> CaptureResult:
     return capture(str(pages_dir / page), duration_s=duration_s, fps=FPS, strategy="virtual_time", out_dir=out, browser=browser)
 
 
 @pytest.mark.browser
 @pytest.mark.parametrize("page", CONTROLLABLE_PAGES)
 def test_virtual_time_two_captures_are_identical_and_agree_with_a(
-    pages_dir: Path, tmp_path_factory: pytest.TempPathFactory, browser, page: str
+    pages_dir: Path, tmp_path_factory: pytest.TempPathFactory, browser: Browser, page: str
 ) -> None:
     first = _capture_b(pages_dir, page, tmp_path_factory.mktemp("b1"), browser, 2)
     second = _capture_b(pages_dir, page, tmp_path_factory.mktemp("b2"), browser, 2)
@@ -124,7 +230,7 @@ def test_virtual_time_two_captures_are_identical_and_agree_with_a(
 
 # ------------------------------------------------------------------------------- browser: C
 @pytest.mark.browser
-def test_realtime_capture_of_css_page(pages_dir: Path, tmp_path: Path, browser) -> None:
+def test_realtime_capture_of_css_page(pages_dir: Path, tmp_path: Path, browser: Browser) -> None:
     result = capture(str(pages_dir / "css_keyframes.html"), duration_s=2, fps=FPS, strategy="realtime", out_dir=tmp_path, browser=browser)
     meta = result.meta
     print(f"[wall] realtime css_keyframes 2 s @ {FPS} fps: {meta.wall_time_s:.2f} s")
@@ -147,7 +253,7 @@ def test_realtime_capture_of_css_page(pages_dir: Path, tmp_path: Path, browser) 
 
 
 @pytest.mark.browser
-def test_realtime_static_page_holds_one_frame(pages_dir: Path, tmp_path: Path, browser) -> None:
+def test_realtime_static_page_holds_one_frame(pages_dir: Path, tmp_path: Path, browser: Browser) -> None:
     result = capture(str(pages_dir / "static.html"), duration_s=0.5, fps=FPS, strategy="realtime", out_dir=tmp_path, browser=browser)
     assert result.meta.strategy == "realtime"
     assert result.meta.deterministic is False
@@ -159,7 +265,7 @@ def test_realtime_static_page_holds_one_frame(pages_dir: Path, tmp_path: Path, b
 
 # ------------------------------------------------------------------------------- browser: fall-through
 @pytest.mark.browser
-def test_gif_page_under_auto_skips_strategy_a(pages_dir: Path, tmp_path: Path, browser) -> None:
+def test_gif_page_under_auto_skips_strategy_a(pages_dir: Path, tmp_path: Path, browser: Browser) -> None:
     result = capture(str(pages_dir / "gif.html"), duration_s=1, fps=FPS, out_dir=tmp_path, browser=browser)
     meta = result.meta
     print(f"[wall] auto gif.html 1 s @ {FPS} fps: {meta.wall_time_s:.2f} s ({meta.strategy})")
@@ -186,7 +292,7 @@ def test_gif_page_under_auto_skips_strategy_a(pages_dir: Path, tmp_path: Path, b
 
 
 @pytest.mark.browser
-def test_gif_under_forced_virtual_time_is_measured(pages_dir: Path, tmp_path: Path, browser, begin_frame_reason: str | None) -> None:
+def test_gif_under_forced_virtual_time_is_measured(pages_dir: Path, tmp_path: Path, browser: Browser, begin_frame_reason: str | None) -> None:
     """Forced B on the GIF page: does the GIF advance, and does B stand behind the frames?"""
     result = capture(str(pages_dir / "gif.html"), duration_s=1, fps=FPS, strategy="virtual_time", out_dir=tmp_path, browser=browser)
     meta = result.meta
@@ -202,7 +308,7 @@ def test_gif_under_forced_virtual_time_is_measured(pages_dir: Path, tmp_path: Pa
 
 
 @pytest.mark.browser
-def test_forced_strategy_is_honoured(pages_dir: Path, tmp_path_factory: pytest.TempPathFactory, browser) -> None:
+def test_forced_strategy_is_honoured(pages_dir: Path, tmp_path_factory: pytest.TempPathFactory, browser: Browser) -> None:
     forced_c = capture(str(pages_dir / "static.html"), duration_s=0.5, fps=FPS, strategy="realtime", out_dir=tmp_path_factory.mktemp("c"), browser=browser)
     assert forced_c.meta.strategy == "realtime"
     assert forced_c.meta.fallback_reason is None

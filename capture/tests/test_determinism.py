@@ -3,10 +3,12 @@ and the three synthetic pages (CSS keyframes, WAAPI, rAF) draw the same thing.""
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from pathlib import Path
 
 import numpy as np
 import pytest
+from playwright.sync_api import Browser
 
 from capture import capture
 
@@ -16,7 +18,7 @@ PAGES = ("css_keyframes.html", "waapi.html", "raf.html")
 BOX_CENTRE_XY = (300, 250)
 
 
-def box_states(frames) -> list[str]:
+def box_states(frames: Iterable[np.ndarray]) -> list[str]:
     states = []
     for frame in frames:
         pixel = frame[BOX_CENTRE_XY[1], BOX_CENTRE_XY[0]]
@@ -44,7 +46,7 @@ def assert_same_square_wave(a: list[str], b: list[str], tolerance: int = 1) -> N
 
 
 @pytest.fixture(scope="module")
-def captures(pages_dir: Path, tmp_path_factory: pytest.TempPathFactory, browser) -> dict[str, list]:
+def captures(pages_dir: Path, tmp_path_factory: pytest.TempPathFactory, browser: Browser) -> dict[str, list]:
     """Each page captured twice (2 s at 60 fps); shared by the tests below."""
     results: dict[str, list] = {}
     for page in PAGES:
@@ -83,7 +85,7 @@ def test_pages_draw_the_same_square_wave(captures: dict[str, list]) -> None:
 
 
 @pytest.mark.browser
-def test_static_page_never_changes(pages_dir: Path, tmp_path: Path, browser) -> None:
+def test_static_page_never_changes(pages_dir: Path, tmp_path: Path, browser: Browser) -> None:
     result = capture(str(pages_dir / "static.html"), duration_s=0.5, fps=FPS, out_dir=tmp_path, browser=browser)
     print(f"[wall] static.html 0.5 s @ {FPS} fps: {result.meta.wall_time_s:.2f} s")
     assert result.meta.frame_count == 30

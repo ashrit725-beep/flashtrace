@@ -1,27 +1,31 @@
-"""Acceptance tests for docs/SPEC.md section 5.10 (items 1-10), plus the input-validation and
+"""Acceptance tests for docs/SPEC.md section 5.10 (items 1-14), plus the input-validation and
 report-shape checks of the engine contract.
 
-Black box: only ``engine.analyze`` and the result object it returns are used.  Frames come
-from ``engine/tests/synth.py`` and are streamed, never stacked.  A PASS here means "no 2.3.1
+Black box: only ``engine.analyze`` and the result object it returns are used (item 12 also
+reads the per-cell redness ratio through ``engine.cells``).  Frames come from
+``engine/tests/synth.py`` and are streamed, never stacked.  A PASS here means "no 2.3.1
 violation detected under the tested conditions", nothing more.
 
 Counting convention (SPEC 5.5, ADR-005): a flash is counted when its SECOND transition
-completes.  A 4 Hz square wave at 60 fps therefore completes one flash every 15 frames, so
-any window of 60 frames holds 4 of them; a 3 Hz wave completes one every 20 frames and a
-window holds 3.  The tests assert on verdicts, maximum rates, counts and whole-array equality,
-never on the exact frame index at which a flash is recorded.
+completes, and the qualifying event is counted on that completing frame (SPEC 5.6, ADR-019).
+A 4 Hz square wave at 60 fps therefore completes one flash every 15 frames, so a window of
+60 frames holds up to 4 of them; a 3 Hz wave completes one every 20 frames and a window holds
+3.  The tests assert on verdicts, maximum rates, counts and whole-array equality; only the
+evidence-frame test looks at which frames were picked, and then only at what they show.
 """
 from __future__ import annotations
 
 import base64
 import json
-from typing import Sequence
+from typing import Any, Sequence
 
 import numpy as np
 import pytest
 
-from engine import analyze
+from engine import AnalysisResult, analyze
 from engine.analyze import evidence_frame_indices
+from engine.cells import cell_signals, frame_to_cells
+from engine.constants import RED_MIN_R8, RED_SATURATION_MIN_RATIO
 from engine.tests import synth
 from engine.tests.synth import (
     BLACK,
@@ -31,10 +35,13 @@ from engine.tests.synth import (
     GREY_147,
     GREY_235,
     RED,
+    RGB,
     WHITE,
     Region,
     full_screen,
     square_wave,
+    square_wave_exact,
+    square_wave_state,
 )
 
 # 1.5 s at 60 fps = 90 frames.  The one-second rate window is 60 frames, so 90 frames contain
@@ -64,41 +71,43 @@ CONTRACT_KEYS = {
 # ---------------------------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------------------------
-def run(regions: Sequence[Region], *, background=BLACK, duration_s: float = DURATION_S, **kwargs):
+def run(regions: Sequence[Region], *, background: RGB = BLACK, duration_s: float = DURATION_S,
+        **kwargs: Any) -> AnalysisResult:
     """Analyse a scene through the public entry point, streaming the frames."""
     frames = synth.scene_frames(background, regions, duration_s)
     return analyze(frames, fps=synth.FPS, viewport=VIEWPORT, **kwargs)
 
 
 def flashing_region(x: int, y: int, w: int, h: int, hz: float = FOUR_HZ,
-                    colour_a=BLACK, colour_b=WHITE) -> Region:
+                    colour_a: RGB = BLACK, colour_b: RGB = WHITE) -> Region:
     """A rectangle toggling between two colours, black <-> white at 4 Hz by default."""
     return Region(x, y, w, h, square_wave(hz, colour_a, colour_b))
 
 
-def violation_types(result) -> list[str]:
+def violation_types(result: AnalysisResult) -> list[str]:
+    """The type ("general" or "red") of every violation, in report order."""
     return [v.type for v in result.violations]
 
 
-def violation_summary(result) -> list[tuple]:
+def violation_summary(result: AnalysisResult) -> list[tuple[int, int, str, int, list[int]]]:
     """Everything about a violation except its window position (used for invariance checks)."""
     return [(v.start, v.end, v.type, v.max_rate_per_sec, list(v.frame_indices)) for v in result.violations]
 
 
 # Two scenes are shared by several tests; analyse each once per module.
 @pytest.fixture(scope="module")
-def four_hz_full_screen():
+def four_hz_full_screen() -> AnalysisResult:
     return run([full_screen(square_wave(FOUR_HZ, BLACK, WHITE))])
 
 
 @pytest.fixture(scope="module")
-def region_26pct_at_origin():
+def region_26pct_at_origin() -> AnalysisResult:
     # 236 x 96 px = 59 x 24 cells = 1416 cells = 26.03% of a 5440-cell window.
     return run([flashing_region(0, 0, 236, 96)])
 
 
 @pytest.fixture(scope="module")
-def static_page():
+def static_page() -> AnalysisResult:
     # Nothing changes, so nothing can flash.  0.5 s (30 frames) is shorter than one rate window.
     return run([full_screen(synth.constant(GREY_127))], duration_s=0.5)
 
@@ -106,7 +115,7 @@ def static_page():
 # ---------------------------------------------------------------------------------------------
 # Fixture self-check: the colour arithmetic documented in synth.py must be true.
 # ---------------------------------------------------------------------------------------------
-def test_fixture_colours_match_their_documented_luminance():
+def test_fixture_colours_match_their_documented_luminance() -> None:
     """The luminance claims in synth.py, re-computed with the WCAG formula (no engine involved)."""
     L = synth.wcag_relative_luminance
     assert L(BLACK) == 0.0
@@ -122,7 +131,7 @@ def test_fixture_colours_match_their_documented_luminance():
 # ---------------------------------------------------------------------------------------------
 # SPEC 5.10 items 1-10
 # ---------------------------------------------------------------------------------------------
-def test_01_four_hz_full_screen_black_white_fails(four_hz_full_screen):
+def test_01_four_hz_full_screen_black_white_fails(four_hz_full_screen: AnalysisResult) -> None:
     """SPEC 5.10 item 1: 4 Hz full-screen square wave (black <-> white) => FAIL, maxRatePerSec == 4."""
     r = four_hz_full_screen
     assert r.verdict == "FAIL"
@@ -145,7 +154,7 @@ def test_01_four_hz_full_screen_black_white_fails(four_hz_full_screen):
     assert "compliant" not in reason.lower()
 
 
-def test_02_three_hz_full_screen_passes():
+def test_02_three_hz_full_screen_passes() -> None:
     """SPEC 5.10 item 2: 3 Hz full-screen square wave => PASS (three per second is not "more than three")."""
     r = run([full_screen(square_wave(THREE_HZ, BLACK, WHITE))])
     assert r.verdict == "PASS"
@@ -158,7 +167,7 @@ def test_02_three_hz_full_screen_passes():
     assert "compliant" not in reason.lower()
 
 
-def test_03_region_covering_20_percent_of_a_window_passes():
+def test_03_region_covering_20_percent_of_a_window_passes() -> None:
     """SPEC 5.10 item 3 (first half): 4 Hz square wave covering 20% of one window => PASS."""
     region = flashing_region(0, 0, 136, 128)  # 34 x 32 cells
     assert region.cells == 1088 and region.cells / WINDOW_CELLS == pytest.approx(0.20)
@@ -170,7 +179,7 @@ def test_03_region_covering_20_percent_of_a_window_passes():
     assert r.frame_stats.general_area_max.max() == pytest.approx(1088 / WINDOW_CELLS)
 
 
-def test_03_region_covering_26_percent_of_a_window_fails(region_26pct_at_origin):
+def test_03_region_covering_26_percent_of_a_window_fails(region_26pct_at_origin: AnalysisResult) -> None:
     """SPEC 5.10 item 3 (second half): 4 Hz square wave covering 26% of one window => FAIL."""
     r = region_26pct_at_origin
     assert r.verdict == "FAIL"
@@ -179,7 +188,7 @@ def test_03_region_covering_26_percent_of_a_window_fails(region_26pct_at_origin)
     assert r.frame_stats.general_area_max.max() == pytest.approx(1416 / WINDOW_CELLS)
 
 
-def test_03_region_covering_exactly_25_percent_passes():
+def test_03_region_covering_exactly_25_percent_passes() -> None:
     """SPEC 5.10 item 3 boundary: "no more than ... 25%" means exactly 25% of a window still passes."""
     region = flashing_region(0, 0, 340, 64)  # 85 x 16 cells: the full window width, a quarter of its height
     assert region.cells == 1360 and 1360 / WINDOW_CELLS == 0.25
@@ -190,7 +199,7 @@ def test_03_region_covering_exactly_25_percent_passes():
     assert r.frame_stats.general_area_max.max() == pytest.approx(0.25)
 
 
-def test_04_luminance_step_of_0_09_passes():
+def test_04_luminance_step_of_0_09_passes() -> None:
     """SPEC 5.10 item 4: Delta L = 0.09 => PASS (no transition, "10% or more" is required)."""
     r = run([full_screen(square_wave(FOUR_HZ, GREY_124, GREY_147))])
     assert r.verdict == "PASS"
@@ -200,7 +209,7 @@ def test_04_luminance_step_of_0_09_passes():
     assert not r.heatmap.any()  # no cell completed a flash of either type
 
 
-def test_05_both_states_above_0_80_pass():
+def test_05_both_states_above_0_80_pass() -> None:
     """SPEC 5.10 item 5: both states above L 0.80 with Delta L >= 0.10 => PASS (darker image not "below 0.80")."""
     r = run([full_screen(square_wave(FOUR_HZ, GREY_235, WHITE))])
     assert r.verdict == "PASS"
@@ -210,7 +219,7 @@ def test_05_both_states_above_0_80_pass():
     assert not r.heatmap.any()
 
 
-def test_06_saturated_red_against_equal_luminance_grey_fails_by_red_rule_only():
+def test_06_saturated_red_against_equal_luminance_grey_fails_by_red_rule_only() -> None:
     """SPEC 5.10 item 6: saturated red toggling at 4 Hz against an equal-luminance grey => FAIL via the red rule, no general violation."""
     r = run([full_screen(square_wave(FOUR_HZ, RED, GREY_127))])
     assert r.verdict == "FAIL"
@@ -237,7 +246,7 @@ def two_halves(gap_px: int) -> list[Region]:
     return [left, right]
 
 
-def test_07_split_region_inside_one_window_fails():
+def test_07_split_region_inside_one_window_fails() -> None:
     """SPEC 5.10 item 7: a region split across two positions that exceeds 25% only when one window contains both parts => FAIL."""
     gap_px = 60
     assert HALF_W + gap_px + HALF_W <= 341   # 292 px: a single 341 px wide window spans both halves
@@ -248,7 +257,7 @@ def test_07_split_region_inside_one_window_fails():
     assert r.frame_stats.general_area_max.max() == pytest.approx(2 * HALF_CELLS / WINDOW_CELLS)
 
 
-def test_07_split_region_in_separate_windows_passes():
+def test_07_split_region_in_separate_windows_passes() -> None:
     """SPEC 5.10 item 7: the same two halves too far apart for any window to contain both => PASS."""
     gap_px = 400
     assert gap_px // synth.CELL_PX > WINDOW_CELLS_X  # a 100-cell gap is wider than the 85-cell window
@@ -261,7 +270,7 @@ def test_07_split_region_in_separate_windows_passes():
     assert int((r.heatmap > 0).sum()) == 2 * HALF_CELLS
 
 
-def test_07_each_half_alone_passes():
+def test_07_each_half_alone_passes() -> None:
     """SPEC 5.10 item 7: each half alone (14.9% of a window) => PASS."""
     r = run([flashing_region(0, 128, HALF_W, HALF_H)])
     assert r.verdict == "PASS"
@@ -269,7 +278,7 @@ def test_07_each_half_alone_passes():
     assert r.violations == []
 
 
-def test_08_translation_invariance(region_26pct_at_origin):
+def test_08_translation_invariance(region_26pct_at_origin: AnalysisResult) -> None:
     """SPEC 5.10 item 8: the same region at two offsets gives identical verdict, counts and area."""
     a = region_26pct_at_origin
     b = run([flashing_region(600, 400, 236, 96)])  # 600 + 236 <= 1024, 400 + 96 <= 768, grid aligned
@@ -287,7 +296,7 @@ def test_08_translation_invariance(region_26pct_at_origin):
     assert np.array_equal(a.heatmap[0:24, 0:59], b.heatmap[100:124, 150:209])
 
 
-def test_09_determinism_same_input_twice_gives_identical_output():
+def test_09_determinism_same_input_twice_gives_identical_output() -> None:
     """SPEC 5.10 item 9: the same input analysed twice yields identical outputs (array equality and identical JSON)."""
 
     def scene() -> list[Region]:
@@ -305,7 +314,7 @@ def test_09_determinism_same_input_twice_gives_identical_output():
     assert first.verdict == second.verdict == "FAIL"
 
 
-def test_10_red_to_dark_red_is_a_general_flash_only_under_wcag22():
+def test_10_red_to_dark_red_is_a_general_flash_only_under_wcag22() -> None:
     """SPEC 5.10 item 10: red <-> dark red (same chromaticity, Delta L >= 0.10) => general flash only, no red flash (wcag22)."""
     r = run([full_screen(square_wave(FOUR_HZ, RED, DARK_RED))], red_rule="wcag22")
     assert r.red_rule == "wcag22"
@@ -318,7 +327,7 @@ def test_10_red_to_dark_red_is_a_general_flash_only_under_wcag22():
     assert violation_types(r) == ["general"]
 
 
-def test_10_red_to_dark_red_counts_as_red_under_the_legacy_rule():
+def test_10_red_to_dark_red_counts_as_red_under_the_legacy_rule() -> None:
     """SPEC 5.10 item 10: the legacy (R-G-B)x320 mode counts red <-> dark red as a red flash (documents the rule difference)."""
     r = run([full_screen(square_wave(FOUR_HZ, RED, DARK_RED))], red_rule="wcag21-legacy")
     assert r.red_rule == "wcag21-legacy"
@@ -331,9 +340,173 @@ def test_10_red_to_dark_red_counts_as_red_under_the_legacy_rule():
 
 
 # ---------------------------------------------------------------------------------------------
+# SPEC 5.10 items 11-14 (added with ADR-019 and ADR-020)
+# ---------------------------------------------------------------------------------------------
+HIGH_RATE_DURATION_S: float = 2.0  # 120 frames at 60 fps: 61 one-second window positions
+
+
+def most_flashes_in_any_second(hz: int, n_frames: int, fps: int = synth.FPS) -> int:
+    """Count, without the engine, the most full black -> white -> black cycles in any fps frames.
+
+    The square wave starts black.  Its state changes are listed frame by frame; every second
+    change ends a full cycle (that is the 1st+2nd, 3rd+4th, ... pairing of SPEC 5.5).  The
+    count is taken over every window start t0 in [0, n_frames - fps], as SPEC 5.7 does.
+    """
+    states = [square_wave_state(i, hz, fps) for i in range(n_frames)]
+    changes = [i for i in range(1, n_frames) if states[i] != states[i - 1]]
+    cycle_ends = changes[1::2]
+    return max(
+        sum(1 for f in cycle_ends if t0 <= f < t0 + fps) for t0 in range(n_frames - fps + 1)
+    )
+
+
+@pytest.mark.parametrize("hz", [15, 20, 24, 30])
+def test_11_high_rate_full_screen_strobes_fail_at_their_frequency(hz: int) -> None:
+    """SPEC 5.10 item 11: full-screen black <-> white at 15, 20, 24 and 30 Hz => FAIL, maxRatePerSec == frequency.
+
+    Near the 60 fps sampling limit flashes complete 2 or 3 frames apart; they must not merge into
+    one event (ADR-019).  At 24 Hz the wave changes state on 4 of every 5 frames, so 2 cycles end
+    in every 5 frames and any 60-frame window holds exactly 24.
+    """
+    n_frames = synth.frame_count(HIGH_RATE_DURATION_S)
+    expected = most_flashes_in_any_second(hz, n_frames)
+    assert expected == hz  # the constructed wave really is hz cycles in every second
+    r = run([full_screen(square_wave_exact(hz, BLACK, WHITE))], duration_s=HIGH_RATE_DURATION_S)
+    assert r.verdict == "FAIL"
+    assert r.general_max_rate == expected
+    assert r.red_max_rate == 0
+    assert violation_types(r) == ["general"]
+    assert r.violations[0].max_rate_per_sec == expected
+
+
+def equal_luminance_grey(colour: RGB) -> RGB:
+    """The grey whose WCAG relative luminance is closest to ``colour``'s (computed, not looked up)."""
+    target = synth.wcag_relative_luminance(colour)
+    level = min(range(256), key=lambda g: abs(synth.wcag_relative_luminance((g, g, g)) - target))
+    return (level, level, level)
+
+
+def uniform_cell_ratios(colours: Sequence[RGB]) -> np.ndarray:
+    """The engine's per-cell redness ratio of each colour, each painted as one uniform 4x4 cell."""
+    frame = np.zeros((synth.CELL_PX, synth.CELL_PX * len(colours), 3), dtype=np.uint8)
+    for i, colour in enumerate(colours):
+        frame[:, i * synth.CELL_PX:(i + 1) * synth.CELL_PX] = colour
+    return cell_signals(frame_to_cells(frame, synth.CELL_PX)).ratio
+
+
+def test_12_exact_0_8_colours_are_saturated_red() -> None:
+    """SPEC 5.10 item 12: R/(R+G+B) exactly 0.8 counts as saturated red (inclusive); (205,52,0) does not."""
+    ratios = uniform_cell_ratios([(204, 51, 0), (16, 4, 0), (205, 52, 0)])
+    assert ratios[0] >= RED_SATURATION_MIN_RATIO   # 204 / 255 = 0.8
+    assert ratios[1] >= RED_SATURATION_MIN_RATIO   # 16 / 20 = 0.8, and R = 16 is not below the floor
+    assert ratios[2] < RED_SATURATION_MIN_RATIO    # 205 / 257 = 0.7977
+
+
+def test_12_every_8_bit_colour_with_ratio_exactly_0_8_is_saturated() -> None:
+    """SPEC 5.10 item 12, exhaustive: every 8-bit colour with R >= 16 and R = 4k, G + B = k measures >= 0.8."""
+    colours = [(4 * k, g, k - g) for k in range(1, 64) for g in range(k + 1) if 4 * k >= RED_MIN_R8]
+    assert len(colours) == sum(k + 1 for k in range(4, 64))  # 2070 colours (k = 4 .. 63)
+    assert all(5 * r == 4 * (r + g + b) for r, g, b in colours)  # exactly 0.8 in whole numbers
+    ratios = uniform_cell_ratios(colours)
+    assert bool((ratios >= RED_SATURATION_MIN_RATIO).all())
+
+
+def test_12_exact_0_8_red_against_equal_luminance_grey_fails_by_red_rule() -> None:
+    """SPEC 5.10 item 12: (204,51,0) <-> an equal-luminance grey at 4 Hz full screen => red flash rate 4."""
+    orange_red: RGB = (204, 51, 0)
+    grey = equal_luminance_grey(orange_red)
+    assert abs(synth.wcag_relative_luminance(orange_red) - synth.wcag_relative_luminance(grey)) < 0.01
+    r = run([full_screen(square_wave(FOUR_HZ, orange_red, grey))])
+    assert r.verdict == "FAIL"
+    assert r.red_max_rate == 4
+    assert r.general_max_rate == 0
+    assert violation_types(r) == ["red"]
+
+
+def test_13_near_black_red_noise_is_not_a_red_flash() -> None:
+    """SPEC 5.10 item 13: rgb(0,0,0) <-> rgb(1,0,0) at 4 Hz full screen => PASS, no red flash (ADR-020)."""
+    r = run([full_screen(square_wave(FOUR_HZ, BLACK, (1, 0, 0)))])
+    assert r.verdict == "PASS"
+    assert r.red_max_rate == 0
+    assert r.general_max_rate == 0
+    assert r.violations == []
+    assert not r.heatmap.any()  # no cell completed a flash of either type
+
+
+SHORT_SIZE: tuple[int, int] = (1024, 100)  # 256 x 25 cells: shorter than the 64-cell-high window
+
+
+def run_short_page(regions: Sequence[Region]) -> AnalysisResult:
+    """Analyse a scene on a 1024x100 page (frames and viewport both 1024x100)."""
+    frames = synth.scene_frames(BLACK, regions, DURATION_S, size=SHORT_SIZE)
+    return analyze(frames, fps=synth.FPS, viewport=SHORT_SIZE)
+
+
+def test_14_short_viewport_measures_area_against_the_full_window() -> None:
+    """SPEC 5.10 item 14: on a 1024x100 viewport a 4 Hz flash of 600 cells (11% of 5440) => PASS (ADR-019)."""
+    region = flashing_region(0, 0, 96, 100)  # 24 x 25 cells
+    assert region.cells == 600
+    r = run_short_page([region])
+    assert r.window_cells == (25, 85)       # the scan is clipped to the 25 cell rows ...
+    assert r.verdict == "PASS"
+    assert r.general_max_rate == 0
+    assert r.frame_stats.general_area_max.max() == 600 / WINDOW_CELLS  # ... the denominator is not
+
+
+def test_14_short_viewport_still_fails_a_large_enough_flash() -> None:
+    """SPEC 5.10 item 14 counterpart: a 340x100 px strip (2125 cells, 39% of 5440) on the same page => FAIL."""
+    region = flashing_region(0, 0, 340, 100)  # 85 x 25 cells
+    r = run_short_page([region])
+    assert r.verdict == "FAIL"
+    assert r.general_max_rate == 4
+    assert r.frame_stats.general_area_max.max() == region.cells / WINDOW_CELLS
+
+
+# ---------------------------------------------------------------------------------------------
+# SPEC 5.10 items 15-16 (proposed with the ADR-018 / ADR-019 amendments)
+# ---------------------------------------------------------------------------------------------
+def test_15_smooth_flash_completing_over_two_frames_is_counted_once() -> None:
+    """Proposed SPEC 5.10 item 15: a smooth 3 Hz pulse whose left half peaks at byte 120 and right half
+    at byte 255 => PASS, maxRatePerSec == 3.
+
+    The two halves reach their extreme byte on neighbouring frames, so each flash keeps more than 25%
+    of a window on three frames in a row.  The ceil(n/2) rule counted that as two events (rate 6);
+    an event now claims its completing frame and the next, so each flash counts once.  110 frames
+    end on a falling run, so no flash is cut short by the end of the capture.
+    """
+    r = analyze(synth.split_pulse_frames(THREE_HZ, 9.52, 110), fps=synth.FPS, viewport=VIEWPORT)
+    first = r.qualifying_general[0]
+    cells = r.frame_stats.general_cells
+    assert cells[first] > 0 and cells[first + 1] > 0   # one flash, completing on two frames ...
+    assert bool((r.frame_stats.general_area_max[first:first + 3] > 0.25).all())  # ... over 25% on three
+    assert r.verdict == "PASS"
+    assert r.general_max_rate == 3
+    assert len(r.qualifying_general) == 5                # peaks at about 19.5, 39.5, ..., 99.5
+
+
+def test_16_sub_tolerance_noise_does_not_scatter_a_flash() -> None:
+    """Proposed SPEC 5.10 item 16: a 4 Hz grey 60 <-> 200 square wave over 1680 cells (30.9% of a
+    window), with +0/+1 byte of noise per cell per frame => FAIL, maxRatePerSec == 4, exactly as clean.
+
+    One byte at grey 60 changes L by far less than the 0.005 reversal tolerance.  When every new
+    extremum moved the stamp, the noise spread one flash's completions over up to 8 frames, no
+    frame reached 25% and the page measured PASS.
+    """
+    region = (40, 40, 168, 160)  # x, y, w, h px: 42 x 40 cells
+    noisy = analyze(synth.noisy_square_region_frames(region, 4, (60, 200), 90, seed=7),
+                    fps=synth.FPS, viewport=VIEWPORT)
+    clean = run([flashing_region(*region, colour_a=(60, 60, 60), colour_b=(200, 200, 200))])
+    assert clean.verdict == "FAIL" and clean.general_max_rate == 4
+    assert noisy.verdict == "FAIL"
+    assert noisy.general_max_rate == 4
+    assert noisy.frame_stats.general_area_max.max() == clean.frame_stats.general_area_max.max()
+    assert clean.frame_stats.general_area_max.max() == 1680 / WINDOW_CELLS
+
+
+# ---------------------------------------------------------------------------------------------
 # Contract extras: a static page, input validation, report shape, heatmap encoding, evidence frames
 # ---------------------------------------------------------------------------------------------
-def test_static_page_passes_with_nothing_flashing(static_page):
+def test_static_page_passes_with_nothing_flashing(static_page: AnalysisResult) -> None:
     """A page that never changes has no transitions, no flashes and a PASS verdict."""
     r = static_page
     assert r.verdict == "PASS"
@@ -343,33 +516,46 @@ def test_static_page_passes_with_nothing_flashing(static_page):
     assert r.frame_count == synth.frame_count(0.5)
 
 
-def test_analyze_rejects_a_single_frame_array():
+def test_analyze_rejects_a_single_frame_array() -> None:
     """analyze() needs at least two frames (SPEC 5.1: T >= 2) and says so with ValueError."""
     with pytest.raises(ValueError):
         analyze(np.zeros((1, synth.VIEWPORT_H, synth.VIEWPORT_W, 3), dtype=np.uint8), fps=synth.FPS)
 
 
-def test_analyze_rejects_a_single_frame_iterable():
+def test_analyze_rejects_a_single_frame_iterable() -> None:
     """The same two-frame minimum applies when frames arrive as a generator."""
     one_frame = synth.scene_frames(BLACK, [], duration_s=1 / synth.FPS)
     with pytest.raises(ValueError):
         analyze(one_frame, fps=synth.FPS)
 
 
-def test_analyze_rejects_float_frames():
+def test_analyze_rejects_float_frames() -> None:
     """Frames must be uint8 sRGB; a float array is refused rather than silently rescaled."""
     with pytest.raises(ValueError):
         analyze(np.zeros((2, synth.VIEWPORT_H, synth.VIEWPORT_W, 3), dtype=np.float32), fps=synth.FPS)
 
 
-def test_analyze_rejects_an_unknown_red_rule():
+def test_analyze_rejects_an_unknown_red_rule() -> None:
     """Only "wcag22" and "wcag21-legacy" exist (ADR-001)."""
     with pytest.raises(ValueError):
         analyze(np.zeros((2, synth.VIEWPORT_H, synth.VIEWPORT_W, 3), dtype=np.uint8),
                 fps=synth.FPS, red_rule="wcag20")
 
 
-def test_to_dict_has_the_contract_keys_and_is_json_safe(four_hz_full_screen):
+def test_analyze_rejects_a_frame_width_that_differs_from_the_viewport() -> None:
+    """SPEC 5.1: frames are at device scale factor 1, so a 512 px wide frame cannot be a 1024 px viewport."""
+    with pytest.raises(ValueError, match="viewport width"):
+        analyze(np.zeros((2, 384, 512, 3), dtype=np.uint8), fps=synth.FPS, viewport=VIEWPORT)
+
+
+def test_analyze_accepts_a_viewport_matching_the_frame_width() -> None:
+    """SPEC 5.1: the same frames pass validation when the viewport says 512 px wide."""
+    r = analyze(np.zeros((2, 384, 512, 3), dtype=np.uint8), fps=synth.FPS, viewport=(512, 384))
+    assert r.verdict == "PASS"
+    assert r.viewport == (512, 384)
+
+
+def test_to_dict_has_the_contract_keys_and_is_json_safe(four_hz_full_screen: AnalysisResult) -> None:
     """to_dict() of the item-1 result carries every contract key with JSON-safe values."""
     r = four_hz_full_screen
     d = r.to_dict()
@@ -396,7 +582,7 @@ def test_to_dict_has_the_contract_keys_and_is_json_safe(four_hz_full_screen):
     assert (d["heatmap"]["w"], d["heatmap"]["h"]) == (GRID[1], GRID[0])
 
 
-def test_heatmap_base64_decodes_to_a_uint16_grid_of_flash_counts(four_hz_full_screen):
+def test_heatmap_base64_decodes_to_a_uint16_grid_of_flash_counts(four_hz_full_screen: AnalysisResult) -> None:
     """heatmap.data is little-endian uint16, row-major, h rows by w columns; the whole screen flashed."""
     r = four_hz_full_screen
     h = r.to_dict()["heatmap"]
@@ -409,7 +595,7 @@ def test_heatmap_base64_decodes_to_a_uint16_grid_of_flash_counts(four_hz_full_sc
     assert int(decoded.min()) >= 4  # at least four completed flashes per cell in 1.5 s at 4 Hz
 
 
-def test_evidence_frame_indices_are_sorted_unique_and_in_range(four_hz_full_screen):
+def test_evidence_frame_indices_are_sorted_unique_and_in_range(four_hz_full_screen: AnalysisResult) -> None:
     """evidence_frame_indices() is deterministic, starts at frame 0, is sorted, unique, in range and capped."""
     r = four_hz_full_screen
     idx = evidence_frame_indices(r, max_frames=6)
@@ -422,6 +608,19 @@ def test_evidence_frame_indices_are_sorted_unique_and_in_range(four_hz_full_scre
     assert len(evidence_frame_indices(r, max_frames=2)) <= 2
 
 
-def test_evidence_frame_indices_for_a_pass_is_frame_zero(static_page):
+def test_evidence_frames_show_the_two_states_of_the_flash(four_hz_full_screen: AnalysisResult) -> None:
+    """ADR-019: the first event frame is the completing frame, so it and the frame before it differ."""
+    r = four_hz_full_screen
+    first_event = r.violations[0].frame_indices[0]
+    idx = evidence_frame_indices(r)
+    assert first_event - 1 in idx and first_event in idx
+    wave = square_wave(FOUR_HZ, BLACK, WHITE)
+    before = wave((first_event - 1) / synth.FPS)
+    after = wave(first_event / synth.FPS)
+    assert before != after                      # the stills show a change, not the same state twice
+    assert int(r.frame_stats.general_cells[first_event]) == GRID[0] * GRID[1]  # every cell completed here
+
+
+def test_evidence_frame_indices_for_a_pass_is_frame_zero(static_page: AnalysisResult) -> None:
     """With no violations the only evidence frame is frame 0."""
     assert evidence_frame_indices(static_page) == [0]

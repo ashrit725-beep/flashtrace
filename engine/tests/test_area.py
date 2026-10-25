@@ -1,12 +1,20 @@
-"""Black-box unit tests for engine/area.py (SPEC T4, SPEC 5.6, ADR-006).
+"""Black-box unit tests for engine/area.py and the window sizes in engine/cells.py
+(SPEC T4, SPEC 5.6, ADR-006, ADR-007, ADR-019).
 
 The window scoring is checked against a deliberately naive brute force
 (nested loops over every window position) so the integral-image shortcut is
 proven equal to the obvious definition.  The qualifying-event tests use the
 real 1024x768 grid (256x192 cells) and the real 341x256 px window (85x64
 cells = 5440 cells, so 25% is exactly 1360 cells).
+
+Event rule under test (SPEC 5.6, ADR-019): E[t] = M[t-1] | M[t] is scored for
+area_max; an event counted at frame t claims the completions of frames t and
+t+1, and a later frame is scored again using only the completions no earlier
+event has claimed.
 """
 from __future__ import annotations
+
+import math
 
 import numpy as np
 import pytest
@@ -16,10 +24,14 @@ from hypothesis import strategies as st
 from engine.area import (
     AreaResult,
     best_window,
+    count_events,
     integral_image,
     qualifying_events,
+    unclaimed_share,
+    union_with_previous_frames,
     window_sums,
 )
+from engine.cells import window_cells, window_cells_full, window_px
 from engine.constants import EVENT_FRAME_TOLERANCE, MAX_AREA_FRACTION
 
 _PROPERTY = settings(deadline=None, derandomize=True, max_examples=40, database=None)
@@ -201,22 +213,22 @@ def test_property_best_window_equals_brute_force(case: tuple[np.ndarray, int, in
 
 
 def test_constants_used_by_this_module() -> None:
-    """SPEC T4 / ADR-006: the area limit is 25% and the event tolerance is one frame."""
+    """SPEC T4 / ADR-019: the area limit is 25% and the event tolerance is one frame."""
     assert MAX_AREA_FRACTION == 0.25
     assert EVENT_FRAME_TOLERANCE == 1
 
 
 def test_small_grid_hand_example() -> None:
-    """SPEC T4 on a 4x4 grid with a 4x4 window: 4 cells (25%) do not qualify, 5 cells (31%) do."""
+    """SPEC T4 on a 4x4 grid with a 4x4 window: 4 cells (25%) do not qualify, 4 + 5 cells (56%) do."""
     masks = np.zeros((2, 4, 4), dtype=bool)
     masks[0, 0, :4] = True          # 4 of 16 cells = 0.25 exactly
     masks[1, 1, :4] = True
     masks[1, 2, 0] = True           # 5 of 16 cells = 0.3125
     res = qualifying_events(masks, 4, 4)
-    # E[0] = M[0] | M[1] = 9 cells; E[1] = M[1] = 5 cells.
-    assert res.area_max.tolist() == [9 / 16, 5 / 16]
-    assert res.qualifying_raw.tolist() == [True, True]
-    assert res.qualifying.tolist() == [True, False]
+    # E[0] = M[0] = 4 cells (nothing before frame 0); E[1] = M[0] | M[1] = 9 cells.
+    assert res.area_max.tolist() == [4 / 16, 9 / 16]
+    assert res.qualifying_raw.tolist() == [False, True]
+    assert res.qualifying.tolist() == [False, True]
     res_single = qualifying_events(masks[:1], 4, 4)
     assert res_single.area_max.tolist() == [4 / 16]
     assert res_single.qualifying_raw.tolist() == [False]
@@ -228,37 +240,37 @@ def test_exactly_25_percent_does_not_qualify() -> None:
     masks[1] = _region(QUARTER)
     res = qualifying_events(masks, WY, WX)
     assert isinstance(res, AreaResult)
+    assert res.area_max[0] == 0.0
     assert res.area_max[1] == 0.25
-    assert res.area_max[0] == 0.25  # E[0] = M[0] | M[1] sees the same 1360 cells
-    assert res.area_max[2] == 0.0
+    assert res.area_max[2] == 0.25  # E[2] = M[1] | M[2] still sees the same 1360 cells
     assert not res.qualifying_raw.any()
     assert not res.qualifying.any()
 
 
 def test_one_cell_over_25_percent_qualifies() -> None:
-    """ADR-006: 'strict > 25%' - 1361 cells (0.25018 of the window) qualify."""
+    """ADR-006: 'strict > 25%' - 1361 cells (0.25018 of the window) qualify, counted once at their frame."""
     masks = _frames(3)
     masks[1] = _region(QUARTER + 1)
     res = qualifying_events(masks, WY, WX)
     assert res.area_max[1] == pytest.approx((QUARTER + 1) / WINDOW_CELLS, abs=1e-12)
-    assert res.qualifying_raw.tolist() == [True, True, False]
-    assert res.qualifying.tolist() == [True, False, False]
+    assert res.qualifying_raw.tolist() == [False, True, True]
+    assert res.qualifying.tolist() == [False, True, False]
 
 
 def test_two_frame_union_merges_a_region_split_across_adjacent_frames() -> None:
-    """SPEC 5.6 step 1: E[t] = M[t] | M[t+1] - 700 cells at t plus 700 at t+1 qualify at t only."""
+    """SPEC 5.6 step 1: E[t] = M[t-1] | M[t] - 700 cells at t plus 700 at t+1 qualify at t+1 only."""
     masks = _frames(5)
     masks[2] = _region(700, 0, 0)
     masks[3] = _region(700, 0, 40)
     res = qualifying_events(masks, WY, WX)
-    assert res.area_max[2] == pytest.approx(1400 / WINDOW_CELLS, abs=1e-12)
-    assert res.area_max[1] == pytest.approx(700 / WINDOW_CELLS, abs=1e-12)  # E[1] = M[2]
-    assert res.area_max[3] == pytest.approx(700 / WINDOW_CELLS, abs=1e-12)  # E[3] = M[3]
+    assert res.area_max[3] == pytest.approx(1400 / WINDOW_CELLS, abs=1e-12)
+    assert res.area_max[2] == pytest.approx(700 / WINDOW_CELLS, abs=1e-12)  # E[2] = M[2]
+    assert res.area_max[4] == pytest.approx(700 / WINDOW_CELLS, abs=1e-12)  # E[4] = M[3]
     assert res.area_max[0] == 0.0
-    assert res.area_max[4] == 0.0
-    assert res.qualifying_raw.tolist() == [False, False, True, False, False]
-    assert res.qualifying.tolist() == [False, False, True, False, False]
-    assert (int(res.window_y[2]), int(res.window_x[2])) == (0, 0)
+    assert res.area_max[1] == 0.0
+    assert res.qualifying_raw.tolist() == [False, False, False, True, False]
+    assert res.qualifying.tolist() == [False, False, False, True, False]
+    assert (int(res.window_y[3]), int(res.window_x[3])) == (0, 0)
 
 
 def test_each_half_alone_does_not_qualify() -> None:
@@ -270,48 +282,141 @@ def test_each_half_alone_does_not_qualify() -> None:
     assert not res.qualifying_raw.any()
 
 
-def test_consecutive_qualifying_frames_count_once() -> None:
-    """ADR-006 leading edge: 1400 cells present at frames 0, 1, 2 are one event, counted at frame 0."""
+def test_single_completion_is_exactly_one_event_at_its_frame() -> None:
+    """SPEC 5.6 / ADR-019: one flash completing at frame t qualifies on t and t+1 and is ONE event, at t."""
+    masks = _frames(8)
+    masks[3] = _region(1400)
+    res = qualifying_events(masks, WY, WX)
+    assert np.flatnonzero(res.qualifying_raw).tolist() == [3, 4]
+    assert np.flatnonzero(res.qualifying).tolist() == [3]
+
+
+def test_completions_two_frames_apart_are_one_event_each() -> None:
+    """ADR-019: completions at 3, 5, 7, 9 keep every frame 3..10 qualifying, and each completion is an event."""
+    masks = _frames(12)
+    for t in (3, 5, 7, 9):
+        masks[t] = _region(1400)
+    res = qualifying_events(masks, WY, WX)
+    assert np.flatnonzero(res.qualifying_raw).tolist() == list(range(3, 11))
+    assert np.flatnonzero(res.qualifying).tolist() == [3, 5, 7, 9]
+
+
+def test_same_cells_completing_on_frames_0_1_2_give_events_at_0_and_2() -> None:
+    """SPEC 5.6 step 4: the event at 0 claims frames 0 and 1; frame 2's completions are unclaimed, so they
+    are a second event.  Frame 3 sees only claimed frame 2 and empty frame 3."""
     masks = _frames(5)
     masks[0:3] = _region(1400)
     res = qualifying_events(masks, WY, WX)
-    assert res.qualifying_raw.tolist() == [True, True, True, False, False]
-    assert res.qualifying.tolist() == [True, False, False, False, False]
-    assert int(res.qualifying.sum()) == 1
+    assert res.qualifying_raw.tolist() == [True, True, True, True, False]
+    assert res.qualifying.tolist() == [True, False, True, False, False]
 
 
-def test_leading_edge_lands_one_frame_before_the_first_mask_frame() -> None:
-    """SPEC 5.6: E[t] includes M[t+1], so an event first present in M[3] qualifies from frame 2."""
+@pytest.mark.parametrize("n_frames", [1, 2, 3, 4, 5, 8, 59])
+def test_count_events_for_the_same_cells_completing_on_consecutive_frames(n_frames: int) -> None:
+    """SPEC 5.6 step 4: each event claims two frames, so the same region completing on n frames in a row
+    from frame 4 is counted at 4, 6, 8, ... - ceil(n/2) events."""
+    masks = _frames(70)
+    masks[4 : 4 + n_frames] = _region(1400)
+    events = qualifying_events(masks, WY, WX).qualifying
+    assert np.flatnonzero(events).tolist() == list(range(4, 4 + n_frames, 2))
+    assert int(events.sum()) == math.ceil(n_frames / 2)
+
+
+def test_count_events_with_zero_tolerance_counts_every_qualifying_frame() -> None:
+    """SPEC 5.6 parameter: with tolerance 0 an event claims only its own frame, so every frame whose own
+    completions qualify is an event."""
+    masks = _frames(6)
+    for t in (1, 2, 3, 5):
+        masks[t] = _region(1400)
+    raw = np.array([False, True, True, True, False, True])
+    events = count_events(masks, raw, 0, (WY, WX), WINDOW_CELLS)
+    assert events.tolist() == raw.tolist()
+
+
+def test_one_flash_completing_over_two_neighbouring_frames_is_one_event() -> None:
+    """ADR-019 as amended: a smooth flash whose cells reach their extreme byte one frame apart completes
+    1400 cells at frame 3 and 1400 other cells at frame 4.  Frames 3, 4 and 5 all exceed 25%, but it is
+    one flash: counted once, at 3 (the old ceil(n/2) rule counted it twice, at 3 and 5)."""
     masks = _frames(8)
-    masks[3:6] = _region(1400)
+    masks[3] = _region(1400, 0, 0)
+    masks[4] = _region(1400, 0, 40)
     res = qualifying_events(masks, WY, WX)
-    assert np.flatnonzero(res.qualifying_raw).tolist() == [2, 3, 4, 5]
+    assert np.flatnonzero(res.qualifying_raw).tolist() == [3, 4, 5]
+    assert np.flatnonzero(res.qualifying).tolist() == [3]
+
+
+def test_claimed_completions_are_not_scored_again() -> None:
+    """SPEC 5.6 step 4: frame 5 sees frame 4 (claimed by the event at 3) and 700 new cells; only the 700
+    count, which is not enough.  Frame 6 adds 700 more unclaimed cells: 1400, a new event."""
+    masks = _frames(9)
+    masks[3] = _region(1400, 0, 0)
+    masks[4] = _region(1400, 0, 40)
+    masks[5] = _region(700, 0, 80)
+    masks[6] = _region(700, 0, 120)
+    res = qualifying_events(masks, WY, WX)
+    assert bool(res.qualifying_raw[5])  # all of E[5] = M[4] | M[5] is 2100 cells
+    assert np.flatnonzero(res.qualifying).tolist() == [3, 6]
+
+
+def test_two_regions_qualifying_on_consecutive_frames_count_once() -> None:
+    """ADR-019 as amended, the recorded trade-off: two separate regions, each over 25% on its own, that
+    complete one frame apart are counted as one event, as under ADR-006."""
+    masks = _frames(6)
+    masks[2] = _region(1400, 0, 0)
+    masks[3] = _region(1400, 100, 150)
+    res = qualifying_events(masks, WY, WX)
     assert np.flatnonzero(res.qualifying).tolist() == [2]
 
 
+def test_unclaimed_share_skips_claimed_frames() -> None:
+    """SPEC 5.6 step 4: the share at frame 4 counts frame 3's cells only while frame 3 is unclaimed."""
+    masks = _frames(5)
+    masks[3] = _region(700, 0, 0)
+    masks[4] = _region(700, 0, 40)
+    free = np.zeros(5, dtype=bool)
+    claimed = free.copy()
+    claimed[3] = True
+    assert unclaimed_share(masks, 4, free, 1, (WY, WX), WINDOW_CELLS) == 1400 / WINDOW_CELLS
+    assert unclaimed_share(masks, 4, claimed, 1, (WY, WX), WINDOW_CELLS) == 700 / WINDOW_CELLS
+
+
+def test_union_looks_backwards_only() -> None:
+    """SPEC 5.6 step 1: E[t] = M[t-1] | M[t]; frame 0 has nothing before it (M[-1] = empty)."""
+    masks = np.zeros((4, 1, 3), dtype=bool)
+    masks[0, 0, 0] = True
+    masks[2, 0, 2] = True
+    events = union_with_previous_frames(masks, 1)
+    assert events[:, 0, :].tolist() == [
+        [True, False, False],   # E[0] = M[0]
+        [True, False, False],   # E[1] = M[0] | M[1]
+        [False, False, True],   # E[2] = M[1] | M[2]
+        [False, False, True],   # E[3] = M[2] | M[3]
+    ]
+
+
 def test_two_events_15_frames_apart_count_twice() -> None:
-    """ADR-006: separate events are each counted at their own leading edge."""
+    """ADR-019: separate events are each counted at their own completing frame."""
     masks = _frames(30)
     masks[10] = _region(1400)
     masks[25] = _region(1400)
     res = qualifying_events(masks, WY, WX)
-    assert np.flatnonzero(res.qualifying_raw).tolist() == [9, 10, 24, 25]
-    assert np.flatnonzero(res.qualifying).tolist() == [9, 24]
+    assert np.flatnonzero(res.qualifying_raw).tolist() == [10, 11, 25, 26]
+    assert np.flatnonzero(res.qualifying).tolist() == [10, 25]
     assert int(res.qualifying.sum()) == 2
 
 
-def test_last_frame_event_is_scored_with_an_empty_m_t() -> None:
-    """SPEC 5.6: 'M[T] = empty', so an event in the last frame is scored from M[T-1] alone."""
+def test_last_frame_event_is_counted_at_the_last_frame() -> None:
+    """SPEC 5.6: an event completing in the last frame has a 1-frame run and is still counted there."""
     masks = _frames(4)
     masks[3] = _region(1400)
     res = qualifying_events(masks, WY, WX)
     assert res.area_max[3] == pytest.approx(1400 / WINDOW_CELLS, abs=1e-12)
-    assert res.qualifying_raw.tolist() == [False, False, True, True]
-    assert res.qualifying.tolist() == [False, False, True, False]
+    assert res.qualifying_raw.tolist() == [False, False, False, True]
+    assert res.qualifying.tolist() == [False, False, False, True]
 
 
-def test_single_frame_input_is_its_own_leading_edge() -> None:
-    """SPEC 5.6: with T = 1 there is neither a t+1 nor a t-1; the frame still gets scored."""
+def test_single_frame_input_is_scored() -> None:
+    """SPEC 5.6: with T = 1 there is no frame before it (M[-1] = empty); the frame still gets scored."""
     masks = _frames(1)
     masks[0] = _region(1400)
     res = qualifying_events(masks, WY, WX)
@@ -364,12 +469,13 @@ def test_region_in_the_bottom_right_corner_is_found() -> None:
 
 
 def test_tolerance_frames_zero_disables_the_union() -> None:
-    """SPEC 5.6 step 1 parameter: with tolerance_frames=0, E[t] = M[t], so the split region fails."""
+    """SPEC 5.6 step 1 parameter: with tolerance_frames=0, E[t] = M[t], so the split region does not qualify."""
     masks = _frames(5)
     masks[2] = _region(700, 0, 0)
     masks[3] = _region(700, 0, 40)
     res = qualifying_events(masks, WY, WX, tolerance_frames=0)
     assert res.area_max[2] == pytest.approx(700 / WINDOW_CELLS, abs=1e-12)
+    assert res.area_max[3] == pytest.approx(700 / WINDOW_CELLS, abs=1e-12)
     assert not res.qualifying_raw.any()
 
 
@@ -378,5 +484,49 @@ def test_max_fraction_parameter_is_respected() -> None:
     masks = _frames(3)
     masks[1] = _region(QUARTER)
     res = qualifying_events(masks, WY, WX, max_fraction=0.2)
-    assert res.qualifying_raw.tolist() == [True, True, False]
-    assert res.qualifying.tolist() == [True, False, False]
+    assert res.qualifying_raw.tolist() == [False, True, True]
+    assert res.qualifying.tolist() == [False, True, False]
+
+
+# ---------------------------------------------------------------------------
+# Full-window denominator and window sizes (SPEC 5.6, ADR-007, ADR-019)
+# ---------------------------------------------------------------------------
+
+
+def test_clipped_window_still_divides_by_the_full_window() -> None:
+    """ADR-019: on a 25-row grid the scan uses 25x85 cells but 600 cells are 600/5440 of the field, not 600/2125."""
+    masks = np.zeros((2, 25, 256), dtype=bool)
+    masks[0, :, :24] = True  # 25 x 24 = 600 cells
+    res = qualifying_events(masks, 25, 85, full_window_cells=WINDOW_CELLS)
+    assert res.area_max[0] == 600 / WINDOW_CELLS
+    assert not res.qualifying_raw.any()
+    clipped = qualifying_events(masks, 25, 85)  # the old, clipped denominator would call it 28%
+    assert clipped.area_max[0] == 600 / (25 * 85)
+    assert bool(clipped.qualifying_raw[0])
+
+
+def test_full_window_smaller_than_the_scan_is_rejected() -> None:
+    """A denominator below the scanned window could push the fraction above 1, so it is refused."""
+    with pytest.raises(ValueError):
+        qualifying_events(_frames(1), WY, WX, full_window_cells=WINDOW_CELLS - 1)
+
+
+def test_window_sizes_at_the_reference_viewport() -> None:
+    """SPEC section 4: 341x256 px at 1024 wide is 85x64 cells (341/4 = 85.25 -> 85, 256/4 = 64)."""
+    assert window_px(1024) == (341, 256)
+    assert window_cells_full(1024) == (WY, WX)
+    assert window_cells(1024, CY, CX) == (WY, WX)
+
+
+def test_short_viewport_clamps_the_scan_but_not_the_full_window() -> None:
+    """ADR-019: a 1024x100 viewport has 25 cell rows; the scan is 25x85, the full window stays 64x85."""
+    assert window_cells(1024, 25, 256) == (25, 85)
+    assert window_cells_full(1024) == (64, 85)
+
+
+def test_window_sizes_round_halves_up() -> None:
+    """SPEC 5.6: 'rounding halves up' - at 1032 px wide 256*1032/1024/4 = 64.5 -> 65 (round() would give 64)."""
+    assert 256 * 1032 / 1024 / 4 == 64.5
+    assert window_cells_full(1032)[0] == 65
+    # 256 * 1026 / 1024 = 256.5 px -> 257 px.
+    assert window_px(1026)[1] == 257

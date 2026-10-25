@@ -1,15 +1,27 @@
-"""Byte-level sniffers for animated images, exercised with hand-built files (no browser)."""
+"""Byte-level sniffers for animated images, exercised with hand-built files (no browser), and the rules
+for where image bytes may be read from (a stand-in page object replaces the browser)."""
 
 from __future__ import annotations
 
 import struct
 import zlib
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+from urllib.parse import quote, quote_from_bytes
 
+import pytest
+
+from capture import detect
 from capture.detect import (
+    GIF_SNIFF_LIMIT,
     SNIFF_LIMIT,
+    find_uncontrollable,
+    gif_needs_more_bytes,
     is_animated_gif,
     is_animated_png,
     is_animated_webp,
+    local_reads_allowed,
     sniff_animated_image,
 )
 
@@ -150,9 +162,9 @@ def test_sniff_labels() -> None:
     assert sniff_animated_image(b"\xff\xd8\xff\xe0JFIF") is None  # JPEG: never animated
 
 
-def test_only_the_head_is_inspected() -> None:
-    # A second frame that starts beyond SNIFF_LIMIT is out of reach by design (documented limitation);
-    # the function must still return cleanly rather than scan the whole blob.
+def test_unknown_bytes_after_a_large_frame_end_the_walk() -> None:
+    # One oversized frame followed by bytes that are no GIF block: the walk stops cleanly ("still")
+    # instead of guessing, and does not ask for more bytes.
     huge_pixels = b"\x01" * 200
     body = GIF_HEADER + GIF_GLOBAL_TABLE
     while len(body) < SNIFF_LIMIT + 1000:
@@ -160,4 +172,154 @@ def test_only_the_head_is_inspected() -> None:
         body += bytes([len(huge_pixels)]) + huge_pixels + b"\x00"
         break  # one oversized frame only
     body += b"\xff" * (SNIFF_LIMIT + 1000 - len(body))
-    assert isinstance(is_animated_gif(body), bool)
+    assert is_animated_gif(body) is False
+    assert gif_needs_more_bytes(body[:SNIFF_LIMIT], SNIFF_LIMIT) is False
+
+
+# ----------------------------------------------------------------------------- large GIFs (4 MB rule)
+def build_play_once_gif_with_large_first_frame() -> bytes:
+    """Two frames, no NETSCAPE2.0 block (play once); the first frame's data runs past 64 KB."""
+    body = GIF_HEADER + GIF_GLOBAL_TABLE + GIF_GRAPHIC_CONTROL
+    body += b"\x2C" + struct.pack("<HHHH", 0, 0, 1, 1) + b"\x00" + b"\x02"  # descriptor + LZW code size
+    while len(body) < SNIFF_LIMIT + 1000:
+        body += b"\xff" + b"\x01" * 255  # full 255-byte data sub-blocks
+    body += b"\x00"  # end of the first frame's data
+    return body + GIF_GRAPHIC_CONTROL + gif_frame() + GIF_TRAILER
+
+
+def test_play_once_gif_with_second_frame_after_64_kb_is_animated() -> None:
+    gif = build_play_once_gif_with_large_first_frame()
+    assert b"NETSCAPE2.0" not in gif
+    assert gif.rindex(b"\x2C") > SNIFF_LIMIT  # the second image descriptor lies beyond 64 KB
+    assert is_animated_gif(gif[:SNIFF_LIMIT]) is False  # the old 64 KB view could not tell
+    assert gif_needs_more_bytes(gif[:SNIFF_LIMIT], SNIFF_LIMIT) is True
+    assert is_animated_gif(gif) is True
+    assert len(gif) < GIF_SNIFF_LIMIT
+
+
+def test_short_truncated_file_does_not_ask_for_more_bytes() -> None:
+    # Fewer bytes than the limit means the file ended: reading further cannot help.
+    gif = build_play_once_gif_with_large_first_frame()[:1000]
+    assert gif_needs_more_bytes(gif, SNIFF_LIMIT) is False
+
+
+# ----------------------------------------------------------------------------- data: URLs
+def test_percent_encoded_data_url_keeps_bytes_above_0x7f() -> None:
+    gif = build_gif(frames=2)
+    assert max(gif) >= 0x80  # the global colour table flag byte and the white entry
+    url = "data:image/gif," + quote_from_bytes(gif)
+    head = detect._read_image_head(None, url, SNIFF_LIMIT, local_ok=False)
+    assert head == gif
+    assert sniff_animated_image(head) == "animated-gif"
+
+
+def test_base64_data_url_still_decodes() -> None:
+    import base64
+
+    gif = build_gif(frames=2)
+    url = "data:image/gif;base64," + base64.b64encode(gif).decode("ascii").rstrip("=")
+    assert detect._read_image_head(None, url, SNIFF_LIMIT, local_ok=False) == gif
+
+
+@pytest.mark.parametrize(
+    "make_url",
+    [
+        # ";base64" in any letter case: browsers accept it (WHATWG data: URL processing).
+        lambda b64: "data:image/gif;BASE64," + b64,
+        lambda b64: "data:image/gif ; Base64 ," + b64,
+        # Base64 that went through encodeURIComponent: '+', '/' and '=' arrive as %2B, %2F and %3D.
+        lambda b64: "data:image/gif;base64," + quote(b64, safe=""),
+        # Line breaks inside the base64 text are ignored.
+        lambda b64: "data:image/gif;base64," + b64[:20] + "\n" + b64[20:],
+    ],
+    ids=["upper-case", "spaced-mixed-case", "percent-encoded", "line-break"],
+)
+def test_base64_data_url_is_read_the_way_a_browser_reads_it(make_url: Callable[[str], str]) -> None:
+    import base64
+
+    gif = build_gif(frames=2, netscape=True) + b"\xfb\xff"  # bytes that give '+' and '/' in base64
+    b64 = base64.b64encode(gif).decode("ascii")
+    assert "+" in b64 or "/" in b64
+    head = detect._read_image_head(None, make_url(b64), SNIFF_LIMIT, local_ok=False)
+    assert head == gif
+    assert sniff_animated_image(head) == "animated-gif"
+
+
+class _FailingRequest:
+    """A page.request whose every fetch fails, as for a server that never answers."""
+
+    def get(self, *_args: object, **_kwargs: object) -> None:
+        raise TimeoutError("no answer")
+
+
+def test_unreadable_image_counts_as_unverified() -> None:
+    """Bytes that cannot be read could be an animation: the image is uncontrollable, not still."""
+    page = StandInPage("https://example.test/page.html", ["https://example.test/slow.gif"])
+    page.request_object = _FailingRequest()
+    uncontrollable, notes = find_uncontrollable(page, allow_local_files=False)
+    assert uncontrollable == ["image-unverified: https://example.test/slow.gif"]
+    assert notes == ["could not read image bytes to check for animation: https://example.test/slow.gif"]
+
+
+# ----------------------------------------------------------------------------- where bytes may come from
+class StandInPage:
+    """Replaces a Playwright page: a fixed URL and a fixed scan result. Any network use fails the test."""
+
+    def __init__(self, url: str, image_urls: list[str]) -> None:
+        self.url = url
+        self.request_object: Any = None  # a test may plug in a stand-in for page.request
+        self._scan = {
+            "images": [{"raw": u, "resolved": u, "kind": "img", "selector": "img"} for u in image_urls],
+            "webglCanvases": [],
+            "offscreenCanvases": [],
+            "crossOriginFrames": [],
+            "videos": 0,
+            "shadowRoots": 0,
+        }
+
+    def evaluate(self, _script: str) -> dict[str, Any]:
+        return self._scan
+
+    @property
+    def request(self) -> Any:
+        if self.request_object is None:
+            raise AssertionError("no network request expected")
+        return self.request_object
+
+
+def test_local_reads_need_a_local_page_and_permission() -> None:
+    assert local_reads_allowed("file:///tmp/page.html", True) is True
+    assert local_reads_allowed("file:///tmp/page.html", False) is False
+    assert local_reads_allowed("https://example.test/", True) is False
+    assert local_reads_allowed("http://localhost:8000/", True) is False
+
+
+@pytest.mark.parametrize(
+    ("page_url", "allow"),
+    [("https://example.test/page.html", True), ("file:///tmp/page.html", False)],
+)
+def test_file_image_is_never_touched_without_local_permission(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, page_url: str, allow: bool
+) -> None:
+    gif_path = tmp_path / "anim.gif"
+    gif_path.write_bytes(build_gif(frames=2))
+
+    def forbidden(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("the local file system must not be touched")
+
+    # Neither a read nor an existence check may happen (patched only for the duration of the scan).
+    with monkeypatch.context() as patch:
+        patch.setattr(detect, "_read_local_file", forbidden)
+        patch.setattr(Path, "is_file", forbidden)
+        patch.setattr(Path, "exists", forbidden)
+        uncontrollable, notes = find_uncontrollable(StandInPage(page_url, [gif_path.as_uri()]), allow)
+    assert uncontrollable == []
+    assert any(note.startswith("animation check skipped for a local image URL") for note in notes), notes
+
+
+def test_local_page_with_permission_reads_a_large_gif_up_to_4_mb(tmp_path: Path) -> None:
+    gif_path = tmp_path / "big.gif"
+    gif_path.write_bytes(build_play_once_gif_with_large_first_frame())
+    page = StandInPage((tmp_path / "page.html").as_uri(), [gif_path.as_uri()])
+    uncontrollable, notes = find_uncontrollable(page, allow_local_files=True)
+    assert uncontrollable == [f"animated-gif: {gif_path.as_uri()}"], notes

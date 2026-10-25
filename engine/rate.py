@@ -122,10 +122,11 @@ def find_advisories(
 def timeline(
     events_general: np.ndarray, events_red: np.ndarray, fps: int
 ) -> list[tuple[float, int, int]]:
-    """Qualifying events per whole second -> [(t_seconds, general, red)].
+    """Qualifying events per second -> [(t_seconds, general, red)].
 
-    Bin k covers frames [k*fps, (k+1)*fps); a final partial second is included
-    so no event is left out of the picture.
+    Bin k covers frames [k*fps, (k+1)*fps).  A final partial second gets its
+    own bin with its raw count, so no event is left out and the bins add up
+    to the totals (ADR-021).
     """
     fps = _check_fps(fps)
     general = _as_events(events_general)

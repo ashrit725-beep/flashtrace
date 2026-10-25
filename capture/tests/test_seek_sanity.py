@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from playwright.sync_api import Browser
 
 from capture import capture
 
@@ -32,7 +33,7 @@ def expected_state(t_seconds: float) -> str:
 
 
 @pytest.mark.browser
-def test_css_keyframes_seek_matches_frame_time(pages_dir: Path, tmp_path: Path, browser) -> None:
+def test_css_keyframes_seek_matches_frame_time(pages_dir: Path, tmp_path: Path, browser: Browser) -> None:
     result = capture(
         str(pages_dir / "css_keyframes.html"),
         duration_s=1,
@@ -67,7 +68,7 @@ def test_css_keyframes_seek_matches_frame_time(pages_dir: Path, tmp_path: Path, 
 
 
 @pytest.mark.browser
-def test_every_frame_follows_the_square_wave(pages_dir: Path, tmp_path: Path, browser) -> None:
+def test_every_frame_follows_the_square_wave(pages_dir: Path, tmp_path: Path, browser: Browser) -> None:
     """Stronger version of the spot check: the full 60-frame state sequence has exactly the expected
     transitions (allowing each transition to land one frame early or late)."""
     result = capture(str(pages_dir / "css_keyframes.html"), duration_s=1, fps=FPS, out_dir=tmp_path, browser=browser)

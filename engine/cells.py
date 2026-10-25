@@ -2,17 +2,20 @@
 
 Why cells at all: WCAG thresholds are about regions of the screen, not single
 pixels, and a 1024x768 frame has 786 432 pixels.  Averaging each 4x4 block
-into one colour gives 49 152 cells, which is cheap to track over hundreds of
-frames and still fine enough to measure the 25 % area rule precisely.
+into one colour gives 49 152 cells, a sixteenth of the numbers to track over
+hundreds of frames, and still fine enough to measure the 25 % area rule
+precisely.
 
 The average is taken in linear light (ADR-002): luminance is linear in light,
 so a cell's L is exactly the mean of its pixels' L, which is what the
-threshold is about.  Averaging the encoded bytes instead would be wrong by up
-to several percent.
+threshold is about.  Averaging the encoded bytes instead would be badly
+wrong: a half-black, half-white cell would measure L = 0.214 (the byte
+average 127.5, linearised) instead of 0.500.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -48,8 +51,8 @@ def frame_to_cells(frame_u8: np.ndarray, cell_px: int = CELL_PX) -> np.ndarray:
     # table.  3. Add up the cell_px pixel rows of every cell row (the image
     # becomes cells_y rows of full-width sums), then add up the cell_px pixel
     # columns of every cell.  4. Divide once by the number of pixels per cell.
-    # Rows first then columns is 3-4x faster than one combined reduction and
-    # is still a fixed operation order, so the result is reproducible bit for bit.
+    # Rows first then columns avoids one big 4-D reduction and keeps a fixed
+    # operation order, so the result is reproducible bit for bit.
     cropped = frame[: cells_y * cell_px, : cells_x * cell_px, :]
     linear = srgb8_to_linear(cropped)
     row_sums = linear.reshape(cells_y, cell_px, cells_x * cell_px, 3).sum(axis=1)
@@ -66,28 +69,43 @@ def _window_scale(viewport_width: int) -> float:
     return viewport_width / REFERENCE_VIEWPORT[0]
 
 
+def _round_half_up(value: float) -> int:
+    """Nearest whole number, halves rounded up (85.5 -> 86), unlike Python's round()."""
+    return int(math.floor(value + 0.5))
+
+
 def window_px(viewport_width: int) -> tuple[int, int]:
     """The 10-degree window in CSS px for this viewport width: (w_px, h_px)."""
     scale = _window_scale(viewport_width)
     # WCAG 2.2 glossary Note 1: "a 341 x 256 pixel rectangle"
-    return int(round(WINDOW_PX[0] * scale)), int(round(WINDOW_PX[1] * scale))
+    return _round_half_up(WINDOW_PX[0] * scale), _round_half_up(WINDOW_PX[1] * scale)
+
+
+def window_cells_full(viewport_width: int, cell_px: int = CELL_PX) -> tuple[int, int]:
+    """The whole window measured in cells, (wy, wx), NOT clamped to the grid.
+
+    For 1024 px wide: 256/4 = 64 rows, 341/4 = 85.25 -> 85 columns, so
+    5 440 cells (ADR-006 records that this is 0.3 % smaller than 341x256 px).
+    This is the area denominator: WCAG's 25 % is an absolute area, so it does
+    not shrink when the viewport is too short to hold the window (ADR-019).
+    """
+    scale = _window_scale(viewport_width)
+    wy = _round_half_up(WINDOW_PX[1] * scale / cell_px)
+    wx = _round_half_up(WINDOW_PX[0] * scale / cell_px)
+    # A window is never smaller than one cell.
+    return max(wy, 1), max(wx, 1)
 
 
 def window_cells(
     viewport_width: int, cells_y: int, cells_x: int, cell_px: int = CELL_PX
 ) -> tuple[int, int]:
-    """The same window measured in cells, (wy, wx), clamped to the grid.
+    """The window that is slid over the grid, (wy, wx): the full window clamped to the grid.
 
-    For 1024 px wide: 256/4 = 64 rows, 341/4 = 85.25 -> 85 columns (ADR-006
-    records that this makes the window 0.3 % smaller than 341x256 px).
+    On a viewport shorter (or narrower) than the window the scan uses the
+    part that fits; the area fraction still divides by window_cells_full().
     """
-    scale = _window_scale(viewport_width)
-    wy = int(round(WINDOW_PX[1] * scale / cell_px))
-    wx = int(round(WINDOW_PX[0] * scale / cell_px))
-    # A window can never be smaller than one cell or larger than the grid.
-    wy = min(max(wy, 1), cells_y)
-    wx = min(max(wx, 1), cells_x)
-    return wy, wx
+    wy, wx = window_cells_full(viewport_width, cell_px)
+    return min(wy, cells_y), min(wx, cells_x)
 
 
 @dataclass
@@ -99,10 +117,10 @@ class CellSignals:
     """
 
     L: np.ndarray      # relative luminance (general flash signal)
-    ratio: np.ndarray  # R / (R + G + B) on encoded components (saturated-red test)
+    ratio: np.ndarray  # R8 / (R8 + G8 + B8) on whole 0..255 encoded values (saturated-red test)
     u: np.ndarray      # CIE 1976 u' (red flash, WCAG 2.2 rule)
     v: np.ndarray      # CIE 1976 v'
-    rv: np.ndarray     # legacy red value max(0, R - G - B) x 320 (comparison mode)
+    rv: np.ndarray     # legacy red value max(0, R8 - G8 - B8) / 255 x 320 (comparison mode)
 
 
 def cell_signals(cells_rgb: np.ndarray) -> CellSignals:

@@ -1,4 +1,4 @@
-"""Black-box unit tests for engine/color.py (SPEC T1, SPEC 5.3, ADR-003, ADR-011).
+"""Black-box unit tests for engine/color.py (SPEC T1, SPEC 5.3, ADR-003, ADR-011, ADR-020).
 
 Every expected number here was derived by hand or brute force from the W3C
 formulas quoted verbatim in docs/SPEC.md sections 3.4 and 3.6; nothing was read
@@ -20,17 +20,27 @@ from engine.color import (
     linear_to_srgb,
     redness_ratio,
     relative_luminance,
+    srgb8_from_linear,
     srgb8_to_linear,
     uv_chromaticity,
     xyz_from_linear,
 )
-from engine.constants import D65_UV
+from engine.constants import (
+    D65_UV,
+    LEGACY_RED_MIN_DELTA,
+    LEGACY_RED_VALUE_SCALE,
+    RED_MIN_R8,
+    RED_SATURATION_MIN_RATIO,
+)
 
 # Hypothesis settings: small, deterministic, no wall-clock deadline (SPEC 5: no randomness).
 _PROPERTY = settings(deadline=None, derandomize=True, max_examples=40, database=None)
 
-# sRGB red in CIE 1976 UCS, computed by hand from the SPEC 5.3 matrix (also quoted in ADR-011).
-_RED_UV = (0.4507, 0.5229)
+# sRGB red in CIE 1976 UCS from the SPEC 5.3 matrix: X = 0.4124, Y = 0.2126, Z = 0.0193, so
+# u' = 4X / (X + 15Y + 3Z) = 1.6496 / 3.6593 = 0.45080 and v' = 9Y / 3.6593 = 0.52289.
+# Written to 4 decimals, so the tests compare with a tolerance of 5e-5.
+_RED_UV = (0.4508, 0.5229)
+_UV_TOL = 5e-5
 
 
 def _rgb8(r: int, g: int, b: int) -> np.ndarray:
@@ -125,11 +135,27 @@ def test_linear_to_srgb_inverts_the_lut_for_all_256_codes() -> None:
 
 
 def test_linear_to_srgb_is_not_rounded_to_8_bit() -> None:
-    """SPEC 5.3: ratio uses the re-encoded value as a float, not snapped to a 0-255 code."""
+    """linear_to_srgb is the plain inverse formula; the rounding to 0-255 lives in srgb8_from_linear."""
     value = linear_to_srgb(np.array([0.5]))[0]
     assert value == pytest.approx(1.055 * 0.5 ** (1 / 2.4) - 0.055, abs=1e-12)
     # 0.7354 is not on the k/255 grid, so a rounded implementation would fail here.
     assert abs(value * 255 - round(value * 255)) > 1e-3
+
+
+def test_srgb8_from_linear_gives_back_every_byte_exactly() -> None:
+    """SPEC 5.3 / ADR-020: re-encoding a uniform cell gives back its whole 0-255 value, for all 256 codes."""
+    np.testing.assert_array_equal(srgb8_from_linear(SRGB8_TO_LINEAR), np.arange(256, dtype=np.float64))
+
+
+def test_srgb8_from_linear_rounds_halves_up() -> None:
+    """SPEC 5.3: whole values are floor(x + 0.5), so 2.5 -> 3 and 4.5 -> 5 (Python's round() gives 2 and 4)."""
+    halves = np.array([0.5, 2.5, 4.5])
+    # In the linear branch (x 12.92) these encode back to exactly k + 0.5; checked first so the test proves
+    # the rounding direction and not a floating-point accident.
+    linear = halves / 255.0 / 12.92
+    assert (linear_to_srgb(linear) * 255.0).tolist() == halves.tolist()
+    cells = np.repeat(linear[:, None], 3, axis=1)
+    assert srgb8_from_linear(cells)[:, 0].tolist() == [1.0, 3.0, 5.0]
 
 
 def test_linear_to_srgb_cutoff_branches() -> None:
@@ -240,8 +266,8 @@ def test_uv_of_red() -> None:
     """SPEC 3.6: u' = 4X/(X+15Y+3Z), v' = 9Y/(...) gives (0.4508, 0.5229) for sRGB red."""
     uv = uv_chromaticity(_lin(255, 0, 0))
     assert uv.shape == (2,)
-    assert uv[0] == pytest.approx(_RED_UV[0], abs=0.002)
-    assert uv[1] == pytest.approx(_RED_UV[1], abs=0.002)
+    assert uv[0] == pytest.approx(_RED_UV[0], abs=_UV_TOL)
+    assert uv[1] == pytest.approx(_RED_UV[1], abs=_UV_TOL)
 
 
 def test_uv_of_black_is_the_d65_constant() -> None:
@@ -251,11 +277,18 @@ def test_uv_of_black_is_the_d65_constant() -> None:
     assert uv[1] == D65_UV[1]
 
 
-def test_uv_of_white_is_near_d65() -> None:
-    """ADR-011: D65 (0.1978, 0.4683) was computed from the same matrix, so white lands on it."""
-    uv = uv_chromaticity(_lin(255, 255, 255))
-    assert uv[0] == pytest.approx(D65_UV[0], abs=0.001)
-    assert uv[1] == pytest.approx(D65_UV[1], abs=0.001)
+def test_d65_constant_is_computed_from_the_matrix() -> None:
+    """ADR-011: D65 is (0.1978, 0.4683) to four decimals; white computed from the matrix gives it bit for bit."""
+    assert D65_UV[0] == pytest.approx(0.1978, abs=_UV_TOL)
+    assert D65_UV[1] == pytest.approx(0.4683, abs=_UV_TOL)
+    np.testing.assert_array_equal(uv_chromaticity(_lin(255, 255, 255)), np.array(D65_UV))
+
+
+def test_black_and_white_have_the_same_chromaticity() -> None:
+    """ADR-011: black counts as colourless exactly like white, so their (u', v') distance is 0, not 5e-5."""
+    black = uv_chromaticity(_lin(0, 0, 0))
+    white = uv_chromaticity(_lin(255, 255, 255))
+    assert math.hypot(*(black - white)) == 0.0
 
 
 def test_uv_is_independent_of_intensity() -> None:
@@ -277,8 +310,8 @@ def test_uv_black_guard_is_elementwise() -> None:
     rgb = np.stack([_lin(0, 0, 0), _lin(255, 0, 0)])
     uv = uv_chromaticity(rgb)
     np.testing.assert_array_equal(uv[0], np.array(D65_UV, dtype=np.float64))
-    assert uv[1, 0] == pytest.approx(_RED_UV[0], abs=0.002)
-    assert uv[1, 1] == pytest.approx(_RED_UV[1], abs=0.002)
+    assert uv[1, 0] == pytest.approx(_RED_UV[0], abs=_UV_TOL)
+    assert uv[1, 1] == pytest.approx(_RED_UV[1], abs=_UV_TOL)
 
 
 def test_red_to_black_uv_distance_exceeds_0_2_but_red_to_orange_does_not() -> None:
@@ -306,22 +339,52 @@ def test_uv_is_always_finite(rgb: list[float]) -> None:
 
 
 def test_redness_ratio_of_pure_red_is_one() -> None:
-    """SPEC T3 / ADR-003: R/(R+G+B) on encoded components is 255/255 = 1.0 for pure red."""
-    assert redness_ratio(_lin(255, 0, 0)) == pytest.approx(1.0, abs=1e-9)
+    """SPEC T3 / ADR-003: R8/(R8+G8+B8) is 255/255 = 1.0 exactly for pure red."""
+    assert redness_ratio(_lin(255, 0, 0)) == 1.0
 
 
 def test_redness_ratio_255_64_0_is_not_saturated() -> None:
     """SPEC T3: 255/(255+64) = 0.7994 is below the 0.8 saturation line."""
     ratio = redness_ratio(_lin(255, 64, 0))
-    assert ratio == pytest.approx(255 / 319, abs=1e-9)
+    assert ratio == 255 / 319
     assert ratio < 0.8
 
 
 def test_redness_ratio_255_63_0_is_saturated() -> None:
     """SPEC T3: 255/(255+63) = 0.8019 is 'greater than or equal to 0.8'."""
     ratio = redness_ratio(_lin(255, 63, 0))
-    assert ratio == pytest.approx(255 / 318, abs=1e-9)
+    assert ratio == 255 / 318
     assert ratio >= 0.8
+
+
+@pytest.mark.parametrize("rgb", [(204, 51, 0), (16, 4, 0), (240, 30, 30), (136, 4, 30), (12, 3, 0)])
+def test_redness_ratio_exactly_0_8_is_exactly_0_8(rgb: tuple[int, int, int]) -> None:
+    """ADR-020: on whole 0-255 values R/(R+G+B) = 4k/5k is exactly 0.8 (not 0.7999999999999999).
+
+    (12, 3, 0) is the one exception: R = 12 is below RED_MIN_R8, so its ratio is 0 (ADR-020).
+    """
+    expected = 0.0 if rgb[0] < RED_MIN_R8 else 0.8
+    assert redness_ratio(_lin(*rgb)) == expected
+
+
+def test_redness_ratio_205_52_0_is_not_saturated() -> None:
+    """SPEC 5.10 item 12: 205/257 = 0.7977 is below 0.8."""
+    assert redness_ratio(_lin(205, 52, 0)) == 205 / 257
+    assert redness_ratio(_lin(205, 52, 0)) < RED_SATURATION_MIN_RATIO
+
+
+def test_reds_darker_than_16_have_ratio_zero() -> None:
+    """ADR-020: R8 = 1..15 has no visible hue, so the ratio is 0; R8 = 16 is the first red that counts."""
+    dark = np.stack([_lin(r, 0, 0) for r in range(1, 16)])
+    assert not redness_ratio(dark).any()
+    assert redness_ratio(_lin(16, 0, 0)) == 1.0
+
+
+def test_red_floor_is_the_smallest_red_the_legacy_rule_could_count() -> None:
+    """ADR-020: 16 is the smallest R8 with R8/255 x 320 > 20, the pre-2022 'greater than 20' against black."""
+    assert RED_MIN_R8 == 16
+    assert RED_MIN_R8 / 255 * LEGACY_RED_VALUE_SCALE > LEGACY_RED_MIN_DELTA
+    assert (RED_MIN_R8 - 1) / 255 * LEGACY_RED_VALUE_SCALE <= LEGACY_RED_MIN_DELTA
 
 
 def test_redness_ratio_of_black_is_zero() -> None:
@@ -331,7 +394,7 @@ def test_redness_ratio_of_black_is_zero() -> None:
 
 def test_redness_ratio_of_white_is_one_third() -> None:
     """ADR-003: equal encoded channels give R/(R+G+B) = 1/3."""
-    assert redness_ratio(_lin(255, 255, 255)) == pytest.approx(1 / 3, abs=1e-9)
+    assert redness_ratio(_lin(255, 255, 255)) == 1 / 3
 
 
 def test_redness_ratio_uses_encoded_not_linear_components() -> None:
@@ -362,13 +425,18 @@ def test_redness_ratio_stays_inside_unit_interval(rgb: list[float]) -> None:
 
 
 def test_legacy_red_value_of_pure_red_is_320() -> None:
-    """ADR-001 legacy rule: (R-G-B) x 320 on 0..1 encoded components gives 320 for pure red."""
-    assert legacy_red_value(_lin(255, 0, 0)) == pytest.approx(320.0, abs=1e-6)
+    """ADR-001 legacy rule: (R-G-B) x 320 gives 255/255 x 320 = 320 exactly for pure red."""
+    assert legacy_red_value(_lin(255, 0, 0)) == 320.0
 
 
 def test_legacy_red_value_of_half_red() -> None:
-    """ADR-001 legacy rule: (128/255 - 0 - 0) x 320 = 160.63."""
-    assert legacy_red_value(_lin(128, 0, 0)) == pytest.approx(128 / 255 * 320, abs=1e-6)
+    """ADR-001 / ADR-020 legacy rule: (128 - 0 - 0) / 255 x 320 = 160.63, computed on whole 0-255 values."""
+    assert legacy_red_value(_lin(128, 0, 0)) == 128 / 255 * 320
+
+
+def test_legacy_red_value_uses_whole_values() -> None:
+    """ADR-020: (200, 50, 30) gives (200 - 50 - 30) / 255 x 320 exactly."""
+    assert legacy_red_value(_lin(200, 50, 30)) == 120 / 255 * 320
 
 
 def test_legacy_red_value_of_yellow_is_zero() -> None:
@@ -394,3 +462,22 @@ def test_legacy_red_value_stays_between_0_and_320(rgb: list[float]) -> None:
     """ADR-001 legacy rule: clipped at 0 below and bounded by 1 x 320 above."""
     rv = float(legacy_red_value(np.array(rgb, dtype=np.float64)))
     assert 0.0 <= rv <= 320.0 + 1e-9
+
+
+# ---------------------------------------------------------------------------
+# Linear-light cell averaging (ADR-002, the engine/cells.py module docstring)
+# ---------------------------------------------------------------------------
+
+
+def test_half_black_half_white_cell_is_l_0_5_not_the_byte_average() -> None:
+    """ADR-002: a 4x4 cell of 8 white and 8 black pixels measures L = 0.500, while linearising the
+    byte average 127.5 would give 0.214 - the figure the engine/cells.py docstring quotes."""
+    from engine.cells import cell_signals, frame_to_cells
+
+    frame = np.zeros((4, 4, 3), dtype=np.uint8)
+    frame[:2] = 255  # two rows of white over two rows of black
+    assert cell_signals(frame_to_cells(frame)).L.tolist() == [0.5]
+    # WCAG 2.2 glossary: "R = ((RsRGB+0.055)/1.055) ^ 2.4" with RsRGB = 127.5/255 = 0.5, and the
+    # three luminance coefficients add up to 1 for a grey.
+    byte_average_l = ((0.5 + 0.055) / 1.055) ** 2.4
+    assert byte_average_l == pytest.approx(0.214, abs=5e-4)

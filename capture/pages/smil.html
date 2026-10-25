@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>FlashTrace synthetic page: SVG SMIL</title>
+<!--
+  Synthetic capture test page (deliberately flashing; only ever opened by FlashTrace's own tests).
+  One SVG rect, 400x300 CSS px at (100,100) (centre (300,250), the probe pixel of the other synthetic
+  pages), whose fill toggles black/white at 4 Hz with an SVG SMIL <animate>: calcMode="discrete" with
+  two values over 0.25 s holds #000 for 0-125 ms and #fff for 125-250 ms. SMIL is not a Web Animations
+  object and ignores Playwright's fake clock, so strategy A must pause the <svg> timeline and set it
+  with setCurrentTime every frame (ADR-022).
+-->
+<style>
+  html, body { margin: 0; padding: 0; background: #fff; width: 100%; height: 100%; overflow: hidden; }
+  svg { position: absolute; left: 0; top: 0; }
+</style>
+</head>
+<body>
+  <svg width="1024" height="768" viewBox="0 0 1024 768">
+    <rect x="100" y="100" width="400" height="300" fill="#000">
+      <animate attributeName="fill" values="#000;#fff" dur="0.25s" calcMode="discrete" repeatCount="indefinite"/>
+    </rect>
+  </svg>
+</body>
+</html>

@@ -60,17 +60,17 @@ def _brute_window_counts(events: np.ndarray, fps: int) -> list[int]:
     return [int(events[t0 : t0 + fps].sum()) for t0 in range(n_frames - fps + 1)]
 
 
-def _violations(result: list) -> list[tuple[int, int, int]]:
+def _violations(result: list[tuple[int, int, int]]) -> list[tuple[int, int, int]]:
     """Normalise violations to plain Python ints."""
     return [(int(start), int(end), int(count)) for start, end, count in result]
 
 
-def _advisories(result: list) -> list[tuple[int, int, float]]:
+def _advisories(result: list[tuple[int, int, float]]) -> list[tuple[int, int, float]]:
     """Normalise advisories to plain Python numbers."""
     return [(int(start), int(end), float(rate)) for start, end, rate in result]
 
 
-def _timeline(result: list) -> list[tuple[float, int, int]]:
+def _timeline(result: list[tuple[float, int, int]]) -> list[tuple[float, int, int]]:
     """Normalise timeline bins to plain Python numbers."""
     return [(float(t), int(general), int(red)) for t, general, red in result]
 
@@ -167,7 +167,8 @@ def test_two_separated_bursts_are_two_violations() -> None:
 
 
 def test_violation_end_is_clipped_to_the_last_frame() -> None:
-    """SPEC 5.7: end = last t0 + fps - 1 'clipped to T-1' - a 30-frame capture ends at 29."""
+    """SPEC 5.7: when T < fps 'the single window is the whole capture', so end = T-1 rather than
+    last t0 + fps - 1 (rate.py clips the end to the capture) - a 30-frame capture ends at 29."""
     events = _events(30, [0, 5, 10, 15])
     assert _violations(find_violations(events, FPS)) == [(0, 29, 4)]
 
@@ -300,7 +301,7 @@ def test_advisory_entries_have_int_bounds_and_float_rate() -> None:
 
 
 def test_timeline_bins_including_a_partial_last_second() -> None:
-    """SPEC 5.8: one bin per second k over [k*fps, (k+1)*fps); a trailing partial second still gets a bin."""
+    """SPEC 5.8 / ADR-021: one bin per second k over [k*fps, (k+1)*fps); a trailing partial second gets its own bin."""
     general = _events(150, [0, 59, 60, 119, 120, 149])
     red = _events(150, [30, 130])
     assert _timeline(timeline(general, red, FPS)) == [(0.0, 2, 1), (1.0, 2, 0), (2.0, 2, 1)]

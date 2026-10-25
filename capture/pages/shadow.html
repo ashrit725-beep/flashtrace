@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>FlashTrace synthetic page: shadow DOM</title>
+<!--
+  Synthetic capture test page (deliberately flashing; only ever opened by FlashTrace's own tests).
+  Two boxes, each 400x300 CSS px, each the only content of a shadow root, each toggling black/white at
+  4 Hz with a CSS steps(1, end) animation (period 250 ms: black for 0-125 ms, white for 125-250 ms),
+  the same contract as #box in css_keyframes.html:
+    * #open-host  at (100,100), centre (300,250): an OPEN shadow root;
+    * #closed-host at (100,420), centre (300,570): a CLOSED shadow root, unreachable from its host.
+  document.getAnimations() returns neither animation (it does not look inside shadow roots), so
+  strategy A must find them through the roots recorded by its attachShadow init script (ADR-022).
+-->
+<style>
+  html, body { margin: 0; padding: 0; background: #fff; width: 100%; height: 100%; overflow: hidden; }
+  #open-host   { position: absolute; left: 100px; top: 100px; width: 400px; height: 300px; }
+  #closed-host { position: absolute; left: 100px; top: 420px; width: 400px; height: 300px; }
+</style>
+</head>
+<body>
+  <div id="open-host"></div>
+  <div id="closed-host"></div>
+  <script>
+    // The same markup goes into both roots: a scoped stylesheet with the keyframes, and the box.
+    const boxMarkup = `
+      <style>
+        :host { display: block; }
+        .box { width: 400px; height: 300px; background-color: #000;
+               animation: ft-blink 250ms steps(1, end) infinite; }
+        @keyframes ft-blink { 0% { background-color: #000; } 50% { background-color: #fff; } 100% { background-color: #000; } }
+      </style>
+      <div class="box"></div>`;
+    document.getElementById('open-host').attachShadow({ mode: 'open' }).innerHTML = boxMarkup;
+    const closedRoot = document.getElementById('closed-host').attachShadow({ mode: 'closed' });
+    closedRoot.innerHTML = boxMarkup;
+  </script>
+</body>
+</html>

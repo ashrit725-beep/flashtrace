@@ -24,6 +24,12 @@ from capture.hashing import frame_hash
 # progress(frames_done, frames_total); called once per stored frame.
 ProgressCallback = Callable[[int, int], None]
 
+#: Real milliseconds between the two screenshots of the double-shot check (SPEC 6.2, ADR-022). The
+#: virtual clocks stand still during the wait, so only content that animates on the real clock can
+#: change. 100 ms is longer than one frame of any animation faster than 10 Hz, so such content changes
+#: between the two pictures instead of slipping through by luck.
+DOUBLE_SHOT_REAL_GAP_MS = 100
+
 
 @dataclass(frozen=True)
 class CaptureSettings:
@@ -38,6 +44,10 @@ class CaptureSettings:
     #: True when the caller named this strategy explicitly (no fall-through will follow), so a strategy
     #: that knows it cannot promise determinism may still capture for inspection instead of giving up.
     forced: bool = False
+    #: Whether local files may be read: the page itself and, for a local page, its images (detect.py).
+    allow_local_files: bool = True
+    #: Ablation (ADR-013): CSS selectors of the elements whose animations must not be driven.
+    suppress_selectors: tuple[str, ...] = ()
 
     @property
     def frame_count(self) -> int:
@@ -91,11 +101,14 @@ def take_screenshot(page: Page) -> bytes:
 
 
 def double_shot_matches(page: Page, reference_hash: str) -> bool:
-    """Take a second screenshot now and report whether it is pixel-identical to ``reference_hash``.
+    """Wait ``DOUBLE_SHOT_REAL_GAP_MS`` of real time, take a second screenshot and report whether it is
+    pixel-identical to ``reference_hash``.
 
     SPEC 6.2 double-shot check: nothing on the page may change between two screenshots taken at the
     same virtual time. If something does, it is animating on a clock the strategy does not control.
+    ``page.wait_for_timeout`` waits in the Playwright driver, not with the page's (frozen) timers.
     """
+    page.wait_for_timeout(DOUBLE_SHOT_REAL_GAP_MS)
     return FrameSink.hash_png(take_screenshot(page)) == reference_hash
 
 
@@ -122,6 +135,9 @@ class CaptureStrategy(ABC):
     #: Extra Chromium command-line switches the strategy needs. When non-empty, ``capturer`` launches a
     #: dedicated browser with them for this attempt and leaves the caller's browser untouched.
     launch_args: ClassVar[tuple[str, ...]] = ()
+    #: True when the strategy re-applies an ablation's suppression on every frame (strategy A). The
+    #: others apply it once, before frame 0 (``capturer``), which the capture notes say.
+    reapplies_suppression: ClassVar[bool] = False
 
     def needs_launch_args(self, browser: Browser) -> bool:
         """Whether this attempt should run in a dedicated browser launched with ``launch_args``.

@@ -1,21 +1,23 @@
-"""Black-box unit tests for engine/transitions.py (SPEC T2, T3, 5.4, 5.5, ADR-004, ADR-005).
+"""Black-box unit tests for engine/transitions.py (SPEC T2, T3, 5.4, 5.5, ADR-004, ADR-005, ADR-018).
 
 Signals are hand-made per-cell time series.  Each expected (frame, sign) list
 was traced by hand through the run-tracking semantics in SPEC 5.4: a run is a
-monotone stretch between adjacent extrema, plateaus and sub-tolerance wobbles
-never end a run, and a transition is timestamped at the frame where the run
-reached its extremum.
+monotone stretch between adjacent extrema, plateaus and reversals no larger
+than the reversal tolerance never end a run, and a transition is timestamped
+at the first frame where the run reached its extremum (ADR-018).
 """
 from __future__ import annotations
 
+import inspect
+
 import numpy as np
-import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from engine.constants import RUN_REVERSAL_TOLERANCE
+from engine.constants import D65_UV, RUN_REVERSAL_TOLERANCE
 from engine.transitions import (
     FlashPairer,
+    Rule,
     RunTracker,
     Transition,
     detect_transitions_1d,
@@ -27,17 +29,19 @@ from engine.transitions import (
 
 _PROPERTY = settings(deadline=None, derandomize=True, max_examples=40, database=None)
 
-# Chromaticities used by the red-rule tests (ADR-011): sRGB red and the D65 white point.
-_RED_UV = (0.4507, 0.5229)
-_D65_UV = (0.1978, 0.4683)
+# Chromaticities used by the red-rule tests (ADR-011): sRGB red (0.45080, 0.52289 from the SPEC 5.3
+# matrix, written to 4 decimals as in test_color.py) and the D65 white point the engine computes.
+_RED_UV = (0.4508, 0.5229)
+_D65_UV = D65_UV
+_TOL_L = RUN_REVERSAL_TOLERANCE["L"]
 
 
-def _t(result: list) -> list[tuple[int, int]]:
+def _t(result: list[tuple[int, int]]) -> list[tuple[int, int]]:
     """Normalise a (frame, sign) list to plain Python ints for exact comparison."""
     return [(int(frame), int(sign)) for frame, sign in result]
 
 
-def _f(result: list) -> list[int]:
+def _f(result: list[int]) -> list[int]:
     """Normalise a frame list to plain Python ints."""
     return [int(frame) for frame in result]
 
@@ -47,7 +51,7 @@ def _uv_aux(u: list[float], v: list[float]) -> dict[str, np.ndarray]:
     return {"u": np.asarray(u, dtype=np.float64), "v": np.asarray(v, dtype=np.float64)}
 
 
-def _run_tracker(signals: np.ndarray, rule=general_rule, tolerance: float = 0.005,
+def _run_tracker(signals: np.ndarray, rule: Rule = general_rule, tolerance: float = _TOL_L,
                  aux: dict[str, np.ndarray] | None = None) -> list[list[tuple[int, int]]]:
     """Drive RunTracker over signals[T, N] and return per-cell (frame, sign) lists."""
     n_frames, n_cells = signals.shape
@@ -106,8 +110,14 @@ def test_two_frame_step_is_one_rise_at_frame_one() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Monotone runs, plateaus, wobbles (SPEC 5.4, ADR-004)
+# Monotone runs, plateaus, wobbles (SPEC 5.4, ADR-004, ADR-018)
 # ---------------------------------------------------------------------------
+
+
+def test_plateau_is_stamped_at_its_first_frame() -> None:
+    """ADR-018 (1): a transition is stamped at the FIRST frame showing the new state, not the last plateau frame."""
+    signal = np.array([0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0])
+    assert _t(detect_transitions_1d(signal)) == [(1, 1), (4, -1), (7, 1)]
 
 
 def _ramp_plateau_ramp() -> np.ndarray:
@@ -127,7 +137,7 @@ def test_plateau_inside_a_ramp_does_not_split_it() -> None:
 
 
 def test_sub_tolerance_wobble_does_not_split_a_ramp() -> None:
-    """SPEC 5.4 / RUN_REVERSAL_TOLERANCE: a 0.002 dip (< 0.005) is a plateau, so the ramp is one rise."""
+    """SPEC 5.4 / ADR-018 (2): a 0.002 dip (< 0.005) is a plateau, so the ramp is one rise."""
     signal = np.array([0.0, 0.05, 0.10, 0.15, 0.20, 0.198, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50])
     assert _t(detect_transitions_1d(signal)) == [(11, 1)]
 
@@ -141,7 +151,7 @@ def test_wobble_above_tolerance_splits_a_ramp_into_two_rises() -> None:
 
 
 def test_tolerance_parameter_decides_whether_a_wobble_splits() -> None:
-    """RUN_REVERSAL_TOLERANCE: the same 0.008 dip splits at tolerance 0.005 and is ignored at 0.01."""
+    """ADR-018 (2): the same 0.008 dip splits at tolerance 0.005 and is ignored at 0.01."""
     signal = np.array([0.0, 0.2, 0.192, 0.5, 0.0])
     assert _t(detect_transitions_1d(signal, tolerance=0.005)) == [(1, 1), (3, 1), (4, -1)]
     assert _t(detect_transitions_1d(signal, tolerance=0.01)) == [(3, 1), (4, -1)]
@@ -153,10 +163,83 @@ def test_open_run_at_the_end_is_evaluated_by_finish() -> None:
 
 
 def test_default_tolerance_matches_the_constant() -> None:
-    """RUN_REVERSAL_TOLERANCE['L'] is 0.005: a 0.004 dip is ignored by the helper's default."""
-    assert RUN_REVERSAL_TOLERANCE["L"] == 0.005
+    """ADR-018: RUN_REVERSAL_TOLERANCE['L'] is 0.005 and the 1-D helpers take their default from it."""
+    assert RUN_REVERSAL_TOLERANCE == {"L": 0.005, "ratio": 0.005, "rv": 1.0}
+    for helper in (detect_transitions_1d, flash_frames_1d):
+        assert inspect.signature(helper).parameters["tolerance"].default == RUN_REVERSAL_TOLERANCE["L"]
     signal = np.array([0.0, 0.3, 0.296, 0.6, 0.0])
     assert _t(detect_transitions_1d(signal)) == [(3, 1), (4, -1)]
+
+
+# ---------------------------------------------------------------------------
+# Where the stamp sits: noise on a plateau versus a smooth approach (SPEC 5.4, ADR-018)
+# ---------------------------------------------------------------------------
+
+
+def test_sub_tolerance_noise_on_a_plateau_does_not_move_the_stamp() -> None:
+    """ADR-018 (1): the change finished at frame 8; a 0.003 bump at frame 11 (< 0.005) is noise on the
+    plateau, so the rise stays stamped at 8 (the literal 'first frame of the extremum' gave 11)."""
+    signal = np.array([0.2] * 8 + [0.5, 0.5, 0.5, 0.503, 0.5, 0.5, 0.5] + [0.2] * 8)
+    assert _t(detect_transitions_1d(signal)) == [(8, 1), (15, -1)]
+
+
+def test_sub_tolerance_noise_on_a_falling_plateau_does_not_move_the_stamp() -> None:
+    """The mirror image: a 0.003 dip at frame 5 on the dark plateau leaves the fall stamped at 3."""
+    signal = np.array([0.8, 0.8, 0.8, 0.1, 0.1, 0.097, 0.1, 0.1, 0.8])
+    assert _t(detect_transitions_1d(signal)) == [(3, -1), (8, 1)]
+
+
+def test_smooth_approach_is_followed_to_its_extremum() -> None:
+    """ADR-018 (1): a fade into black keeps falling by less than 0.005 per frame near the end
+    (0.004 -> 0.001 -> 0.0); the signal has not settled, so the stamp follows it to frame 8, the
+    first frame at 0.0.  Ignoring every sub-tolerance gain would stop at frame 6, earlier for a
+    dimmer cell than for a brighter one, and split one flash over several frames."""
+    signal = np.array([0.3, 0.3, 0.2, 0.1, 0.03, 0.01, 0.004, 0.001, 0.0, 0.0, 0.3])
+    assert _t(detect_transitions_1d(signal)) == [(8, -1), (10, 1)]
+
+
+def test_gain_on_the_first_plateau_frame_still_counts_as_arriving() -> None:
+    """ADR-018 (1): until the signal stands still or turns back it is still arriving, so a 0.003
+    gain on the frame right after the edge moves the stamp from 3 to 4 (a one-frame shift, which
+    the one-frame event tolerance of SPEC 5.6 absorbs)."""
+    signal = np.array([0.2, 0.2, 0.2, 0.5, 0.503, 0.5, 0.5, 0.2])
+    assert _t(detect_transitions_1d(signal)) == [(4, 1), (7, -1)]
+
+
+def test_step_beyond_the_tolerance_after_settling_moves_the_stamp_again() -> None:
+    """ADR-018 (1): after standing at 0.5 the signal climbs 0.02 (> 0.005) and then 0.01 more; that
+    is a real change, so the stamp follows it to frame 4."""
+    signal = np.array([0.0, 0.5, 0.5, 0.52, 0.53, 0.0])
+    assert _t(detect_transitions_1d(signal)) == [(4, 1), (5, -1)]
+
+
+def test_gain_of_exactly_the_tolerance_after_settling_does_not_move_the_stamp() -> None:
+    """SPEC 5.4: a change 'no larger than' the tolerance is noise - a settled plateau gaining exactly
+    0.005 keeps its stamp at frame 2, while a gain 1e-9 larger moves it to frame 4."""
+    exact = np.array([0.2, 0.2, 0.5, 0.5, 0.5 + _TOL_L, 0.2])
+    larger = np.array([0.2, 0.2, 0.5, 0.5, 0.5 + _TOL_L + 1e-9, 0.2])
+    assert _t(detect_transitions_1d(exact)) == [(2, 1), (5, -1)]
+    assert _t(detect_transitions_1d(larger)) == [(4, 1), (5, -1)]
+
+
+def test_reversal_of_exactly_the_tolerance_does_not_end_a_run() -> None:
+    """SPEC 5.4: a reversal 'no larger than' the tolerance does not end a run.  0.0625 is exact in
+    binary; a dip of exactly 0.005 is ignored, so the two 0.06 rises merge into one rise >= 0.10 at
+    frame 3.  With the dip 1e-9 deeper the run ends there and neither 0.06 rise is a transition."""
+    peak = 0.0625
+    dip = peak - _TOL_L  # the same float the tracker computes as ext - tol
+    assert _t(detect_transitions_1d(np.array([0.0, peak, dip, dip + 0.06]))) == [(3, 1)]
+    deeper = dip - 1e-9
+    assert _t(detect_transitions_1d(np.array([0.0, peak, deeper, deeper + 0.06]))) == []
+
+
+def test_a_change_of_exactly_the_tolerance_does_not_start_a_run() -> None:
+    """SPEC 5.4: from rest, a move of exactly 0.005 is still a plateau, so the later fall is measured
+    from 0.3 (0.098, no transition).  A move 1e-9 larger starts a rise; the fall is then measured
+    from 0.305 (0.103 >= 0.10) and is a transition."""
+    start, low = 0.3, 0.3 - 0.098
+    assert _t(detect_transitions_1d(np.array([start, start + _TOL_L, low]))) == []
+    assert _t(detect_transitions_1d(np.array([start, start + _TOL_L + 1e-9, low]))) == [(2, -1)]
 
 
 # ---------------------------------------------------------------------------
@@ -186,8 +269,8 @@ def test_three_transitions_give_one_flash() -> None:
 
 
 def test_rise_tiny_fall_rise_fall_is_exactly_one_flash() -> None:
-    """ADR-005: two same-sign rises (the 0.05 fall between them is no transition) pair with the
-    final fall only once - one flash at frame 4."""
+    """ADR-005 / ADR-018 (3): two same-sign rises (the 0.05 fall between them is no transition); the
+    newer rise replaces the pending one and pairs with the final fall - one flash at frame 4."""
     signal = np.array([0.0, 0.5, 0.45, 0.9, 0.0])
     assert _t(detect_transitions_1d(signal)) == [(1, 1), (3, 1), (4, -1)]
     assert _f(flash_frames_1d(signal)) == [4]
@@ -339,7 +422,7 @@ def test_run_tracker_groups_cells_sharing_frame_and_sign() -> None:
     """Transition.cells: cells that end the same kind of run at the same frame share one record."""
     square = np.array([0.0, 1.0, 0.0, 1.0, 0.0])
     signals = np.stack([square, square], axis=1)
-    tracker = RunTracker(2, general_rule, 0.005)
+    tracker = RunTracker(2, general_rule, _TOL_L)
     emitted: list[Transition] = []
     for t in range(signals.shape[0]):
         emitted.extend(tracker.update(t, signals[t], {}))
@@ -352,7 +435,7 @@ def test_run_tracker_groups_cells_sharing_frame_and_sign() -> None:
 def test_run_tracker_emits_transitions_timestamped_before_the_current_frame() -> None:
     """ADR-004: a rise whose plateau lasts to frame 20 is emitted at update(21) but timestamped 9."""
     signal = _ramp_plateau_ramp()
-    tracker = RunTracker(1, general_rule, 0.005)
+    tracker = RunTracker(1, general_rule, _TOL_L)
     emitted_at: dict[int, list[tuple[int, int]]] = {}
     for t in range(signal.shape[0]):
         out = tracker.update(t, signal[t : t + 1], {})
@@ -366,7 +449,7 @@ def test_run_tracker_emits_transitions_timestamped_before_the_current_frame() ->
 def test_run_tracker_finish_returns_only_open_qualifying_runs() -> None:
     """ADR-004: finish() emits the run still open at the last frame; nothing for a flat cell."""
     signals = np.array([[0.0, 0.5], [0.0, 0.5], [1.0, 0.5]])  # cell 0 steps at frame 2, cell 1 flat
-    tracker = RunTracker(2, general_rule, 0.005)
+    tracker = RunTracker(2, general_rule, _TOL_L)
     during = []
     for t in range(3):
         during.extend(tracker.update(t, signals[t], {}))
@@ -380,7 +463,7 @@ def test_run_tracker_finish_returns_only_open_qualifying_runs() -> None:
 
 def test_run_tracker_finish_with_nothing_open_returns_empty() -> None:
     """ADR-004: a signal that already completed all its runs has nothing left for finish()."""
-    tracker = RunTracker(1, general_rule, 0.005)
+    tracker = RunTracker(1, general_rule, _TOL_L)
     for t in range(4):
         tracker.update(t, np.full(1, 0.3), {})
     assert list(tracker.finish(3)) == []

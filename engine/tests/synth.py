@@ -1,9 +1,9 @@
 """Synthetic frame sequences for the SPEC section 5.10 acceptance tests.
 
-Every acceptance test needs a short "video" of a 1024x768 page in which some rectangle
-switches colour at a known rate.  This module builds those videos lazily, one
-``uint8 [768, 1024, 3]`` frame at a time, so a test never holds a whole sequence in memory
-(90 frames of 1024x768 RGB would already be 212 MB).
+Every acceptance test needs a short "video" of a page (1024x768 unless a test asks for another
+size) in which some rectangle switches colour at a known rate.  This module builds those videos
+lazily, one ``uint8 [768, 1024, 3]`` frame at a time, so a test never holds a whole sequence in
+memory (90 frames of 1024x768 RGB would already be 212 MB).
 
 Nothing here touches the engine: the generator is plain NumPy arithmetic, so a failing
 acceptance test always points at the engine, never at the fixture.
@@ -115,6 +115,30 @@ def square_wave(hz: float, colour_a: RGB, colour_b: RGB) -> ColourAt:
     return colour_at
 
 
+def square_wave_state(frame: int, hz: int, fps: int = FPS) -> int:
+    """0 or 1: which colour an exact ``hz`` square wave shows at frame ``frame``.
+
+    Same rule as square_wave() (state = floor(t * 2 * hz) % 2 with t = frame / fps) but in
+    whole numbers, floor(frame * 2 * hz / fps), so no rate can land on the wrong side of an
+    integer.  Used for the high rates (15-30 Hz) of SPEC 5.10 item 11.
+    """
+    return (frame * 2 * hz // fps) % 2
+
+
+def square_wave_exact(hz: int, colour_a: RGB, colour_b: RGB, fps: int = FPS) -> ColourAt:
+    """A square wave like square_wave(), computed from the frame number in integer arithmetic.
+
+    scene_frames() calls colour_at(i / fps); round(t * fps) recovers i exactly for any frame
+    number a test uses, and square_wave_state() does the rest without floating point.
+    """
+
+    def colour_at(t_seconds: float) -> RGB:
+        frame = round(t_seconds * fps)
+        return colour_a if square_wave_state(frame, hz, fps) == 0 else colour_b
+
+    return colour_at
+
+
 @dataclass(frozen=True)
 class Region:
     """A rectangle of the page with its own colour schedule.  Units are CSS px."""
@@ -155,20 +179,74 @@ def scene_frames(
     regions: Sequence[Region],
     duration_s: float,
     fps: int = FPS,
+    size: tuple[int, int] = (VIEWPORT_W, VIEWPORT_H),
 ) -> Iterator[np.ndarray]:
-    """Yield the scene's frames one at a time as ``uint8 [768, 1024, 3]`` arrays.
+    """Yield the scene's frames one at a time as ``uint8 [height, width, 3]`` arrays.
 
-    Frame ``i`` is rendered at ``t = i / fps`` (SPEC 5.1).  Regions are painted in list order,
-    so a later region covers an earlier one where they overlap.  Each frame is a fresh array:
-    the engine may keep a reference to the previous frame and must not see it change.
+    ``size`` is (width, height) in px, 1024x768 by default; a shorter page (SPEC 5.10 item 14)
+    passes e.g. (1024, 100), and every region must then fit inside it.  Frame ``i`` is rendered
+    at ``t = i / fps`` (SPEC 5.1).  Regions are painted in list order, so a later region covers
+    an earlier one where they overlap.  Each frame is a fresh array: the engine may keep a
+    reference to the previous frame and must not see it change.
     """
-    base = np.empty((VIEWPORT_H, VIEWPORT_W, 3), dtype=np.uint8)
+    width, height = size
+    for region in regions:
+        if region.x + region.w > width or region.y + region.h > height:
+            raise ValueError(f"region {region.x},{region.y} {region.w}x{region.h} does not fit {width}x{height}")
+    base = np.empty((height, width, 3), dtype=np.uint8)
     base[...] = background
     for i in range(frame_count(duration_s, fps)):
         t_seconds = i / fps
         frame = base.copy()
         for region in regions:
             frame[region.y:region.y + region.h, region.x:region.x + region.w] = region.colour_at(t_seconds)
+        yield frame
+
+
+def cosine_pulse(frame: int, hz: float, trough_frame: float, fps: int = FPS) -> float:
+    """0 at ``trough_frame`` (and every 1/hz s after it), 1 half a period later: a smooth eased pulse.
+
+    0.5 - 0.5 * cos(2 * pi * hz * (frame - trough_frame) / fps) - the shape of CSS ease-in-out
+    swinging back and forth, which is how a smooth CSS pulse looks when sampled frame by frame.
+    """
+    return 0.5 - 0.5 * math.cos(2 * math.pi * hz * (frame - trough_frame) / fps)
+
+
+def split_pulse_frames(
+    hz: float, trough_frame: float, n_frames: int, peaks: tuple[int, int] = (120, 255)
+) -> Iterator[np.ndarray]:
+    """Grey frames whose left half pulses up to byte ``peaks[0]`` and right half up to ``peaks[1]``.
+
+    Both halves follow the same cosine_pulse, but each is rounded to whole bytes, so the dim half
+    and the bright half reach their extreme byte on frames one apart: one flash whose cells
+    complete on two neighbouring frames.
+    """
+    for i in range(n_frames):
+        level = cosine_pulse(i, hz, trough_frame)
+        frame = np.zeros((VIEWPORT_H, VIEWPORT_W, 3), dtype=np.uint8)
+        frame[:, : VIEWPORT_W // 2] = round(peaks[0] * level)
+        frame[:, VIEWPORT_W // 2 :] = round(peaks[1] * level)
+        yield frame
+
+
+def noisy_square_region_frames(
+    region: tuple[int, int, int, int], hz: int, greys: tuple[int, int], n_frames: int, seed: int
+) -> Iterator[np.ndarray]:
+    """A grey square wave inside ``region`` (x, y, w, h px, cell aligned) on black, with noise.
+
+    Every 4x4 cell of the region gets its own +0 or +1 byte on every frame, drawn from a
+    generator seeded with ``seed`` (so the frames are the same on every run).  On the dark grey
+    that changes L by far less than the 0.005 reversal tolerance - the kind of wobble lossy
+    video leaves on a flat colour.
+    """
+    x, y, w, h = region
+    rng = np.random.default_rng(seed)
+    for i in range(n_frames):
+        grey = greys[square_wave_state(i, hz)]
+        cells = grey + rng.integers(0, 2, size=(h // CELL_PX, w // CELL_PX))
+        block = np.repeat(np.repeat(cells, CELL_PX, axis=0), CELL_PX, axis=1).astype(np.uint8)
+        frame = np.zeros((VIEWPORT_H, VIEWPORT_W, 3), dtype=np.uint8)
+        frame[y : y + h, x : x + w] = block[..., None]
         yield frame
 
 

@@ -3,8 +3,9 @@
 Every function here is element-wise and works in float64, so the same code
 serves one pixel, a whole frame or a grid of cells.  The formulas are the ones
 WCAG 2.2 prints (docs/SPEC.md 3.4 and 3.6).  The only additions are the reverse
-transfer function (needed to re-encode a cell's mean colour, ADR-003) and the
-black special case for chromaticity (ADR-011).
+transfer function (needed to re-encode a cell's mean colour as whole 0..255
+values, ADR-003 and ADR-020), the floor below which a red has no hue (ADR-020)
+and the black special case for chromaticity (ADR-011).
 
 Why "linear" matters: the bytes in a screenshot are gamma-encoded, so byte 128
 is not half as bright as byte 255.  WCAG's thresholds are about physical light,
@@ -20,6 +21,7 @@ from engine.constants import (
     D65_UV,
     LEGACY_RED_VALUE_SCALE,
     LUMINANCE_COEFFICIENTS,
+    RED_MIN_R8,
     SRGB_ENCODE_CUTOFF,
     SRGB_GAMMA,
     SRGB_GAMMA_OFFSET,
@@ -42,9 +44,10 @@ def _linearise_encoded(encoded: np.ndarray) -> np.ndarray:
 def _build_lookup_table() -> np.ndarray:
     """Linear-light value for each of the 256 possible byte values.
 
-    A frame has millions of bytes but only 256 distinct values, so computing
-    the formula once per value and looking the answers up is both faster and
-    guarantees every pixel with the same byte gets the exact same float.
+    A frame has millions of bytes but only 256 distinct values, so the formula
+    is computed once per value (256 power functions instead of one per byte)
+    and every pixel looks its answer up, which also guarantees that every pixel
+    with the same byte gets the exact same float.
     """
     # WCAG 2.2 glossary: "RsRGB = R8bit/255"
     encoded = np.arange(256, dtype=np.float64) / 255.0
@@ -67,9 +70,8 @@ def srgb8_to_linear(frame_u8: np.ndarray) -> np.ndarray:
 def linear_to_srgb(linear: np.ndarray) -> np.ndarray:
     """Linear light 0..1 -> sRGB-encoded 0..1 (the reverse of the WCAG formula).
 
-    Not rounded to bytes: the redness ratio R/(R+G+B) is scale-free, so the
-    unrounded 0..1 values give the same ratio as 0..255 values would, without
-    adding rounding noise to a cell's mean colour.
+    The result is not rounded; srgb8_from_linear() below puts it on the
+    whole-number 0..255 scale that the redness rules use.
     """
     lin = np.maximum(np.asarray(linear, dtype=np.float64), 0.0)
     # Reverse of WCAG's "R = RsRGB/12.92" branch (IEC 61966-2-1): C = 12.92 * L
@@ -77,6 +79,19 @@ def linear_to_srgb(linear: np.ndarray) -> np.ndarray:
     # Reverse of WCAG's "((RsRGB+0.055)/1.055) ^ 2.4": C = 1.055 * L^(1/2.4) - 0.055
     large = SRGB_GAMMA_SCALE * lin ** (1.0 / SRGB_GAMMA) - SRGB_GAMMA_OFFSET
     return np.where(lin <= SRGB_ENCODE_CUTOFF, small, large)
+
+
+def srgb8_from_linear(linear_rgb: np.ndarray) -> np.ndarray:
+    """Linear RGB [..., 3] -> sRGB-encoded whole numbers 0..255 (float64) [..., 3].
+
+    Re-encoding is not exact in floating point: byte 12 comes back as
+    11.999999999999998.  Rounding to the nearest whole number (halves up)
+    gives the original byte back for every uniform cell, so a colour whose
+    ratio is exactly 0.8 measures exactly 0.8 (ADR-020).
+    """
+    scaled = linear_to_srgb(linear_rgb) * 255.0
+    # floor(x + 0.5) rounds halves up, the same way on every machine.
+    return np.clip(np.floor(scaled + 0.5), 0.0, 255.0)
 
 
 def relative_luminance(linear_rgb: np.ndarray) -> np.ndarray:
@@ -129,29 +144,32 @@ def uv_chromaticity(linear_rgb: np.ndarray) -> np.ndarray:
 
 
 def redness_ratio(linear_rgb: np.ndarray) -> np.ndarray:
-    """Linear RGB [..., 3] -> R / (R + G + B) on sRGB-ENCODED components [...].
+    """Linear RGB [..., 3] -> R8 / (R8 + G8 + B8) on whole 0..255 encoded values [...].
 
     WCAG does not say which scale R, G, B are on; the build brief fixes the
-    0..255 encoded scale and ADR-003 records it.  The ratio is scale-free, so
-    the 0..1 encoded values used here give exactly the 0..255 answer.  Black
-    (sum 0) gets ratio 0: it is not red.
+    0..255 sRGB-encoded scale (ADR-003), taken literally as whole numbers
+    (ADR-020).  The ratio is 0 for black (the sum is 0) and for any colour
+    with R8 below RED_MIN_R8, whose red is too dark to show a hue (ADR-020).
     """
-    encoded = linear_to_srgb(linear_rgb)
-    r, g, b = encoded[..., 0], encoded[..., 1], encoded[..., 2]
-    total = r + g + b
+    rgb8 = srgb8_from_linear(linear_rgb)
+    r8, g8, b8 = rgb8[..., 0], rgb8[..., 1], rgb8[..., 2]
+    total = r8 + g8 + b8
+    # ADR-020: below R8 = 16 there is no visible red, so the ratio stays 0.
+    has_hue = (total != 0.0) & (r8 >= RED_MIN_R8)
     ratio = np.zeros(total.shape, dtype=np.float64)
     # WCAG 2.2 glossary Note 3: "a value R/(R + G + B)"
-    np.divide(r, total, out=ratio, where=total != 0.0)
+    np.divide(r8, total, out=ratio, where=has_hue)
     return ratio
 
 
 def legacy_red_value(linear_rgb: np.ndarray) -> np.ndarray:
-    """Linear RGB [..., 3] -> pre-2022 red value max(0, R - G - B) x 320 [...].
+    """Linear RGB [..., 3] -> pre-2022 red value max(0, R8 - G8 - B8) / 255 x 320 [...].
 
-    Computed on sRGB-encoded 0..1 components, as the build brief specifies.
+    Computed on the same whole 0..255 encoded values as redness_ratio(), then
+    put back on the 0..1 scale the working value was written for (ADR-020).
     Only the "wcag21-legacy" comparison mode uses it (ADR-001).
     """
-    encoded = linear_to_srgb(linear_rgb)
-    r, g, b = encoded[..., 0], encoded[..., 1], encoded[..., 2]
+    rgb8 = srgb8_from_linear(linear_rgb)
+    r8, g8, b8 = rgb8[..., 0], rgb8[..., 1], rgb8[..., 2]
     # Build brief / WCAG 2.0-2.1 era working value: "(R - G - B) x 320", floored at 0
-    return np.maximum(r - g - b, 0.0) * LEGACY_RED_VALUE_SCALE
+    return np.maximum(r8 - g8 - b8, 0.0) / 255.0 * LEGACY_RED_VALUE_SCALE

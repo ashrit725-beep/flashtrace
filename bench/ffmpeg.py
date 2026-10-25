@@ -27,11 +27,31 @@ FFMPEG_GLOBS = (
 )
 
 
-def find_ffmpeg():
-    """Path to an ffmpeg binary, or None.
+def has_vp8_encoder(ffmpeg: str) -> bool:
+    """True when this ffmpeg binary lists the `libvpx` (VP8) encoder.
 
-    Order: the FLASHTRACE_FFMPEG environment variable, Playwright's cache
-    (newest build when several are installed), then `ffmpeg` on PATH.
+    Not every Playwright ffmpeg build has it: build 1011 ships `libvpx`
+    (VP8), while build 1013 (installed with Playwright 1.63) ships only
+    `libvpx-vp9`. ADR-015 fixes the benchmark videos to VP8, so a binary
+    without that encoder cannot make them.
+    """
+    try:
+        listing = subprocess.run([ffmpeg, "-hide_banner", "-encoders"],
+                                 capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    # Each encoder line reads "<flags> <name> <description>", e.g.
+    # " V....D libvpx   libvpx VP8 (codec vp8)"; the name must be exactly "libvpx".
+    return any(line.split()[1:2] == ["libvpx"] for line in listing.stdout.splitlines())
+
+
+def find_ffmpeg() -> str | None:
+    """Path to an ffmpeg binary that can encode VP8, or None.
+
+    Order: the FLASHTRACE_FFMPEG environment variable (used as given), then
+    Playwright's cache (newest build first), then `ffmpeg` on PATH. A cached
+    or PATH binary without the VP8 encoder is passed over, so video pages
+    are skipped (documented behaviour) instead of failing mid-generation.
     """
     from_env = os.environ.get("FLASHTRACE_FFMPEG")
     if from_env and os.path.isfile(from_env):
@@ -39,9 +59,11 @@ def find_ffmpeg():
     for pattern in FFMPEG_GLOBS:
         matches = sorted(path for path in glob.glob(os.path.expanduser(pattern))
                          if os.path.isfile(path) and os.access(path, os.X_OK))
-        if matches:
-            return matches[-1]
-    return shutil.which("ffmpeg")
+        for path in reversed(matches):        # newest build first
+            if has_vp8_encoder(path):
+                return path
+    on_path = shutil.which("ffmpeg")
+    return on_path if on_path and has_vp8_encoder(on_path) else None
 
 
 def even(value):

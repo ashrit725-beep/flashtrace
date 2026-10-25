@@ -58,7 +58,9 @@ from playwright.sync_api import Browser, BrowserContext, CDPSession, Page
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
+from capture.page_scripts import SEEDED_RANDOM_JS, SEEDED_RANDOM_NOTE
 from capture.strategies.base import (
+    DOUBLE_SHOT_REAL_GAP_MS,
     CaptureSettings,
     CaptureStrategy,
     FrameSink,
@@ -117,10 +119,9 @@ BEGIN_FRAME_UNAVAILABLE = "HeadlessExperimental.beginFrame unavailable"
 #: Prefix of the note that says budget-only pictures do not stand still in real time (tests look for it).
 BUDGET_MODE_UNUSABLE = "budget-only virtual time is not a verdict-grade picture source on this Chromium"
 
-#: Real milliseconds between the two pictures of a budget-only double-shot (and of the self-test).
-#: 100 ms is longer than one frame of any animation faster than 10 Hz, so content that is drawn on the
-#: real clock changes between the two pictures instead of slipping through by luck.
-REAL_GAP_MS = 100
+#: Real milliseconds between the two pictures of a budget-only double-shot (and of the self-test); the
+#: same gap strategy A uses (base.py explains the 100 ms).
+REAL_GAP_MS = DOUBLE_SHOT_REAL_GAP_MS
 
 #: Self-test page for ``budget_mode_unusable``: one black square whose opacity ramps 0 -> 1 every
 #: second (a linear CSS animation, so any passage of rendering time changes its pixels).
@@ -149,8 +150,9 @@ START_INTERACTION_JS = r"""
 INTERACTION_STATE_EXPRESSION = "JSON.stringify(window.__ftInteraction || { state: 'missing', message: '' })"
 
 # Answers that hold for a whole Chromium build on this platform, remembered so a batch of captures
-# (benchmark, ablation) does not re-pay a probe that cannot change its answer. Keyed by browser version.
-_BEGIN_FRAME_UNSUPPORTED: dict[str, str] = {}
+# (benchmark, ablation) does not re-pay a probe that cannot change its answer. Keyed by browser version;
+# both answers are remembered: the reason BeginFrameControl is unavailable, or ``None`` when it works.
+_BEGIN_FRAME_PROBED: dict[str, str | None] = {}
 _BUDGET_MODE: dict[str, str | None] = {}
 
 
@@ -163,19 +165,41 @@ def _protocol_message(exc: BaseException) -> str:
     return str(exc).splitlines()[0].strip() if str(exc) else type(exc).__name__
 
 
+def _detach_quietly(session: CDPSession | None) -> None:
+    """Detach a DevTools session; one whose target has already gone away needs no detaching."""
+    if session is None:
+        return
+    try:
+        session.detach()
+    except PlaywrightError:
+        pass
+
+
 def _create_begin_frame_target(browser: Browser, context: BrowserContext, scratch: Page, viewport: tuple[int, int]) -> None:
-    """``Target.createTarget`` with BeginFrameControl inside ``context`` (raises PlaywrightError when refused)."""
-    info = context.new_cdp_session(scratch).send("Target.getTargetInfo")["targetInfo"]
-    browser.new_browser_cdp_session().send(
-        "Target.createTarget",
-        {
-            "url": "about:blank",
-            "browserContextId": info.get("browserContextId"),
-            "enableBeginFrameControl": True,
-            "width": viewport[0],
-            "height": viewport[1],
-        },
-    )
+    """``Target.createTarget`` with BeginFrameControl inside ``context`` (raises PlaywrightError when refused).
+
+    Both DevTools sessions it opens are detached again, so a browser shared by many captures does not
+    collect one browser-level session per probe.
+    """
+    page_session: CDPSession | None = None
+    browser_session: CDPSession | None = None
+    try:
+        page_session = context.new_cdp_session(scratch)
+        info = page_session.send("Target.getTargetInfo")["targetInfo"]
+        browser_session = browser.new_browser_cdp_session()
+        browser_session.send(
+            "Target.createTarget",
+            {
+                "url": "about:blank",
+                "browserContextId": info.get("browserContextId"),
+                "enableBeginFrameControl": True,
+                "width": viewport[0],
+                "height": viewport[1],
+            },
+        )
+    finally:
+        _detach_quietly(browser_session)
+        _detach_quietly(page_session)
 
 
 def begin_frame_unavailable(browser: Browser) -> str | None:
@@ -183,21 +207,21 @@ def begin_frame_unavailable(browser: Browser) -> str | None:
 
     The probe is ``Target.createTarget {enableBeginFrameControl: true}`` in a throw-away context: it
     answers immediately with an error on platforms without BeginFrameControl (measured on macOS:
-    "BeginFrameControl is not supported on MacOS yet"). The answer is remembered per Chromium build.
+    "BeginFrameControl is not supported on MacOS yet"). Both answers are remembered per Chromium build.
     """
     key = _browser_key(browser)
-    if key in _BEGIN_FRAME_UNSUPPORTED:
-        return _BEGIN_FRAME_UNSUPPORTED[key]
+    if key in _BEGIN_FRAME_PROBED:
+        return _BEGIN_FRAME_PROBED[key]
+    reason: str | None = None
     context = browser.new_context()
     try:
         _create_begin_frame_target(browser, context, context.new_page(), (320, 240))
     except PlaywrightError as exc:
         reason = f"{BEGIN_FRAME_UNAVAILABLE}: {_protocol_message(exc)}"
-        _BEGIN_FRAME_UNSUPPORTED[key] = reason
-        return reason
     finally:
         context.close()
-    return None
+    _BEGIN_FRAME_PROBED[key] = reason
+    return reason
 
 
 def budget_mode_unusable(browser: Browser) -> str | None:
@@ -304,6 +328,11 @@ class VirtualTimeStrategy(CaptureStrategy):
 
     def describe_setup(self) -> list[str]:
         return list(self._setup_notes)
+
+    def prepare_context(self, context: BrowserContext, settings: CaptureSettings) -> None:
+        """Seed ``Math.random`` in every document before any page script runs (ADR-022)."""
+        context.add_init_script(SEEDED_RANDOM_JS)
+        self._setup_notes.append(SEEDED_RANDOM_NOTE)
 
     def create_page(self, context: BrowserContext, settings: CaptureSettings) -> Page:
         """Create the capture page with BeginFrameControl when the platform allows it."""
@@ -472,7 +501,7 @@ class VirtualTimeStrategy(CaptureStrategy):
                 # The target accepted BeginFrameControl but the domain is missing (full Chromium build).
                 reason = f"{BEGIN_FRAME_UNAVAILABLE}: {_protocol_message(exc)}"
                 if self._browser_key is not None:
-                    _BEGIN_FRAME_UNSUPPORTED[self._browser_key] = reason
+                    _BEGIN_FRAME_PROBED[self._browser_key] = reason
                 self._setup_notes.append(reason + "; switching to page.screenshot")
                 self._begin_frame = False
         try:

@@ -1,6 +1,6 @@
 """The pipeline: frames in, AnalysisResult out (SPEC section 5).
 
-Per frame (streaming, so the whole capture never has to be in memory):
+Per frame (streaming: a frame is dropped as soon as its signals are read):
     uint8 frame -> linear light -> 4x4 cell means -> per-cell signals
         -> RunTracker (general on L; red on ratio+u'v' or on the legacy value)
         -> FlashPairer -> "this cell completed a flash at frame f" masks
@@ -9,18 +9,30 @@ After the last frame:
     masks -> area scoring (which events cover > 25 % of a window)
         -> sliding one-second counts -> violations, advisories, timeline.
 
+What stays in memory for the whole capture is one true/false per cell per
+frame for each flash type (the masks, needed by the area step) plus a few
+numbers per cell for the trackers; the frames themselves are never kept.
+
 Everything is float64 / int64, in a fixed order, with no randomness and no
 threads, so the same frames always give byte-identical JSON.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Callable, Iterable, Iterator
 
 import numpy as np
 
 from engine.area import AreaResult, qualifying_events
-from engine.cells import cell_signals, frame_to_cells, grid_shape, window_cells, window_px
+from engine.cells import (
+    cell_signals,
+    frame_to_cells,
+    grid_shape,
+    window_cells,
+    window_cells_full,
+    window_px,
+)
 from engine.constants import CELL_PX, RED_RULES, RUN_REVERSAL_TOLERANCE
 from engine.rate import find_advisories, find_violations, timeline, trailing_counts, window_counts
 from engine.transitions import (
@@ -100,9 +112,126 @@ class _FlashStream:
 
 
 def _red_rule_for(name: str) -> tuple[Rule, float]:
+    """The red transition rule and its reversal tolerance for a red_rule name."""
     if name == "wcag22":
         return red_rule_wcag22, RUN_REVERSAL_TOLERANCE["ratio"]
     return red_rule_legacy, RUN_REVERSAL_TOLERANCE["rv"]
+
+
+@dataclass(frozen=True)
+class _Geometry:
+    """Grid and window sizes for one capture, all counted in cells."""
+
+    cells_y: int
+    cells_x: int
+    wy: int                  # rows of the window slid over the grid (clamped to it)
+    wx: int                  # columns of that window
+    full_window_cells: int   # size of the unclamped window: the area denominator (ADR-019)
+
+
+@dataclass
+class _TypeResult:
+    """Everything measured for one flash type (general or red) after the last frame."""
+
+    masks: np.ndarray            # bool [T, cells_y, cells_x]: cells completing a flash at t
+    area: AreaResult
+    violations: list[Violation]
+    advisories: list[Advisory]
+    max_rate: int                # highest count in any one-second window
+
+
+def _check_arguments(fps: int, red_rule: str) -> int:
+    """Reject an unknown red rule or a frame rate below 1; return fps as an int."""
+    if red_rule not in RED_RULES:
+        raise ValueError(f"unknown red_rule {red_rule!r}; expected one of {RED_RULES}")
+    fps = int(fps)
+    if fps < 1:
+        raise ValueError(f"fps must be >= 1, got {fps}")
+    return fps
+
+
+def _resolve_viewport(viewport: tuple[int, int] | None, width: int, height: int) -> tuple[int, int]:
+    """The (width, height) in CSS px to analyse with: the given viewport, or the frame size.
+
+    SPEC 5.1: frames are taken at device scale factor 1, so the frame width
+    must equal the viewport width; the window size is derived from it.
+    """
+    if viewport is None:
+        return width, height
+    viewport_wh = (int(viewport[0]), int(viewport[1]))
+    if viewport_wh[0] < 1 or viewport_wh[1] < 1:
+        raise ValueError(f"viewport must be positive, got {viewport}")
+    if viewport_wh[0] != width:
+        raise ValueError(
+            f"frame width {width} px differs from viewport width {viewport_wh[0]} px; "
+            "SPEC 5.1 needs frames at device scale factor 1"
+        )
+    return viewport_wh
+
+
+def _geometry(height: int, width: int, viewport_width: int) -> _Geometry:
+    """Cell grid of the frame plus the scanned and the full window (SPEC 5.2, 5.6)."""
+    cells_y, cells_x = grid_shape(height, width, CELL_PX)
+    if cells_y == 0 or cells_x == 0:
+        raise ValueError(f"frame {height}x{width} is smaller than one {CELL_PX}x{CELL_PX} cell")
+    wy, wx = window_cells(viewport_width, cells_y, cells_x, CELL_PX)
+    full_y, full_x = window_cells_full(viewport_width, CELL_PX)
+    return _Geometry(cells_y, cells_x, wy, wx, full_y * full_x)
+
+
+def _next_frame(source: Iterator[np.ndarray], expected: tuple[int, int, int] | None) -> np.ndarray | None:
+    """The next checked frame from the source, or None when the source is used up."""
+    try:
+        return _check_frame(next(source), expected)
+    except StopIteration:
+        return None
+
+
+def _push_frame(
+    t: int, frame: np.ndarray, red_rule: str, general: _FlashStream, red: _FlashStream, heatmap: np.ndarray
+) -> None:
+    """Read one frame's cell signals and feed them to both flash streams (SPEC 5.2-5.5)."""
+    signals = cell_signals(frame_to_cells(frame, CELL_PX))
+    general.push(t, signals.L, {}, heatmap)
+    if red_rule == "wcag22":
+        red.push(t, signals.ratio, {"u": signals.u, "v": signals.v}, heatmap)
+    else:
+        red.push(t, signals.rv, {"ratio": signals.ratio}, heatmap)
+
+
+def _stream(
+    first: np.ndarray,
+    source: Iterator[np.ndarray],
+    n_cells: int,
+    red_rule: str,
+    progress: ProgressCallback | None,
+) -> tuple[_FlashStream, _FlashStream, np.ndarray, int]:
+    """Run every frame through the trackers, one frame at a time.
+
+    In: the first frame (already checked), the rest of the frames, the
+    number of cells, the red rule name and the optional progress callback.
+    Out: the general and red streams (holding their per-frame masks), the
+    flat uint16 heatmap and the number of frames seen.
+    """
+    red_fn, red_tol = _red_rule_for(red_rule)
+    general = _FlashStream(n_cells, general_rule, RUN_REVERSAL_TOLERANCE["L"])
+    red = _FlashStream(n_cells, red_fn, red_tol)
+    heatmap_flat = np.zeros(n_cells, dtype=np.uint16)
+    expected_shape = (int(first.shape[0]), int(first.shape[1]), 3)  # every frame must match the first
+    t = 0
+    frame: np.ndarray | None = first
+    while frame is not None:
+        _push_frame(t, frame, red_rule, general, red, heatmap_flat)
+        t += 1
+        if progress is not None:
+            progress(t)
+        frame = _next_frame(source, expected_shape)
+    if t < 2:
+        raise ValueError(f"analyze() needs at least 2 frames; got {t}")
+    # Runs still open after the last frame are closed there (SPEC 5.4).
+    general.finish(t - 1, heatmap_flat)
+    red.finish(t - 1, heatmap_flat)
+    return general, red, heatmap_flat, t
 
 
 def _build_violations(
@@ -145,10 +274,85 @@ def _build_violations(
 
 
 def _build_advisories(flash_type: str, events: np.ndarray, fps: int) -> list[Advisory]:
+    """Advisory records for one flash type (SPEC 5.9; not a WCAG rule, ADR-009)."""
     return [
         Advisory(flash_type=flash_type, start=int(s), end=int(e), mean_rate_per_sec=float(rate))
         for s, e, rate in find_advisories(events, fps)
     ]
+
+
+def _score_type(flash_type: str, stream: _FlashStream, geo: _Geometry, fps: int) -> _TypeResult:
+    """Area and rate for one flash type (SPEC 5.6, 5.7, 5.9).
+
+    In: the type name, its stream after the last frame, the geometry and fps.
+    Out: its masks, area scoring, violations, advisories and maximum rate.
+    """
+    masks = stream.stacked(geo.cells_y, geo.cells_x)
+    area = qualifying_events(masks, geo.wy, geo.wx, full_window_cells=geo.full_window_cells)
+    return _TypeResult(
+        masks=masks,
+        area=area,
+        violations=_build_violations(flash_type, area, fps, CELL_PX, (geo.wy, geo.wx)),
+        advisories=_build_advisories(flash_type, area.qualifying, fps),
+        max_rate=int(window_counts(area.qualifying, fps).max()),
+    )
+
+
+def _frame_stats(general: _TypeResult, red: _TypeResult, fps: int) -> FrameStats:
+    """Per-frame statistics of both flash types (SPEC 5.8)."""
+    return FrameStats(
+        general_cells=general.masks.sum(axis=(1, 2)).astype(np.int64),
+        red_cells=red.masks.sum(axis=(1, 2)).astype(np.int64),
+        general_area_max=general.area.area_max,
+        red_area_max=red.area.area_max,
+        general_window_y=general.area.window_y,
+        general_window_x=general.area.window_x,
+        red_window_y=red.area.window_y,
+        red_window_x=red.area.window_x,
+        general_qualifying=general.area.qualifying,
+        red_qualifying=red.area.qualifying,
+        general_trailing_1s=trailing_counts(general.area.qualifying, fps),
+        red_trailing_1s=trailing_counts(red.area.qualifying, fps),
+    )
+
+
+def _assemble(
+    general: _TypeResult,
+    red: _TypeResult,
+    geo: _Geometry,
+    heatmap_flat: np.ndarray,
+    frame_count: int,
+    fps: int,
+    viewport_wh: tuple[int, int],
+    red_rule: str,
+) -> AnalysisResult:
+    """Put both flash types' results into one AnalysisResult (SPEC 5.8)."""
+    # Violations of both types in time order; general first when they start together.
+    violations = sorted(
+        general.violations + red.violations,
+        key=lambda v: (v.start, 0 if v.type == "general" else 1),
+    )
+    bins = [TimelineBin(t=sec, general_flashes=g, red_flashes=r)
+            for sec, g, r in timeline(general.area.qualifying, red.area.qualifying, fps)]
+    return AnalysisResult(
+        frame_count=frame_count,
+        fps=fps,
+        viewport=viewport_wh,
+        cell_px=CELL_PX,
+        grid=(geo.cells_y, geo.cells_x),
+        window_cells=(geo.wy, geo.wx),
+        window_px=window_px(viewport_wh[0]),
+        red_rule=red_rule,
+        frame_stats=_frame_stats(general, red, fps),
+        violations=violations,
+        advisories=general.advisories + red.advisories,
+        heatmap=heatmap_flat.reshape(geo.cells_y, geo.cells_x),
+        timeline=bins,
+        general_max_rate=general.max_rate,
+        red_max_rate=red.max_rate,
+        qualifying_general=[int(f) for f in np.flatnonzero(general.area.qualifying)],
+        qualifying_red=[int(f) for f in np.flatnonzero(red.area.qualifying)],
+    )
 
 
 def analyze(
@@ -163,130 +367,35 @@ def analyze(
     frames    uint8 [T, H, W, 3] array, or any iterable yielding uint8 [H, W, 3]
               frames (a generator is fine: frames are processed one at a time).
     fps       frames per second of animation time; frame i is at i / fps s.
-    viewport  (width, height) in CSS px; defaults to the frame size.  The width
-              sets the window size (ADR-007).
+    viewport  (width, height) in CSS px; defaults to the frame size.  Its width
+              must equal the frame width (SPEC 5.1) and sets the window size (ADR-007).
     red_rule  "wcag22" (default, used for verdicts) or "wcag21-legacy".
     progress  optional callback receiving the number of frames processed so far.
     """
-    if red_rule not in RED_RULES:
-        raise ValueError(f"unknown red_rule {red_rule!r}; expected one of {RED_RULES}")
-    fps = int(fps)
-    if fps < 1:
-        raise ValueError(f"fps must be >= 1, got {fps}")
-
+    fps = _check_arguments(fps, red_rule)
     source = _iter_frames(frames)
-    try:
-        frame = _check_frame(next(source), None)
-    except StopIteration:
-        raise ValueError("analyze() needs at least 2 frames; got 0") from None
-    height, width = int(frame.shape[0]), int(frame.shape[1])
-    expected_shape = (height, width, 3)
-    if viewport is None:
-        viewport_wh = (width, height)
-    else:
-        viewport_wh = (int(viewport[0]), int(viewport[1]))
-        if viewport_wh[0] < 1 or viewport_wh[1] < 1:
-            raise ValueError(f"viewport must be positive, got {viewport}")
-
-    cell_px = CELL_PX
-    cells_y, cells_x = grid_shape(height, width, cell_px)
-    if cells_y == 0 or cells_x == 0:
-        raise ValueError(f"frame {height}x{width} is smaller than one {cell_px}x{cell_px} cell")
-    n_cells = cells_y * cells_x
-    wy, wx = window_cells(viewport_wh[0], cells_y, cells_x, cell_px)
-    win_px = window_px(viewport_wh[0])
-
-    red_fn, red_tol = _red_rule_for(red_rule)
-    general = _FlashStream(n_cells, general_rule, RUN_REVERSAL_TOLERANCE["L"])
-    red = _FlashStream(n_cells, red_fn, red_tol)
-    heatmap_flat = np.zeros(n_cells, dtype=np.uint16)
-
-    # ---- streaming pass over the frames -----------------------------------
-    t = 0
-    while True:
-        signals = cell_signals(frame_to_cells(frame, cell_px))
-        general.push(t, signals.L, {}, heatmap_flat)
-        if red_rule == "wcag22":
-            red.push(t, signals.ratio, {"u": signals.u, "v": signals.v}, heatmap_flat)
-        else:
-            red.push(t, signals.rv, {"ratio": signals.ratio}, heatmap_flat)
-        t += 1
-        if progress is not None:
-            progress(t)
-        try:
-            frame = _check_frame(next(source), expected_shape)
-        except StopIteration:
-            break
-    frame_count = t
-    if frame_count < 2:
-        raise ValueError(f"analyze() needs at least 2 frames; got {frame_count}")
-    general.finish(frame_count - 1, heatmap_flat)
-    red.finish(frame_count - 1, heatmap_flat)
-
-    # ---- area: which events are big enough ---------------------------------
-    general_masks = general.stacked(cells_y, cells_x)
-    red_masks = red.stacked(cells_y, cells_x)
-    general_area = qualifying_events(general_masks, wy, wx)
-    red_area = qualifying_events(red_masks, wy, wx)
-    general_events = general_area.qualifying
-    red_events = red_area.qualifying
-
-    # ---- rate: how many per second ----------------------------------------
-    general_max_rate = int(window_counts(general_events, fps).max())
-    red_max_rate = int(window_counts(red_events, fps).max())
-    violations = sorted(
-        _build_violations("general", general_area, fps, cell_px, (wy, wx))
-        + _build_violations("red", red_area, fps, cell_px, (wy, wx)),
-        key=lambda v: (v.start, 0 if v.type == "general" else 1),
+    first = _next_frame(source, None)
+    if first is None:
+        raise ValueError("analyze() needs at least 2 frames; got 0")
+    height, width = int(first.shape[0]), int(first.shape[1])
+    viewport_wh = _resolve_viewport(viewport, width, height)
+    geo = _geometry(height, width, viewport_wh[0])
+    general_stream, red_stream, heatmap_flat, frame_count = _stream(
+        first, source, geo.cells_y * geo.cells_x, red_rule, progress
     )
-    advisories = _build_advisories("general", general_events, fps) + _build_advisories(
-        "red", red_events, fps
-    )
-    bins = [TimelineBin(t=sec, general_flashes=g, red_flashes=r)
-            for sec, g, r in timeline(general_events, red_events, fps)]
-
-    frame_stats = FrameStats(
-        general_cells=general_masks.sum(axis=(1, 2)).astype(np.int64),
-        red_cells=red_masks.sum(axis=(1, 2)).astype(np.int64),
-        general_area_max=general_area.area_max,
-        red_area_max=red_area.area_max,
-        general_window_y=general_area.window_y,
-        general_window_x=general_area.window_x,
-        red_window_y=red_area.window_y,
-        red_window_x=red_area.window_x,
-        general_qualifying=general_events,
-        red_qualifying=red_events,
-        general_trailing_1s=trailing_counts(general_events, fps),
-        red_trailing_1s=trailing_counts(red_events, fps),
-    )
-
-    return AnalysisResult(
-        frame_count=frame_count,
-        fps=fps,
-        viewport=viewport_wh,
-        cell_px=cell_px,
-        grid=(cells_y, cells_x),
-        window_cells=(wy, wx),
-        window_px=win_px,
-        red_rule=red_rule,
-        frame_stats=frame_stats,
-        violations=violations,
-        advisories=advisories,
-        heatmap=heatmap_flat.reshape(cells_y, cells_x),
-        timeline=bins,
-        general_max_rate=general_max_rate,
-        red_max_rate=red_max_rate,
-        qualifying_general=[int(f) for f in np.flatnonzero(general_events)],
-        qualifying_red=[int(f) for f in np.flatnonzero(red_events)],
-    )
+    general = _score_type("general", general_stream, geo, fps)
+    red = _score_type("red", red_stream, geo, fps)
+    return _assemble(general, red, geo, heatmap_flat, frame_count, fps, viewport_wh, red_rule)
 
 
 def evidence_frame_indices(result: AnalysisResult, max_frames: int = 6) -> list[int]:
     """Which still frames to save as evidence: deterministic, at most ``max_frames``.
 
     Frame 0 (the page at rest), then for each violation its first event frame
-    and the frame just before it (the two states of the flash), de-duplicated,
-    sorted and capped.
+    and the frame just before it, de-duplicated, sorted and capped.  An event
+    is counted on the frame where its flash completes (ADR-019), so for a
+    flash whose cells complete together the two frames show the state just
+    before and just after the completing transition.
     """
     if max_frames < 1:
         return []
