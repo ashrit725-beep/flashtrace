@@ -52,3 +52,28 @@ student. No AI/LLM is used *inside* FlashTrace; the product is fully offline and
   on the real clock. The decisions were recorded as SPEC amendments and ADR-018 – ADR-023 before any fix.
 * The student's role: wrote the brief and the thresholds to check, decides which decisions to keep, and must be
   able to explain each engine function (docs/ENGINE.md is written for that purpose).
+
+## 2026-10-24 – 2026-10-25 — M3 to M8, motion pass, determinism investigations
+
+* **M3 (CLI, report, bench runner).** AI agents wrote `cli/` (audit, fix, bench, demo, serve commands; report
+  assembly with schema validation; the self-contained HTML export) and the bench runner and scorer. Two reviewers and
+  one verifier per finding checked them; confirmed findings were fixed with tests.
+* **First full benchmark.** The orchestrating AI ran `flashtrace bench` on 200 pages in a clean git worktree so the
+  recorded commit is exact. It found that only 9 of 20 re-runs were identical. The AI then ran its own experiments
+  (frame diffs, concurrent captures, Chromium switch sets) and traced the cause to Chromium's threaded animation
+  under machine load (ADR-025). The fix was validated at benchmark scale (20 of 20 identical) before it was kept.
+* **Measurement accuracy.** The AI noticed that the demo's 5 Hz strobe was reported as 6 per second, traced it to
+  floating-point state switches exactly at sample instants and to Playwright's 16 ms animation-frame timer, and
+  changed sampling and animation-frame handling (ADR-029). An exact 3 Hz benchmark page that had failed now passes.
+* **M4–M6 (attribution, ablation, fixes).** AI agents built candidate collection, overlap ranking, ablation with a
+  minimal culprit set, CSS fix generation from measured colours and rates, and fix verification by re-capture.
+  Reviews found and fixed, among others, a Playwright browser-sharing bug that silently turned audits INCONCLUSIVE.
+* **M8 (server, viewer).** AI agents built the FastAPI server and the Next.js viewer against `docs/API.md`, with
+  Playwright + axe-core tests (0 violations on every screen and state).
+* **Motion and look-and-feel (student request).** The student asked for reactive components, transitions and a
+  better look and feel using their installed motion and component skills. AI agents wrote a motion spec, had it
+  critiqued for photosensitivity safety, implemented it with the Motion library, and built a self-audit in which
+  FlashTrace's own capture and engine measure the UI. That self-audit caught real problems (for example a History
+  delete at phone width counted as flashing) which were fixed before the work was kept (ADR-024 amendment).
+* **What the AI did not do.** It did not type any number into docs/RESULTS.md; that file is written by
+  `flashtrace bench`. It did not change a WCAG threshold; corrections to the brief's working values are ADRs.
