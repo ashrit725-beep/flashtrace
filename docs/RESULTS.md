@@ -1,16 +1,17 @@
 # RESULTS
 
-Written by `flashtrace bench` from one run; nothing on this page is typed by hand. Full per-page results: `docs/RESULTS.json`, written by the same run (its sha256 is in the Run table).
+Written by `flashtrace bench` from one run; nothing on this page is typed by hand. Full per-page results: [`docs/RESULTS.json`](RESULTS.json), written by the same run (its sha256 is in the Run table).
 
 ## Run
 
 | Field | Value |
 |---|---|
-| Date (UTC) | 2026-10-25 23:05:53 UTC |
-| Commit | 808cd30 |
-| Command | `flashtrace bench --n 200 --seed 1 --duration 10 --fps 60 --workers 4 --determinism-sample 20 --attribute bbox --ablate-sample 20 --ablate-duration 4 --out docs/RESULTS.md --work-dir .flashtrace/bench` |
+| Date (UTC) | 2026-10-26 03:02:35 UTC |
+| Commit | 6a838cc |
+| Command | `flashtrace bench --n 200 --seed 1 --duration 10 --fps 60 --workers 4 --determinism-sample 20 --attribute bbox --ablate-sample 20 --ablate-duration 4 --out docs/RESULTS.md --work-dir .flashtrace/bench --quiet` |
 | Machine | macOS-26.5.1-arm64-arm-64bit-Mach-O; Python 3.14.0; Chromium 153.0.8010.12; 11 CPUs |
-| Per-page results | `docs/RESULTS.json` (sha256 `bcefad34af797764dcdbdc4ab07503377fd05662e837708d2eab225db3793b70`) |
+| Per-page results | [`docs/RESULTS.json`](RESULTS.json) (sha256 `be41f016354b02c134daecab8ecbd09db8a2955e013770ea521594cc203018aa`) |
+| Record warnings | none |
 
 ## Settings
 
@@ -91,7 +92,7 @@ Ablation sample: the first 20 pages that FAILed in the main pass were audited ag
 Top-1 culprit in the truth culprits: 20/20 (100.0%)
 Minimal culprit set correct: 20/20 (100.0%)
 Re-captures per page: mean 3.2, min 1, max 5 (20 pages)
-Wall time per sampled audit, baseline and ablation together (s): mean 100.8, median 101.4, max 156.2 (20 pages)
+Wall time per sampled audit, baseline and ablation together (s): mean 87.7, median 90.5, max 132.4 (20 pages)
 Sampled pages: bench-0003, bench-0005, bench-0006, bench-0008, bench-0014, bench-0025, bench-0026, bench-0030, bench-0033, bench-0039, bench-0040, bench-0050, bench-0055, bench-0058, bench-0062, bench-0068, bench-0072, bench-0075, bench-0076, bench-0079
 
 A minimal set counts as correct when every element marked as in the minimal set is a truth culprit, suppressing them leaves at most 1360 flashing cells of the truth elements (25% of the 85 x 64-cell window) or a rate of 3 per second or less, and putting back any one of them makes the page fail again. It is not compared with the truth list for equality: elements that flash in sync can be explained by more than one minimal set.
@@ -108,8 +109,8 @@ Wall time per page in seconds (time.perf_counter) for 10 s of animation at 60 fp
 
 | Stage | Pages | Mean | Median | Min | Max |
 |---|---|---|---|---|---|
-| Capture | 200 | 40.249 | 38.324 | 28.664 | 66.002 |
-| Analysis | 200 | 30.281 | 23.604 | 13.848 | 194.761 |
+| Capture | 200 | 30.852 | 28.320 | 22.311 | 76.960 |
+| Analysis | 200 | 17.834 | 16.089 | 12.278 | 51.721 |
 
 ## Mismatches
 
