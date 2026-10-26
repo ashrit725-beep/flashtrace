@@ -286,7 +286,8 @@ and it can pass on this platform. Animated images, SVG images, workers and cross
 does not measure: an animated SVG image that passed both double-shots was measured too fast and reported as
 deterministic. So a budget-only B (no BeginFrameControl) now steps aside, as A does, for uncontrollable content
 that the scan before frame 0 finds: in auto it steps aside; forced, it captures and reports `deterministic=false`
-with the content in `meta.uncontrollable`. Unlike A, it does not look again during its frame loop (ADR-046). With
+with the content in `meta.uncontrollable`. *Amended again 2026-10-25:* it also looks again during its frame loop, at
+strategy A's checkpoints, and counts what an earlier strategy of the same capture found (ADR-046). With
 BeginFrameControl, B keeps its role.
 
 ## ADR-024 — Motion in the web UI: purposeful one-shot transitions, proven safe by FlashTrace itself (2026-10-24)
@@ -416,7 +417,7 @@ Decision: the runner passes run_audit a JobProgress object. It is called once pe
 
 ## ADR-037 — Server hardening beyond docs/API.md (2026-10-24)
 
-Context: a loopback-only server can still be reached by web pages through DNS rebinding and cross-site form POSTs. Decision: (1) serve() refuses any host but 127.0.0.1. (2) FlashTrace's AllowedHostMiddleware (validation.host_allowed) accepts only the Host names 127.0.0.1 and localhost, with any port, and answers anything else with 400 {"detail": "The Host header must be 127.0.0.1 or localhost."} (amended 2026-10-25; it replaced Starlette's TrustedHostMiddleware, whose 400 was plain text). (3) A POST or DELETE carrying an Origin header that is not the server's own origin (or, with FLASHTRACE_DEV_CORS=1, http://localhost:3000 or http://127.0.0.1:3000) gets 403. Requests without an Origin header, such as curl, are allowed. (4) CORS is off unless FLASHTRACE_DEV_CORS=1. (5) URLs with a user name or password are refused with 422, because the URL is stored in meta.json and the report. (6) Swagger and ReDoc are disabled because they load scripts from a CDN; /openapi.json stays. (7) A malformed job id returns 422; a frame index must be a whole number, and anything outside 0..frameCount-1 returns 404, so a client never names a path. (8) Relative local paths are resolved against the project directory, and symlinks are resolved before the inside check. The outside check runs before the existence check, so the error never reveals whether an outside file exists. (9) *Added 2026-10-25:* every response, refusals included, carries `Content-Security-Policy: frame-ancestors 'none'`, `X-Frame-Options: DENY` and `X-Content-Type-Options: nosniff` (SecurityHeadersMiddleware, the outermost layer), so no other site can show the UI in a frame and trick a user into clicking Verify or Ablate (clickjacking); the static UI's .js, .mjs and .css files are served as text/javascript and text/css, so nosniff never blocks them. *Corrected 2026-10-25:* "every response" leaves out one case. Starlette 1.10.0 puts its ServerErrorMiddleware outside every middleware FlashTrace adds, and server/app.py registers no handler for an unhandled exception, so an unexpected internal error (a bug in a route) is answered with Starlette's plain-text 500 "Internal Server Error": it is not {"detail": ...} JSON and does not carry the three headers. Every response the API and the UI produce themselves, refusals and 4xx errors included, does. docs/API.md says so. Consequences: two extra status codes (400 bad Host, 403 foreign Origin), both JSON {"detail": ...}; docs/API.md lists them with the headers.
+Context: a loopback-only server can still be reached by web pages through DNS rebinding and cross-site form POSTs. Decision: (1) serve() refuses any host but 127.0.0.1. (2) FlashTrace's AllowedHostMiddleware (validation.host_allowed) accepts only the Host names 127.0.0.1 and localhost, with any port, and answers anything else with 400 {"detail": "The Host header must be 127.0.0.1 or localhost."} (amended 2026-10-25; it replaced Starlette's TrustedHostMiddleware, whose 400 was plain text). (3) A POST or DELETE carrying an Origin header that is not the server's own origin (or, with FLASHTRACE_DEV_CORS=1, http://localhost:3000 or http://127.0.0.1:3000) gets 403. Requests without an Origin header, such as curl, are allowed. (4) CORS is off unless FLASHTRACE_DEV_CORS=1. (5) URLs with a user name or password are refused with 422, because the URL is stored in meta.json and the report. (6) Swagger and ReDoc are disabled because they load scripts from a CDN; /openapi.json stays. (7) A malformed job id returns 422; a frame index must be a whole number, and anything outside 0..frameCount-1 returns 404, so a client never names a path. (8) Relative local paths are resolved against the project directory, and symlinks are resolved before the inside check. The outside check runs before the existence check, so the error never reveals whether an outside file exists. (9) *Added 2026-10-25:* every response, refusals included, carries `Content-Security-Policy: frame-ancestors 'none'`, `X-Frame-Options: DENY` and `X-Content-Type-Options: nosniff` (SecurityHeadersMiddleware, the outermost layer), so no other site can show the UI in a frame and trick a user into clicking Verify or Ablate (clickjacking); the static UI's .js, .mjs and .css files are served as text/javascript and text/css, so nosniff never blocks them. *Corrected 2026-10-25:* "every response" leaves out one case. Starlette 1.10.0 puts its ServerErrorMiddleware outside every middleware FlashTrace adds, and server/app.py registers no handler for an unhandled exception, so an unexpected internal error (a bug in a route) is answered with Starlette's plain-text 500 "Internal Server Error": it is not {"detail": ...} JSON and does not carry the three headers. Every response the API and the UI produce themselves, refusals and 4xx errors included, does. docs/API.md says so. *Fixed 2026-10-25:* server/app.py now registers a handler for `Exception` (`on_unexpected_error`). Starlette runs it from ServerErrorMiddleware, so an unhandled exception is answered with 500 {"detail": "Internal error: <first line of the exception>"} (the exception's class name when its message is empty), and the handler sets the three headers itself, because SecurityHeadersMiddleware sits inside ServerErrorMiddleware and never sees that response. The case above no longer exists: every response carries the headers. Starlette re-raises the exception after answering, so the server log still shows it. server/tests/test_security_static.py pins `test_unexpected_error_is_json_and_carries_the_security_headers`. Consequences: two extra status codes (400 bad Host, 403 foreign Origin), both JSON {"detail": ...}; docs/API.md lists them with the headers.
 
 **ADR-024 amendment (2026-10-25).** A 390 px and dark-mode review, measured with the self-audit, found ordinary
 actions that exceeded 3 flashes per second: one History delete (a gap-closing glide of dense text across the screen),
@@ -655,14 +656,34 @@ while the capture still said `deterministic=true`:
   SharedWorkers, recorded by `WORKER_PROBE_JS`. Image URLs beyond the first 200 per page, scan and later checks
   together, count as `images-unverified`. Each of these errs on the safe side: "could be animated" is treated as
   animated.
+* *Added 2026-10-25:* **A detection budget.** All the image reads of one capture, by every strategy's scan
+  before frame 0 and by the later looks, may take at most `DETECTION_BUDGET_S` = 60 s of real time together
+  (`detect.ReadBudget`, shared like the image verdicts of ADR-047). A read gives up when the budget runs out (it
+  is given the time left when that is under 5 s), and image URLs not read within it count as uncontrollable:
+  `images-unverified: N image URL(s) not checked within the 60 s detection budget`. The reads are silent, and
+  without this limit 60 image requests that never answer kept a capture without progress for the server
+  watchdog's 300 s (ADR-049). A GIF or SVG whose second, longer read (past the first 64 KB) fails now counts as
+  `image-unverified`; it had counted as still, although its first 64 KB end inside the first frame or the
+  markup.
 * An `<object>` or `<embed>` that shows a same-origin document is not an image, because A drives that document's
   animations like the page's own.
 * A budget-only strategy B (no BeginFrameControl) steps aside, as A does, for uncontrollable content that the
   scan before frame 0 finds (`VirtualTimeStrategy.needs_controllable_content`). Forced, it captures anyway,
-  reports `deterministic=false` and lists the content in `meta.uncontrollable`, like a forced A. Unlike A, B does
-  not look again during its frame loop: it never asks `ContentWatch` for new content, and its page-clock and
-  double-shot checks run only at frame 0 and at the last frame. Content that appears after frame 0 is caught under
-  B only if the double-shot at the last frame sees it move.
+  reports `deterministic=false` and lists the content in `meta.uncontrollable`, like a forced A. *Amended
+  2026-10-25:* a budget-only B also looks again during its frame loop, at A's checkpoints (frame 0, the first
+  frame of every captured second and the last frame, `is_checkpoint`) but not at every frame: there it runs the
+  page-clock and double-shot checks and asks `ContentWatch` for the full scan plus every image URL the page
+  requested since the previous checkpoint (`VirtualTimeStrategy._late_content`). Content found there sends auto
+  on to C (the loop stops at once, as A's does) and makes a forced B `deterministic=false`, with the content in
+  `meta.uncontrollable`. Content that comes and goes between two checkpoints and leaves no request behind (a
+  data: URL image, a WebGL canvas) is not caught; a worker is, because `WORKER_PROBE_JS` records every worker the
+  page starts. With BeginFrameControl, B checks frame 0 and the last frame only and does not look again.
+* *Added 2026-10-25:* **What one strategy found counts for the next.** Uncontrollable content that a strategy
+  given up in auto had found, before frame 0 or during its frame loop, counts as found by the first scan of
+  every later strategy of the same capture (`capturer._SharedDetection`, `ContentWatch(carried=...)`), with a
+  note when that scan did not see it itself. Before, each attempt scanned afresh. B's frames start at page time
+  2 s (its pre-roll, ADR-023), so a GIF that A found at 1.5 s and that the page removed before 2 s was gone at
+  B's frame 0, and a budget-only B captured that page as deterministic.
 
 **Consequences.**
 * Such pages are captured by strategy C, so a PASS on them becomes INCONCLUSIVE (SPEC §6.4) instead of a PASS that
@@ -672,6 +693,13 @@ while the capture still said `deterministic=true`:
   reporting, a data-URL CSS GIF found by the once-a-second scan, an SVG `<img>`, a worker started at load, a
   same-origin `<object>` driven deterministically) and capture/tests/test_detect.py (the SVG sniffer,
   `test_workers_are_uncontrollable`, `test_images_past_the_cap_count_as_unverified`, the `ContentWatch` cache).
+  *Added 2026-10-25:* capture/tests/test_robustness.py pins
+  `test_gif_inserted_after_1_5_s_never_ends_in_a_deterministic_capture` (a GIF inserted at 1.5 s, kept or removed
+  before B's frame 0: the chain is `waapi_step (failed) -> virtual_time (skipped) -> realtime (used)`),
+  `test_budget_only_b_looks_again_at_its_checkpoints` (forced, and B first in auto) and
+  `test_image_reads_that_never_answer_stay_within_the_detection_budget`; capture/tests/test_detect.py pins
+  `test_image_reads_stop_when_the_detection_budget_is_spent`, `test_gif_whose_longer_read_fails_is_unverified_not_still`
+  and `test_first_scan_counts_what_an_earlier_attempt_found`.
 * SPEC §6.2 amended; ADR-022 and ADR-023 carry dated notes.
 
 ## ADR-047 — Page loading has time limits, and an HTTP error page is not audited (2026-10-25)
@@ -749,25 +777,31 @@ frame 0 of every strategy that steps aside before its loop add up:
 * navigation, up to 30 s for each of the three strategies (`NAVIGATION_TIMEOUT_MS`);
 * in A and in C, up to 10 s for the `load` event (`LOAD_WAIT_MS`) and up to 10 s for web fonts (`FONT_WAIT_MS`);
 * in C, up to 5 s for the screencast's first frame, then the whole recording (the duration, at most 60 s, plus a
-  quarter-second settle) before its first callback.
+  quarter-second settle) before its first callback;
+* detection's image reads, which are silent too. Each read may take 5 s (`IMAGE_READ_TIMEOUT_MS`), and a long GIF
+  or SVG is read a second time, up to 4 MB. *Amended 2026-10-25:* all the reads of one capture together may take
+  at most 60 s of real time (`DETECTION_BUDGET_S`, ADR-046), whether the scan before frame 0 of any strategy makes
+  them or the look-again of strategy A between two frames or of a budget-only B at its checkpoints; a read gives
+  up when the budget runs out, and image URLs not read within it count as `images-unverified`. The results are
+  reused by the later strategies (ADR-047).
 
-Without images that is 3 × 30 + 2 × (10 + 10) + 5 + 60 s, about 195 s, and 300 s leaves a margin for a slow
-machine. Detection's image reads are silent too and are not in that sum: each read may take 5 s
-(`IMAGE_READ_TIMEOUT_MS`), up to 200 image URLs are read per page (`MAX_IMAGE_URLS`), and a long GIF or SVG is read
-a second time, up to 4 MB, within another 5 s. The scan before frame 0 makes these reads once per capture (later
-strategies reuse the results, ADR-047); strategy A's look-again reads new image URLs between two frames.
+That is 3 × 30 + 2 × (10 + 10) + 5 + 60 + 60 s, about 255 s, and 300 s leaves a margin for a slow machine.
+(Before the amendment the image reads were not in the sum, which was about 195 s, and had no limit in all.) The
+comment above `STALL_LIMIT_S` in server/runner.py states the same sum.
 
 **Consequences.**
 * One hostile page can no longer hold the runner and every job behind it.
 * On Windows (no `ps` or SIGKILL) nothing is killed and the old behaviour remains: a cancel takes effect at the next
   callback. `flashtrace audit` has no watchdog yet.
-* *Known gap.* A page with many image requests that never answer can reach the 300 s limit before frame 0: 60
-  reads that each wait their full 5 s make 300 s on their own. The watchdog then stops a capture that would have
-  finished (each such image would only have counted as `image-unverified`), and the job ends as "The page stopped
-  responding (no progress for 300 s), so its browser was stopped."
+* *Known gap, closed 2026-10-25.* A page with many image requests that never answer could reach the 300 s limit
+  before frame 0: 60 reads that each waited their full 5 s made 300 s on their own, and the watchdog stopped a
+  capture that would have finished. The detection budget bounds those reads at 60 s per capture; the image URLs
+  left unread count as `images-unverified`, so such a page is captured by C and a PASS on it is INCONCLUSIVE.
+  capture/tests/test_robustness.py pins `test_image_reads_that_never_answer_stay_within_the_detection_budget`.
 * server/tests/test_watchdog.py pins the process depth and kill, the watchdog rules at fixed clock times, DELETE,
-  the stall limit and shutdown of a task hung in a browser, and a real page that loops forever. ADR-035 and ADR-036
-  carry dated notes, and docs/API.md describes DELETE and the stall limit.
+  the stall limit and shutdown of a task hung in a browser, and a real page that loops forever, and
+  `test_stall_limit_covers_every_silent_wait_before_frame_0` computes the sum above from the constants (added
+  2026-10-25). ADR-035 and ADR-036 carry dated notes, and docs/API.md describes DELETE and the stall limit.
 
 ## ADR-050 — Every CLI invocation ends with the disclaimer (2026-10-25)
 

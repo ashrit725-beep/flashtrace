@@ -478,16 +478,18 @@ independent of the PNG encoder). `hash = sha256(concatenation of all frameHashes
   `meta.uncontrollable`. A `<video>` seek or an animation-ready wait that times out also sets
   `deterministic=false` with a note.
 * **B `virtual_time`.** CDP `Emulation.setVirtualTimePolicy` with a `1000/fps` ms budget per frame, plus
-  `HeadlessExperimental.beginFrame` where the launched Chromium supports it. Double-shot check at frame 0 and at
-  the last frame. The page is
-  loaded under 250 ms budgets and pre-rolled to a fixed 2 000 ms before frame 0 (pausing virtual time before
-  navigation never loads a page). Without BeginFrameControl, rendering follows the real clock; a once-per-build
-  self-test detects this and auto mode then skips B (ADR-023). That self-test measures only a CSS animation, so a
-  budget-only B (no BeginFrameControl) also steps aside, as A does, for uncontrollable content that the scan before
-  frame 0 finds; forced, it captures and reports `deterministic=false` with the content in `meta.uncontrollable`
-  (ADR-046). Unlike A, B does not look again during its frame loop, and its page-clock and double-shot checks run
-  only at frame 0 and at the last frame, so content that appears after frame 0 is caught under B only if the
-  last frame's double-shot sees it move.
+  `HeadlessExperimental.beginFrame` where the launched Chromium supports it. Page-clock and double-shot checks at
+  frame 0 and at the last frame, and with budget-only pictures also at the first frame of every captured second
+  (below). The page is loaded under 250 ms budgets and pre-rolled to a fixed 2 000 ms before frame 0 (pausing
+  virtual time before navigation never loads a page). Without BeginFrameControl, rendering follows the real clock; a
+  once-per-build self-test detects this and auto mode then skips B (ADR-023). That self-test measures only a CSS
+  animation, so a budget-only B (no BeginFrameControl) also steps aside, as A does, for uncontrollable content that
+  the scan before frame 0 finds; forced, it captures and reports `deterministic=false` with the content in
+  `meta.uncontrollable` (ADR-046). At A's checkpoints (frame 0, the first frame of every captured second and the
+  last frame) a budget-only B also looks again for uncontrollable content: the full scan, plus every image URL the
+  page requested since the previous checkpoint. Content that appears after frame 0 makes auto fall through to C (the
+  B loop stops there) and a forced B `deterministic=false`, with the content in `meta.uncontrollable`. With
+  BeginFrameControl, B does not look again.
 * **C `realtime`.** CDP `Page.startScreencast` with timestamps, resampled to `fps` by holding the latest
   frame at or before each sample time. Chromium's compositor draws on a 60 Hz clock, so the screencast timestamps
   sit on one 1/60 s lattice; the sample grid starts half a compositor tick away from that lattice (the circular
@@ -505,7 +507,10 @@ before every picture, strategy A then gives up its attempt (auto falls through; 
 the reason). A main document that answers with HTTP status 400 or above raises `PageLoadError` (exported by
 `capture`): a capture error (§6.4 rule 1), never retried under another strategy. Each image read over the network
 for detection may take 5 s of real time; an image that does not answer counts as `image-unverified`, and image
-classifications are reused by the later strategies of the same capture.
+classifications are reused by the later strategies of the same capture. All image reads of one capture, every
+strategy's scan and the later looks together, may take at most 60 s of real time (the detection budget,
+`DETECTION_BUDGET_S`); a read gives up when it runs out, and image URLs not read within it count as
+`images-unverified` (ADR-046, ADR-049).
 
 Fall-through A → B → C happens when the page contains *uncontrollable* content (ADR-046), recognised from bytes,
 never from a file extension:
@@ -515,7 +520,7 @@ never from a file extension:
   `<input type=image>`, `<object>`, `<embed>`, `<video poster>` and every CSS property that paints an image);
 * images that could not be checked: unreadable bytes (`image-unverified`), a GIF whose frames or an SVG whose
   markup go on past the first 4 MB (`gif-unverified`, `svg-unverified`), and image URLs beyond the first 200 per
-  page, scan and later checks together (`images-unverified`);
+  page, scan and later checks together, or not read within the detection budget (`images-unverified`);
 * WebGL canvases and canvases handed to an `OffscreenCanvas`;
 * cross-origin iframes;
 * Web Workers and SharedWorkers (recorded by an init script that wraps their constructors), whose timers run on
@@ -524,7 +529,10 @@ never from a file extension:
 An `<object>` or `<embed>` that shows a same-origin document is not an image: strategy A drives that document's
 animations like the page's own. Fall-through also happens when a check of the frame loop fails (above), when a
 strategy cannot load the page under its time source, or when it raises. The reason is recorded in
-`meta.fallbackReason`.
+`meta.fallbackReason`. Uncontrollable content that a strategy given up in auto found, before frame 0 or during its
+frame loop, counts as found by the scan before frame 0 of every later strategy of the same capture (a note says
+so when that scan did not see it itself), because the page can show such content at moments a later strategy's
+frames do not cover (ADR-046).
 
 ### 6.3 Determinism test (M2)
 

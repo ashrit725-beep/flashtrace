@@ -424,3 +424,96 @@ def test_local_page_with_permission_reads_a_large_gif_up_to_4_mb(tmp_path: Path)
     page = StandInPage((tmp_path / "page.html").as_uri(), [gif_path.as_uri()])
     uncontrollable, notes = find_uncontrollable(page, allow_local_files=True)
     assert uncontrollable == [f"animated-gif: {gif_path.as_uri()}"], notes
+
+
+# ----------------------------------------------------------------------------- detection budget, carried findings
+class _ClockedRequest:
+    """A page.request whose every read waits its whole timeout and then fails, on a fake clock (no sleeping).
+
+    ``timeouts`` records the timeout (ms) each read was given; ``clock`` is the fake ``time.monotonic``."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.timeouts: list[float] = []
+
+    def clock(self) -> float:
+        return self.now
+
+    def get(self, _url: str, **options: Any) -> None:
+        self.timeouts.append(options["timeout"])
+        self.now += options["timeout"] / 1000
+        raise TimeoutError("no answer")
+
+
+def test_image_reads_stop_when_the_detection_budget_is_spent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Silent reads are bounded in all: the last read gets only the time left, the rest count as unverified."""
+    from types import SimpleNamespace
+
+    request = _ClockedRequest()
+    monkeypatch.setattr(detect, "time", SimpleNamespace(monotonic=request.clock))
+    monkeypatch.setattr(detect, "DETECTION_BUDGET_S", 12.0)
+    urls = [f"https://example.test/hang/{n}.png" for n in range(5)]
+    page = StandInPage("https://example.test/page.html", urls)
+    page.request_object = request
+    verdicts: detect.ImageVerdicts = {}
+    budget = detect.ReadBudget()  # one per capture, like the verdicts (capturer._SharedDetection)
+    uncontrollable, notes = detect.ContentWatch(False, verdicts, budget).first_scan(page)
+    assert request.timeouts == [detect.IMAGE_READ_TIMEOUT_MS, detect.IMAGE_READ_TIMEOUT_MS, 2000]  # 5 s + 5 s + the last 2 s
+    assert uncontrollable == [f"image-unverified: {url}" for url in urls[:3]] + [
+        "images-unverified: 2 image URL(s) not checked within the 12 s detection budget"
+    ]
+    assert notes[-1] == "detection's image reads used up their 12 s of real time; 2 image URL(s) were not checked for animation"
+
+    # The budget belongs to the capture: a later attempt's scan reads nothing new, and finds the old verdicts.
+    later = StandInPage("https://example.test/page.html", [urls[0], "https://example.test/hang/new.png"])
+    later.request_object = request
+    found, _notes = detect.ContentWatch(False, verdicts, budget).first_scan(later)
+    assert len(request.timeouts) == 3
+    assert found == [f"image-unverified: {urls[0]}", "images-unverified: 1 image URL(s) not checked within the 12 s detection budget"]
+
+
+class _HeadThenFailRequest:
+    """Answers the first read with the first 64 KB of ``data`` and fails every later read."""
+
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+        self.reads = 0
+
+    def get(self, _url: str, **_options: Any) -> Any:
+        self.reads += 1
+        if self.reads > 1:
+            raise TimeoutError("no answer")
+        return _Response(self.data[:SNIFF_LIMIT])
+
+
+class _Response:
+    """Just enough of a Playwright APIResponse: its body."""
+
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def body(self) -> bytes:
+        return self._body
+
+
+def test_gif_whose_longer_read_fails_is_unverified_not_still() -> None:
+    """The first 64 KB end inside the first frame, so they cannot show the second one: not 'still'."""
+    page = StandInPage("https://example.test/page.html", ["https://example.test/big.gif"])
+    page.request_object = _HeadThenFailRequest(build_play_once_gif_with_large_first_frame())
+    uncontrollable, notes = find_uncontrollable(page, allow_local_files=False)
+    assert page.request_object.reads == 2
+    assert uncontrollable == ["image-unverified: https://example.test/big.gif"]
+    assert notes == ["could not read image bytes to check for animation: https://example.test/big.gif"]
+
+
+def test_first_scan_counts_what_an_earlier_attempt_found() -> None:
+    """Content a strategy found during its frame loop counts in the next strategy's scan (ADR-046)."""
+    animated = data_gif(2)
+    carried = ["animated-gif: https://example.test/late.gif", f"animated-gif: {animated}"]
+    watch = detect.ContentWatch(False, carried=carried)
+    uncontrollable, notes = watch.first_scan(StandInPage("https://example.test/", [animated]))
+    assert uncontrollable == [f"animated-gif: {animated}", "animated-gif: https://example.test/late.gif"]  # no duplicate
+    assert notes == [
+        "uncontrollable content an earlier strategy of this capture found counts here too, although this "
+        "attempt's first scan did not see it: animated-gif: https://example.test/late.gif"
+    ]

@@ -13,7 +13,12 @@ How it is meant to work, in plain words:
    lacks it (a bare ``beginFrame`` on an ordinary target hangs instead, so it is never used as a probe).
 3. Without BeginFrameControl the strategy falls back to budgets plus ``page.screenshot`` with a short
    timeout and records that in the notes.
-4. The same double-shot check as strategy A: two pictures at the same virtual time must be identical.
+4. The same double-shot check as strategy A: two pictures at the same virtual time must be identical,
+   and the page clock must read the virtual time. With BeginFrameControl both run at frame 0 and the
+   last frame. Budget-only pictures run them at strategy A's checkpoints (frame 0, the first frame of
+   every captured second, the last frame) and there also look again for uncontrollable content, as A
+   does (ADR-046): content that appears after frame 0 sends "auto" on to strategy C, and makes a forced
+   capture ``deterministic=False``.
 
 What was measured on the development machine (macOS, Playwright 1.63, Chromium 153 headless shell and
 full build; the orchestrator's ADR record has the details):
@@ -67,7 +72,9 @@ from capture.strategies.base import (
     ProgressCallback,
     StrategyOutcome,
     check_main_response,
+    is_checkpoint,
 )
+from capture.strategies.network_wait import NetworkTracker
 
 #: Chromium switches that make BeginFrameControl rendering reproducible (the parts of Chromium's own
 #: ``--deterministic-mode`` that matter for screenshots). They are only requested when BeginFrameControl
@@ -284,6 +291,10 @@ class VirtualTimeStrategy(CaptureStrategy):
         self._budget_expired = False
         self._blocked_reason: str | None = None
         self._setup_notes: list[str] = []
+        # Image requests the page makes, for the content checks of budget-only pictures (only the image
+        # URLs are used: B never waits for the network, its virtual-time policy does that).
+        self._network = NetworkTracker()
+        self._late_notes: list[str] = []  # notes of the content checks made during the frame loop
 
     # ------------------------------------------------------------------ small CDP helpers
     def _send(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -404,9 +415,11 @@ class VirtualTimeStrategy(CaptureStrategy):
         return new_pages[0]
 
     def prepare_page(self, page: Page, settings: CaptureSettings) -> None:
-        """Attach DevTools and listen for budget expiries; virtual time itself is armed in ``navigate``."""
+        """Attach DevTools and listen for budget expiries and image requests; virtual time itself is armed
+        in ``navigate``."""
         self._cdp = page.context.new_cdp_session(page)
         self._cdp.on("Emulation.virtualTimeBudgetExpired", self._on_budget_expired)
+        self._network.attach(page)
 
     def navigate(self, page: Page, settings: CaptureSettings) -> str | None:
         """Arm virtual time for the coming navigation, load, and grant page time until the document is complete.
@@ -548,9 +561,13 @@ class VirtualTimeStrategy(CaptureStrategy):
     ) -> StrategyOutcome:
         total = settings.frame_count
         failures: list[str] = []
+        late: list[str] = []  # uncontrollable content that appeared after the first scan (budget-only pictures)
         deterministic = True
         previous: bytes | None = None
         clock_at_frame0: float | None = None
+        stepped_aside = False
+        # Images requested during the load and pre-roll were either in the first scan or not shown.
+        self._network.take_image_requests()
 
         for index in range(total):
             t_ms = settings.frame_time_ms(index)
@@ -565,7 +582,7 @@ class VirtualTimeStrategy(CaptureStrategy):
                 break
             previous = png
             digest = sink.add(png)
-            if index in (0, total - 1):
+            if self._checks_frame(index, total, settings.fps):
                 deterministic &= self._check_frame(page, settings, index, t_ms, png, digest, failures)
                 now = self._page_now_ms()
                 clock_at_frame0 = now if clock_at_frame0 is None else clock_at_frame0
@@ -573,10 +590,14 @@ class VirtualTimeStrategy(CaptureStrategy):
                 if abs(now - expected) > CLOCK_TOLERANCE_MS:
                     deterministic = False
                     failures.append(f"page clock read {now:.1f} ms at frame {index}, expected {expected:.1f} ms")
+                failures.extend(self._late_content(page, index, late))
             if progress is not None:
                 progress(index + 1, total)
+            if late and not settings.forced:
+                stepped_aside = True
+                break  # "auto" moves on to the next strategy, which discards these frames: stop here
 
-        if len(sink.hashes) < total:
+        if len(sink.hashes) < total and not stepped_aside:
             failures.append(f"only {len(sink.hashes)} of {total} frames were captured")
         if self._known_nondeterministic is not None:
             deterministic = False
@@ -587,8 +608,43 @@ class VirtualTimeStrategy(CaptureStrategy):
         notes.append(
             "pictures via HeadlessExperimental.beginFrame" if self._begin_frame else "pictures via page.screenshot between virtual-time budgets"
         )
+        if self.needs_controllable_content():
+            notes.append(
+                f"budget-only pictures: clock and double-shot checks at frame 0, every {settings.fps}th frame and the last "
+                "frame, and uncontrollable content looked for again at those frames (ADR-046)"
+            )
         failure_reason = "; ".join(failures) if failures else None
-        return StrategyOutcome(deterministic=deterministic and not failures, notes=notes + failures, failure_reason=failure_reason)
+        return StrategyOutcome(
+            deterministic=deterministic and not failures,
+            notes=notes + self._late_notes + failures,
+            failure_reason=failure_reason,
+            uncontrollable=list(late),
+        )
+
+    def _checks_frame(self, index: int, total: int, fps: int) -> bool:
+        """Whether frame ``index`` gets the double-shot, clock and content checks.
+
+        Budget-only pictures can move on the real clock, so they are checked at strategy A's checkpoints:
+        frame 0, the first frame of every captured second and the last frame (ADR-046). With
+        BeginFrameControl the compositor draws only when told, and frame 0 and the last frame suffice.
+        """
+        if self.needs_controllable_content():
+            return is_checkpoint(index, total, fps)
+        return index in (0, total - 1)
+
+    def _late_content(self, page: Page, index: int, late: list[str]) -> list[str]:
+        """Budget-only pictures: content that became uncontrollable since the last look; failure texts.
+
+        Runs ``detect.ContentWatch``'s full scan (image elements and CSS images, WebGL and offscreen
+        canvases, cross-origin frames, workers) plus every image URL the page requested since the last
+        look. New entries are added to ``late``. With BeginFrameControl, B keeps its role and does not look.
+        """
+        if not self.needs_controllable_content() or self.content_watch is None:
+            return []
+        found, notes = self.content_watch.recheck(page, full=True, requested_images=self._network.take_image_requests())
+        self._late_notes.extend(f"at frame {index}: {note}" for note in notes)
+        late.extend(found)
+        return [f"uncontrollable content appeared after the first scan, at frame {index}: {entry}" for entry in found]
 
     def _check_frame(
         self,

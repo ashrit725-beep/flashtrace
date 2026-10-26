@@ -19,7 +19,8 @@ Security rules (build brief and docs/API.md):
 
 Every error is ``{"detail": "<one sentence>"}`` with 400 (bad state), 404 (unknown job), 409 (job busy)
 or 422 (invalid input); the security checks add 400 (Host header not 127.0.0.1 or localhost) and 403
-(POST or DELETE from another origin).
+(POST or DELETE from another origin), and an unexpected internal error (a bug) is 500
+``{"detail": "Internal error: <first line of the exception>"}`` with the security headers too.
 """
 
 from __future__ import annotations
@@ -309,6 +310,25 @@ async def on_validation_error(request: Request, exc: RequestValidationError) -> 
     return JSONResponse(status_code=422, content={"detail": validation_sentence(exc.errors())})
 
 
+def first_line(exc: BaseException) -> str:
+    """The first line of an exception's message, or its class name when the message is empty."""
+    lines = str(exc).strip().splitlines()
+    return lines[0].strip() if lines else type(exc).__name__
+
+
+async def on_unexpected_error(request: Request, exc: Exception) -> JSONResponse:
+    """500 ``{"detail": "Internal error: ..."}`` for an exception no route handled (a bug in FlashTrace).
+
+    Starlette answers such an exception from its ServerErrorMiddleware, which sits outside every
+    middleware FlashTrace adds, so SecurityHeadersMiddleware never sees this response: the headers
+    are set here.  Starlette still re-raises the exception afterwards, so the server log keeps it.
+    """
+    response = JSONResponse(status_code=500, content={"detail": f"Internal error: {first_line(exc)}"})
+    for name, value in SECURITY_HEADERS:
+        response.headers[name.decode("latin-1")] = value.decode("latin-1")
+    return response
+
+
 # --------------------------------------------------------------------------------------- middleware
 class SameOriginMiddleware:
     """Refuse POST/DELETE requests whose Origin header names another site (403).
@@ -448,6 +468,7 @@ def create_app(
     app.state.server = ServerState(store=store, runner=Runner(store), project_root=Path(project_root).resolve(),
                                    allow_local_files=allow_local_files)
     app.add_exception_handler(RequestValidationError, on_validation_error)  # type: ignore[arg-type]
+    app.add_exception_handler(Exception, on_unexpected_error)  # Starlette hands it to ServerErrorMiddleware
     add_security_middleware(app)
     app.include_router(router)
     mount_ui(app, Path(static_dir) if static_dir is not None else DEFAULT_STATIC_DIR)

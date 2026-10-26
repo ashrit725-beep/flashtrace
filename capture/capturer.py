@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 from playwright.sync_api import Browser, BrowserContext, Page, sync_playwright
 from playwright.sync_api import Error as PlaywrightError
 
-from capture.detect import CANVAS_PROBE_JS, WORKER_PROBE_JS, ContentWatch, ImageVerdicts
+from capture.detect import CANVAS_PROBE_JS, WORKER_PROBE_JS, ContentWatch, ImageVerdicts, ReadBudget
 from capture.frames import FrameSequence
 from capture.hashing import sequence_hash
 from capture.page_scripts import APPLY_SUPPRESSION_JS, RECORD_SHADOW_ROOT_FN, SHADOW_ROOT_RECORDER_JS
@@ -137,6 +137,30 @@ class _Attempt:
 
     def abandon(self, kind: str, reason: str) -> None:
         self.abandoned = (kind, reason)
+
+
+@dataclass
+class _SharedDetection:
+    """What the attempts of one capture share about the page's content (capture/detect.py)."""
+
+    #: Image classifications: an image is read once per capture, not once per attempt (ADR-047).
+    verdicts: ImageVerdicts = field(default_factory=dict)
+    #: Real time left for image reads, ``DETECTION_BUDGET_S`` for the whole capture.
+    budget: ReadBudget = field(default_factory=ReadBudget)
+    #: Uncontrollable content that abandoned attempts found, before frame 0 or during their frame loops.
+    found: list[str] = field(default_factory=list)
+
+    def watch(self, allow_local_files: bool) -> ContentWatch:
+        """The ``ContentWatch`` of the next attempt: same cache, same budget, earlier findings carried in."""
+        return ContentWatch(allow_local_files, self.verdicts, self.budget, carried=self.found)
+
+    def remember(self, attempt: _Attempt) -> None:
+        """Keep what an abandoned attempt found, so a later strategy that needs controllable content also
+        steps aside for content the page shows only at some moments (ADR-046)."""
+        late = attempt.outcome.uncontrollable if attempt.outcome is not None else []
+        for entry in [*attempt.uncontrollable, *late]:
+            if entry not in self.found:
+                self.found.append(entry)
 
 
 @dataclass
@@ -425,10 +449,11 @@ def _capture_with_browser(
     it raises; every reason is kept in the chain and written to ``meta.fallbackReason`` and
     ``meta.notes``. The last strategy (or a forced one) is never abandoned: its result is returned as it
     is, and its exceptions propagate. ``PageLoadError`` (the page itself answered with an HTTP error)
-    always propagates: every strategy would load the same answer.
+    always propagates: every strategy would load the same answer. Uncontrollable content an abandoned
+    attempt found is carried into the later attempts' scans (``_SharedDetection``).
     """
     chain = _Chain()
-    verdicts: ImageVerdicts = {}  # image classifications, reused by later attempts on the same page
+    shared = _SharedDetection()  # image verdicts, read budget and findings, for every attempt on this page
     for position, name in enumerate(names):
         strategy_class = REGISTRY.get(name)
         if strategy_class is None:
@@ -436,13 +461,14 @@ def _capture_with_browser(
             raise NotImplementedError(f"capture strategy '{name}' is not implemented yet{reason}")
         attempt = _Attempt(name=name, strategy=strategy_class(), may_fall_through=auto and position < len(names) - 1)
         try:
-            _run_attempt(browser, attempt, settings, target_dir, progress, image_verdicts=verdicts)
+            _run_attempt(browser, attempt, settings, target_dir, progress, shared=shared)
         except (PlaywrightError, RuntimeError, OSError) as exc:
             if not attempt.may_fall_through:
                 raise
             attempt.abandon("errored", f"{type(exc).__name__}: {_first_line(exc)}")
         if attempt.abandoned is not None:
             chain.record(attempt)
+            shared.remember(attempt)
             continue
         return _build_result(attempt, chain, settings, started)
 
@@ -474,17 +500,20 @@ def _run_attempt(
     settings: CaptureSettings,
     target_dir: Path,
     progress: ProgressCallback | None,
-    image_verdicts: ImageVerdicts | None = None,
+    shared: _SharedDetection | None = None,
 ) -> None:
     """Run one strategy end to end in a fresh context; fills ``attempt`` (or abandons it).
 
-    ``image_verdicts`` is the image-classification cache of the capture this attempt belongs to.
+    ``shared`` is what the attempts of the capture this attempt belongs to share about the page's
+    content (a fresh one when the attempt stands alone).
     """
+    if shared is None:  # an attempt on its own (capture/inspect.py, capture/fix.py)
+        shared = _SharedDetection()
     attempt_browser, owned = _browser_for(attempt, browser)
     try:
         context = _new_context(attempt_browser, settings.viewport)
         try:
-            _load_and_capture(context, attempt, settings, target_dir, progress, image_verdicts)
+            _load_and_capture(context, attempt, settings, target_dir, progress, shared)
         finally:
             context.close()
     finally:
@@ -498,7 +527,7 @@ def _load_and_capture(
     settings: CaptureSettings,
     target_dir: Path,
     progress: ProgressCallback | None,
-    image_verdicts: ImageVerdicts | None = None,
+    shared: _SharedDetection,
 ) -> None:
     """Prepare, load, scan and capture inside ``context`` (the per-attempt steps of SPEC 6.2)."""
     strategy = attempt.strategy
@@ -527,7 +556,7 @@ def _load_and_capture(
     if settings.suppress_selectors:
         # Before detection, so a suppressed (hidden) animated image no longer counts as uncontrollable.
         _apply_suppression(page, attempt, settings)
-    if not _scan_page(page, attempt, settings, image_verdicts):
+    if not _scan_page(page, attempt, settings, shared):
         return
 
     attempt.sink = FrameSink(FrameSequence.new_in_dir(target_dir))
@@ -551,12 +580,13 @@ def _record_load_failure(attempt: _Attempt, reason: str, target_dir: Path) -> No
     attempt.outcome = StrategyOutcome(deterministic=False, notes=notes, failure_reason=reason)
 
 
-def _scan_page(page: Page, attempt: _Attempt, settings: CaptureSettings, image_verdicts: ImageVerdicts | None = None) -> bool:
+def _scan_page(page: Page, attempt: _Attempt, settings: CaptureSettings, shared: _SharedDetection) -> bool:
     """Look for uncontrollable content (SPEC 6.2); False when the attempt was abandoned because of it.
 
-    The scan's ``ContentWatch`` is handed to the strategy, which may look again during its frame loop.
+    Content that earlier attempts of this capture found counts as found here too. The scan's
+    ``ContentWatch`` is handed to the strategy, which may look again during its frame loop.
     """
-    watch = ContentWatch(settings.allow_local_files, image_verdicts)
+    watch = shared.watch(settings.allow_local_files)
     attempt.uncontrollable, detect_notes = watch.first_scan(page)
     attempt.strategy.content_watch = watch
     attempt.notes.extend(detect_notes)

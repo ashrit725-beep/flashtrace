@@ -91,6 +91,23 @@ def wait_until(condition: Callable[[], bool], timeout: float = 30.0) -> None:
 
 
 # ------------------------------------------------------------------------------------ processes
+def test_stall_limit_covers_every_silent_wait_before_frame_0() -> None:
+    """ADR-049's arithmetic, from the constants themselves: the waits before frame 0 of a capture whose three
+    strategies all step aside before their frame loops stay below the stall limit, so the watchdog never stops
+    a capture that would have finished. Detection's image reads count with their budget for the whole capture."""
+    from capture import detect
+    from capture.capturer import NAVIGATION_TIMEOUT_MS
+    from capture.strategies import base, realtime
+    from server.app import MAX_DURATION_S
+
+    navigation_s = 3 * NAVIGATION_TIMEOUT_MS / 1000                       # A, B and C
+    load_and_fonts_s = 2 * (base.LOAD_WAIT_MS + base.FONT_WAIT_MS) / 1000  # A and C
+    realtime_s = realtime.FIRST_FRAME_CAP_S + MAX_DURATION_S + realtime.SETTLE_S  # C's first frame, then its recording
+    silent_s = navigation_s + load_and_fonts_s + realtime_s + detect.DETECTION_BUDGET_S
+    assert silent_s == 255.25  # the sum server/runner.py and ADR-049 state
+    assert silent_s < runner_module.STALL_LIMIT_S
+
+
 def test_descendants_gives_each_process_below_the_root_its_depth() -> None:
     table = [(0, 0), (1, 0), (10, 1), (11, 10), (12, 11), (13, 11), (20, 2), (21, 20)]
     assert descendants(1, table) == {10: 1, 11: 2, 12: 3, 13: 3}

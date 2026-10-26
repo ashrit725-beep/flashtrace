@@ -29,17 +29,17 @@ How it works, in plain words:
    (``network_wait.py``), and every ``<video>``/``<img>`` in the viewport that is still loading. In
    virtual time they therefore arrive at the frame in which the page asked for them. A wait that runs
    out marks the capture ``deterministic=False``.
-6. Per frame ``i``: advance the fake clock to ``round(t_i)`` (one ``run_for`` call, so timers and rAF
-   callbacks fire), wait for the network, seek every animation, SVG timeline and video (one
-   ``evaluate`` call), force a style flush, wait for the network again, screenshot. SPEC 6.2 lists the
-   steps as "seek, then ``run_for``, then screenshot"; both orders show every clock at ``t_i`` in the
-   picture. The clock is advanced first so that an animation created by a timer or rAF callback during
-   that step is found and seeked before the picture instead of one frame later.
+6. Per frame ``i``, in the order SPEC 6.2 lists: (1) advance the fake clock to ``round(t_i)`` with one
+   ``run_for`` call, so timers fire, and wait for the network; (2) and (3), one ``evaluate`` pass: run
+   the page's queued ``requestAnimationFrame`` callbacks once at that clock time (``RAF_SYNC_JS``,
+   ADR-029), then seek every animation, SVG timeline and video and force a style flush; wait for the
+   network again; (4) screenshot. The clock is advanced first so that an animation created by a timer or
+   rAF callback during that step is found and seeked before the picture instead of one frame later.
 7. Checks at frame 0, at the first frame of every captured second and at the last frame
    (``is_checkpoint``): the page clock must read the virtual time, and a second screenshot 100 ms of real
    time later, at the same virtual time, must be identical (double-shot), otherwise something animates
-   on a clock we do not control. SPEC 6.2 names only the first and last frames; content that runs on the
-   real clock only in between (a GIF shown from 1 s to 3 s) slipped through those two. Every frame also
+   on a clock we do not control. Checking only the first and last frames let content that runs on the
+   real clock only in between (a GIF shown from 1 s to 3 s) slip through (ADR-046). Every frame also
    asks ``detect.ContentWatch`` for uncontrollable content that appeared since the first scan (new
    images, WebGL canvases, cross-origin frames, workers, image requests), with the costly CSS-image walk
    at the checkpoints. A failed check or such content sends "auto" on to the next strategy (the loop
@@ -97,6 +97,7 @@ from capture.strategies.base import (
     ProgressCallback,
     StrategyOutcome,
     double_shot_matches,
+    is_checkpoint,  # frame 0, every fps-th frame and the last frame (module docstring, step 7)
     take_screenshot,
 )
 from capture.strategies.network_wait import NetworkTracker
@@ -613,12 +614,6 @@ INTERACTION_STATE_JS = "() => window.__ftInteraction || { state: 'missing', mess
 def _frames_text(frames: list[int]) -> str:
     """'3 frame(s), first at frame 12' for a list of frame indices."""
     return f"{len(frames)} frame(s), first at frame {frames[0]}"
-
-
-def is_checkpoint(index: int, total: int, fps: int) -> bool:
-    """Whether frame ``index`` of ``total`` gets the clock check, the double-shot check and the full content
-    scan: frame 0, the first frame of every captured second and the last frame (module docstring, step 7)."""
-    return index == 0 or index == total - 1 or index % fps == 0
 
 
 def _uncertainty_texts() -> dict[str, str]:

@@ -20,13 +20,17 @@ URL can serve a GIF. Only the first ``SNIFF_LIMIT`` bytes are inspected, or up t
 a GIF whose first frame, or an SVG whose markup, is larger than that. An image whose bytes cannot be
 read is reported as ``image-unverified`` (uncontrollable): it could be animated, and a wrong "still"
 would let strategy A claim determinism for frames a GIF moved on the real clock. For the same reason
-image URLs past the first ``MAX_IMAGE_URLS`` are reported as ``images-unverified``.
+image URLs past the first ``MAX_IMAGE_URLS``, and image URLs not read before the capture's
+``DETECTION_BUDGET_S`` of real time for image reads ran out (``ReadBudget``), are reported as
+``images-unverified``.
 
 Content can also arrive after the scan before frame 0: an ``<img>`` a timer inserts, a background a
 class change brings in, a worker a script starts. ``ContentWatch`` keeps what the first scan saw, and
 strategy A asks it at every frame for anything new (SPEC 6.2): the element scan without the costly
 computed-style walk every frame, the full scan once per captured second, plus every image URL the page
-requested since the last frame.
+requested since the last frame. Strategy B, when it takes budget-only pictures, asks for the full scan
+at the same once-a-second checkpoints. What one attempt found is carried into the next attempt's
+``ContentWatch`` (ADR-046).
 
 The scan looks in the document, in every shadow root (open or closed, recorded by the init script in
 ``capture/page_scripts.py``; ADR-022) and in every same-origin frame. Elements an ablation hid
@@ -46,6 +50,7 @@ from __future__ import annotations
 import base64
 import re
 import struct
+import time
 import zlib
 from collections.abc import Iterable
 from pathlib import Path
@@ -74,6 +79,15 @@ MAX_IMAGE_URLS = 200
 
 # Real milliseconds one image read over the network may take before the image counts as unreadable.
 IMAGE_READ_TIMEOUT_MS = 5000
+
+# Real seconds that detection's image reads may take in all, for one capture. The scan before frame 0 of
+# every strategy and the later looks of strategy A (every frame) and of a budget-only strategy B (its
+# checkpoints) share it, as they share the image verdicts (ADR-047). The reads are silent: without this
+# limit 60 image URLs that never answer, at IMAGE_READ_TIMEOUT_MS each, kept a capture without a
+# progress callback for 300 s, the server watchdog's stall limit (ADR-049). Image URLs not read within
+# it count as 'images-unverified', the same safe direction as an unreadable image: "auto" falls through
+# and a PASS becomes INCONCLUSIVE.
+DETECTION_BUDGET_S = 60.0
 
 
 # ---------------------------------------------------------------------------------------- GIF
@@ -302,11 +316,11 @@ WORKER_PROBE_JS = r"""
 })();
 """
 
-# Runs after load (and after an ablation's set-up), and again during strategy A's frame loop
-# (``ContentWatch``). Walks the document, every shadow root and every same-origin frame (``ftScopes``
-# from page_scripts.py) and returns what detection needs. A frame whose document throws on access is
-# cross-origin, which is exactly how it is recognised. Each image URL, canvas, frame and worker is
-# returned once per page: later calls return only what is new. Options:
+# Runs after load (and after an ablation's set-up), and again during the frame loops of strategy A and
+# of a budget-only strategy B (``ContentWatch``). Walks the document, every shadow root and every
+# same-origin frame (``ftScopes`` from page_scripts.py) and returns what detection needs. A frame whose
+# document throws on access is cross-origin, which is exactly how it is recognised. Each image URL,
+# canvas, frame and worker is returned once per page: later calls return only what is new. Options:
 #   styles  also read the CSS image properties of every element (the costly part);
 #   walk    also walk every element for open shadow roots the init script could not see.
 _SCAN_PAGE_BODY = r"""
@@ -491,10 +505,19 @@ async ([url, limit]) => {
 """
 
 
-def _read_image_head(page: Any, url: str, limit: int, local_ok: bool) -> bytes | None:
+def _read_timeout_ms(deadline: float | None) -> float:
+    """Real milliseconds one network read may take: ``IMAGE_READ_TIMEOUT_MS``, or less when ``deadline``
+    (a ``time.monotonic()`` instant, where the detection budget runs out) comes sooner."""
+    if deadline is None:
+        return IMAGE_READ_TIMEOUT_MS
+    return min(IMAGE_READ_TIMEOUT_MS, (deadline - time.monotonic()) * 1000)
+
+
+def _read_image_head(page: Any, url: str, limit: int, local_ok: bool, deadline: float | None = None) -> bytes | None:
     """At most ``limit`` bytes of ``url`` (local file, data: or blob: URL, or over the page's network).
 
-    ``local_ok`` comes from ``local_reads_allowed``; without it a ``file:`` URL is not touched.
+    ``local_ok`` comes from ``local_reads_allowed``; without it a ``file:`` URL is not touched. A network
+    read gives up at ``deadline`` (see ``_read_timeout_ms``); ``None`` means it could not be read.
     """
     parsed = urlparse(url)
     try:
@@ -505,10 +528,13 @@ def _read_image_head(page: Any, url: str, limit: int, local_ok: bool) -> bytes |
         if parsed.scheme == "blob":
             return base64.b64decode(page.evaluate(READ_IN_PAGE_JS, [url, limit]))
         if parsed.scheme in ("http", "https"):
+            timeout_ms = _read_timeout_ms(deadline)
+            if timeout_ms < 1:  # the budget is spent (and Playwright reads a timeout of 0 as "no limit")
+                return None
             # A Range header asks the server for the head only; servers that ignore it send the whole
             # body, which is sliced below, so the result is the same either way.
             response = page.request.get(
-                url, headers={"Range": f"bytes=0-{limit - 1}"}, timeout=IMAGE_READ_TIMEOUT_MS, fail_on_status_code=False
+                url, headers={"Range": f"bytes=0-{limit - 1}"}, timeout=timeout_ms, fail_on_status_code=False
             )
             return response.body()[:limit]
     except Exception:  # unreadable image: nothing to classify, reported by the caller as a note
@@ -516,18 +542,30 @@ def _read_image_head(page: Any, url: str, limit: int, local_ok: bool) -> bytes |
     return None
 
 
-def _classify_image(page: Any, image: dict[str, str], local_ok: bool) -> tuple[str | None, str | None]:
-    """``(uncontrollable entry, note)`` for one image found by the scan; ``(None, None)`` when it is still."""
+def _unreadable(raw: str) -> tuple[str, str]:
+    """The verdict for an image whose bytes could not be read: it could hold an animation (safe direction)."""
+    return f"image-unverified: {raw}", f"could not read image bytes to check for animation: {raw}"
+
+
+def _classify_image(page: Any, image: dict[str, str], local_ok: bool, deadline: float | None = None) -> tuple[str | None, str | None]:
+    """``(uncontrollable entry, note)`` for one image found by the scan; ``(None, None)`` when it is still.
+
+    Network reads give up at ``deadline`` (the detection budget's end; ``None``: no budget).
+    """
     raw, url = image["raw"], image["resolved"]
     if urlparse(url).scheme == "file" and not local_ok:
         return None, f"animation check skipped for a local image URL (the audited page is not a local file, or local files are not allowed): {raw}"
-    head = _read_image_head(page, url, SNIFF_LIMIT, local_ok)
+    head = _read_image_head(page, url, SNIFF_LIMIT, local_ok, deadline)
     if head is None:
         # Safe direction, as for large GIFs below: bytes we could not read could hold an animation.
-        return f"image-unverified: {raw}", f"could not read image bytes to check for animation: {raw}"
+        return _unreadable(raw)
     if gif_needs_more_bytes(head, SNIFF_LIMIT) or svg_needs_more_bytes(head, SNIFF_LIMIT):
         # The first frame of this GIF, or this SVG's markup, goes on past the first 64 KB: read up to 4 MB.
-        head = _read_image_head(page, url, GIF_SNIFF_LIMIT, local_ok) or head
+        longer = _read_image_head(page, url, GIF_SNIFF_LIMIT, local_ok, deadline)
+        if not longer:
+            # The first 64 KB end in the middle of the first frame or the markup, so they cannot say "still".
+            return _unreadable(raw)
+        head = longer
         if gif_needs_more_bytes(head, GIF_SNIFF_LIMIT):
             # Safe direction: frames beyond 4 MB could animate, so the image counts as uncontrollable.
             return f"gif-unverified: {raw}", f"GIF frames beyond the first {GIF_SNIFF_LIMIT} bytes were not checked: {raw}"
@@ -542,30 +580,60 @@ def _classify_image(page: Any, image: dict[str, str], local_ok: bool) -> tuple[s
 ImageVerdicts = dict[tuple[str, str], tuple[str | None, str | None]]
 
 
+class ReadBudget:
+    """Real time left for detection's image reads (``DETECTION_BUDGET_S``). A capture makes one and every
+    ``ContentWatch`` of its attempts draws on it, so the silent reads of a whole capture stay bounded."""
+
+    def __init__(self, seconds: float | None = None) -> None:
+        self.seconds = DETECTION_BUDGET_S if seconds is None else seconds
+        self.spent = 0.0  # real seconds the reads have taken so far
+
+    def remaining_s(self) -> float:
+        return max(0.0, self.seconds - self.spent)
+
+
 # ------------------------------------------------------------------------------- entry points
 class ContentWatch:
     """Uncontrollable content of one loaded page: the first scan before frame 0, then later checks.
 
     ``first_scan`` is ``find_uncontrollable``. ``recheck`` looks again during the frame loop and returns
     only what is new since the last look (the page remembers which URLs, canvases, frames and workers it
-    has already returned). ``verdicts`` is a classification cache that may be shared between the
-    attempts of one capture. At most ``MAX_IMAGE_URLS`` image URLs are read per page; any beyond count
-    as 'images-unverified'.
+    has already returned). ``verdicts`` is a classification cache and ``budget`` the time left for image
+    reads; a capture shares both between its attempts. At most ``MAX_IMAGE_URLS`` image URLs are read per
+    page, and none once the budget is spent; the others count as 'images-unverified'. ``carried`` lists
+    uncontrollable content that earlier attempts of the same capture found (some only during their frame
+    loops): the first scan reports it as well, so a later strategy that needs controllable content steps
+    aside for it too (ADR-046).
     """
 
-    def __init__(self, allow_local_files: bool = False, verdicts: ImageVerdicts | None = None) -> None:
+    def __init__(
+        self,
+        allow_local_files: bool = False,
+        verdicts: ImageVerdicts | None = None,
+        budget: ReadBudget | None = None,
+        carried: Iterable[str] = (),
+    ) -> None:
         self.allow_local_files = allow_local_files
         self.verdicts: ImageVerdicts = {} if verdicts is None else verdicts
+        self.budget = ReadBudget() if budget is None else budget
+        self.carried = list(carried)
         self._seen: set[str] = set()  # resolved image URLs already judged on this page
         self._read = 0                # how many of them were read (at most MAX_IMAGE_URLS)
 
     def first_scan(self, page: "Page") -> tuple[list[str], list[str]]:
-        """Scan a freshly loaded page; ``(uncontrollable, notes)`` as for ``find_uncontrollable``."""
+        """Scan a freshly loaded page; ``(uncontrollable, notes)`` as for ``find_uncontrollable``, plus the
+        carried entries this scan did not find itself."""
         scan = page.evaluate(SCAN_PAGE_JS, FIRST_SCAN)
         uncontrollable, notes = self._judge(page, scan)
         if scan.get("shadowRoots"):
             notes.append(f"detection searched {scan['shadowRoots']} shadow root(s) (open or closed)")
-        return uncontrollable, notes
+        carried = [entry for entry in self.carried if entry not in uncontrollable]
+        if carried:
+            notes.append(
+                "uncontrollable content an earlier strategy of this capture found counts here too, although "
+                "this attempt's first scan did not see it: " + "; ".join(carried)
+            )
+        return uncontrollable + carried, notes
 
     def recheck(self, page: "Page", full: bool, requested_images: Iterable[str] = ()) -> tuple[list[str], list[str]]:
         """What became uncontrollable since the last look: ``(new entries, notes)``.
@@ -592,30 +660,51 @@ class ContentWatch:
         return uncontrollable, notes
 
     def _judge_images(self, page: "Page", images: list[dict[str, str]]) -> tuple[list[str], list[str]]:
-        """Read and classify each image URL not judged before, up to ``MAX_IMAGE_URLS`` per page."""
+        """Read and classify each image URL not judged before, up to ``MAX_IMAGE_URLS`` per page and while
+        the read budget lasts."""
         local_ok = local_reads_allowed(page.url, self.allow_local_files)
         uncontrollable: list[str] = []
         notes: list[str] = []
-        unread = 0
+        past_cap = out_of_time = 0
         for image in images:
             if image["resolved"] in self._seen:
                 continue
             self._seen.add(image["resolved"])
             if self._read >= MAX_IMAGE_URLS:
-                unread += 1
+                past_cap += 1
+                continue
+            verdict = self._verdict(page, image, local_ok)
+            if verdict is None:
+                out_of_time += 1
                 continue
             self._read += 1
-            key = (image["raw"], image["resolved"])
-            if key not in self.verdicts:
-                self.verdicts[key] = _classify_image(page, image, local_ok)
-            entry, note = self.verdicts[key]
+            entry, note = verdict
             uncontrollable.extend([entry] if entry else [])
             notes.extend([note] if note else [])
-        if unread:
-            # Safe direction, as for an unreadable image: any of them could be animated.
-            uncontrollable.append(f"images-unverified: {unread} image URL(s) beyond the first {MAX_IMAGE_URLS} were not checked for animation")
+        # Safe direction, as for an unreadable image: any image URL left unread could be animated.
+        if past_cap:
+            uncontrollable.append(f"images-unverified: {past_cap} image URL(s) beyond the first {MAX_IMAGE_URLS} were not checked for animation")
             notes.append(f"only the first {MAX_IMAGE_URLS} of {len(self._seen)} image URLs were checked for animation")
+        if out_of_time:
+            budget = f"{self.budget.seconds:g} s"
+            uncontrollable.append(f"images-unverified: {out_of_time} image URL(s) not checked within the {budget} detection budget")
+            notes.append(f"detection's image reads used up their {budget} of real time; {out_of_time} image URL(s) were not checked for animation")
         return uncontrollable, notes
+
+    def _verdict(self, page: "Page", image: dict[str, str], local_ok: bool) -> tuple[str | None, str | None] | None:
+        """The image's classification, from the shared cache or read now; ``None`` once the budget is spent.
+
+        The time a read takes is charged to the budget, and a read gives up when the budget runs out."""
+        key = (image["raw"], image["resolved"])
+        if key in self.verdicts:
+            return self.verdicts[key]
+        remaining = self.budget.remaining_s()
+        if remaining <= 0:
+            return None
+        started = time.monotonic()
+        self.verdicts[key] = _classify_image(page, image, local_ok, deadline=started + remaining)
+        self.budget.spent += time.monotonic() - started
+        return self.verdicts[key]
 
 
 def find_uncontrollable(page: "Page", allow_local_files: bool = False) -> tuple[list[str], list[str]]:

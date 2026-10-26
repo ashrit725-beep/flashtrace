@@ -3,7 +3,8 @@
 FlashTrace audits its own web UI: ``tests/test_ui_self_audit.py`` captures the built UI with
 ``capture.capture`` and analyses it with ``engine.analyze``. The capture runs in a real browser on
 the capture's own clock, so the API cannot be mocked inside the page (``web/tests/mock-api.ts`` uses
-Playwright routes). This module serves the same answers over HTTP instead. Standard library only.
+Playwright routes). This module serves the same answers over HTTP instead. Standard library only, apart
+from ``engine.ENGINE_VERSION``, which ``GET /health`` reports as the real server does.
 
 * Static files come from ``web/out`` (the ``next build`` export). A directory serves its
   ``index.html``; the query string (``?id=``, ``?_rsc=``) is ignored, so client navigation loads its
@@ -35,6 +36,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit
+
+from engine import ENGINE_VERSION  # the real engine's version, so /health never drifts from it
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUT = ROOT / "web" / "out"
@@ -233,7 +236,7 @@ def _make_handler(out_dir: Path, state: MockState) -> type[BaseHTTPRequestHandle
             if path == "/__control/strobe.html":
                 self._send(200, STROBE_HTML.encode("utf-8"), TYPES[".html"])
             elif path == "/health":
-                self._json(200, {"ok": True, "version": "0.1.0", "engineVersion": "1.0.0"})
+                self._json(200, {"ok": True, "version": "0.1.0", "engineVersion": ENGINE_VERSION})
             elif path == "/jobs" or path.startswith("/jobs/"):
                 with state.lock:
                     self._api(method, path)

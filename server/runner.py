@@ -83,10 +83,18 @@ STOP_TIMEOUT_S = 10.0  # how long shutdown waits for the running job to stop (th
 # A cancelled task normally stops at its next frame, a few hundredths of a second later; one still
 # running after this long waits in a call that does not call back, so its browser is killed.
 CANCEL_GRACE_S = 2.0
-# The longest stretches without a progress callback while a browser runs are page loads (at most 30 s
-# each, capture.capturer.NAVIGATION_TIMEOUT_MS, for each of the three strategies A -> B -> C) and the
-# realtime strategy's recording (the duration, at most 60 s): 3 x 30 + 60 = 150 s.  Twice that, for a
-# slow machine, is the limit after which a task with a running browser counts as hung.
+# Inside a capture the first progress callback comes from a strategy's frame loop, so the longest
+# stretch without one is the waits before frame 0 of every strategy that steps aside before its loop
+# (docs/DECISIONS.md ADR-049):
+#   * navigation, up to 30 s for each of the three strategies A -> B -> C (capture.capturer.NAVIGATION_TIMEOUT_MS);
+#   * in A and in C, up to 10 s for the load event and up to 10 s for web fonts
+#     (capture.strategies.base.LOAD_WAIT_MS and FONT_WAIT_MS);
+#   * in C, up to 5 s for the screencast's first frame (capture.strategies.realtime.FIRST_FRAME_CAP_S), then
+#     the whole recording (the duration, at most 60 s, plus a quarter-second settle);
+#   * detection's image reads, at most 60 s in all for one capture (capture.detect.DETECTION_BUDGET_S),
+#     shared by every strategy's scan and the later looks of A and of a budget-only B.
+# 3 x 30 + 2 x (10 + 10) + 5 + 60 + 60 = 255 s, plus the quarter second.  300 s leaves a margin for a
+# slow machine; after it a task with a running browser counts as hung.
 STALL_LIMIT_S = 300.0
 WATCH_INTERVAL_S = 0.5  # how often the watchdog looks at the running task
 

@@ -95,6 +95,13 @@ DOUBLE_SHOT_REAL_GAP_MS = 100
 SAMPLE_PHASE = 0.25
 
 
+def is_checkpoint(index: int, total: int, fps: int) -> bool:
+    """Whether frame ``index`` of ``total`` gets the clock check, the double-shot check and the full content
+    scan: frame 0, the first frame of every captured second and the last frame (SPEC 6.2, ADR-046).
+    Strategy A uses it, and so does strategy B when it takes budget-only pictures."""
+    return index == 0 or index == total - 1 or index % fps == 0
+
+
 @dataclass(frozen=True)
 class CaptureSettings:
     """Everything a strategy needs to know about the requested capture."""
@@ -224,7 +231,8 @@ class CaptureStrategy(ABC):
         #: ``capturer`` copies into the capture notes after navigation.
         self.load_notes: list[str] = []
         #: Set by ``capturer`` after its scan for uncontrollable content, before ``run``: the scan's state,
-        #: so a strategy can look again for content that appears after frame 0 (strategy A does).
+        #: so a strategy can look again for content that appears after frame 0 (strategy A does, and strategy B
+        #: when it takes budget-only pictures).
         self.content_watch: ContentWatch | None = None
 
     def needs_controllable_content(self) -> bool:

@@ -98,6 +98,25 @@ def test_every_response_forbids_framing_and_sniffing(make_client, ui_build: Path
         assert {name: response.headers.get(name) for name in FRAMING_HEADERS} == FRAMING_HEADERS
 
 
+def test_unexpected_error_is_json_and_carries_the_security_headers(make_client, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A bug in a route answers 500 in the usual {"detail": ...} shape, still forbidding framing (ADR-037).
+
+    Starlette's ServerErrorMiddleware sits outside SecurityHeadersMiddleware, so the handler sets them."""
+    app = make_client().app
+
+    def broken() -> str:
+        raise RuntimeError("version file unreadable\nsecond line of the message")
+
+    monkeypatch.setattr(server_app, "package_version", broken)  # GET /health calls it on every request
+    # raise_server_exceptions=False: answer like a real server instead of re-raising inside the test.
+    response = TestClient(app, base_url="http://127.0.0.1:8001", raise_server_exceptions=False).get("/health")
+    assert response.status_code == 500
+    assert response.headers["content-type"] == "application/json"
+    assert response.json() == {"detail": "Internal error: version file unreadable"}
+    assert {name: response.headers.get(name) for name in FRAMING_HEADERS} == FRAMING_HEADERS
+    assert server_app.first_line(ValueError()) == "ValueError"  # an empty message names the exception's class
+
+
 def test_the_ui_scripts_are_served_as_javascript(make_client, ui_build: Path) -> None:
     """With nosniff a browser runs a script only when it is served with a JavaScript type."""
     (ui_build / "app.js").write_text("console.log(1);", encoding="utf-8")

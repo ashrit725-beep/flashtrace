@@ -359,3 +359,130 @@ def test_web_font_that_never_answers_does_not_stop_the_capture(server: str, tmp_
 def _forget_registered_pages() -> Iterator[None]:
     yield
     _Handler.pages.clear()
+
+
+# ------------------------------------------------------------------------------- detection budget (ADR-049)
+SILENT_HOLD_S = 20  # longer than every limit the budget test runs into
+
+
+class _SilentHandler(BaseHTTPRequestHandler):
+    """Holds every request for SILENT_HOLD_S and then hangs up without an answer. Records the detection
+    reads, which ask for an image's head with a Range header (the browser's own image loads do not)."""
+
+    detection_reads: ClassVar[list[str]] = []
+
+    def log_message(self, *_args: object) -> None:
+        pass
+
+    def do_GET(self) -> None:  # noqa: N802 - the name http.server calls
+        if self.headers.get("Range"):
+            _SilentHandler.detection_reads.append(self.path)
+        time.sleep(SILENT_HOLD_S)
+
+
+class _SilentServer(ThreadingHTTPServer):
+    block_on_close = False  # closing the server does not wait for the requests it is still holding
+
+
+@pytest.fixture()
+def silent_server() -> Iterator[str]:
+    """A loopback server whose answers never come in time; yields its base URL."""
+    _SilentHandler.detection_reads.clear()
+    httpd = _SilentServer(("127.0.0.1", 0), _SilentHandler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{httpd.server_address[1]}/"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+@pytest.mark.browser
+@pytest.mark.usefixtures("short_waits")
+def test_image_reads_that_never_answer_stay_within_the_detection_budget(
+    silent_server: str, tmp_path: Path, browser: Browser, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """60 such images, read for up to 5 s each, kept a capture silent for the server watchdog's 300 s before
+    frame 0 (ADR-049). All the capture's reads now share DETECTION_BUDGET_S (1 s here, 0.3 s per read); the
+    image URLs left unread count as uncontrollable, so the capture finishes and claims no determinism."""
+    from capture import detect
+    from capture.strategies import virtual_time
+
+    monkeypatch.setattr(detect, "DETECTION_BUDGET_S", 1.0)
+    monkeypatch.setattr(virtual_time, "EXPIRY_REAL_CAP_S", 2.0)  # B's virtual clock waits for the held loads
+    images = "".join(f'<img src="{silent_server}hang/{n}.png" alt="" width="10" height="10">' for n in range(8))
+    page = write_page(tmp_path, page_html('<div id="box"></div>' + images, style=BLINK_CSS))
+    started = time.monotonic()
+    meta = run(page, tmp_path / "out", browser, 0.5).meta
+    assert time.monotonic() - started < 60
+    assert meta.deterministic is False and meta.frame_count == 30
+    budget_entry = r"images-unverified: [1-7] image URL\(s\) not checked within the 1 s detection budget"
+    assert any(re.fullmatch(budget_entry, entry) for entry in meta.uncontrollable), meta.uncontrollable
+    # About 1 s / 0.3 s reads for the whole capture (every strategy draws on one budget), never all 8 images.
+    assert 1 <= len(_SilentHandler.detection_reads) < 8, _SilentHandler.detection_reads
+
+
+# ------------------------------------------------------------------------------- strategy B looks again (ADR-046)
+@pytest.fixture()
+def budget_only_b(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Strategy B as on this laptop: no BeginFrameControl, budget-only self-test passed (ADR-023), on any machine."""
+    from capture.strategies import virtual_time as vt
+
+    monkeypatch.setattr(vt, "begin_frame_unavailable", lambda _browser: f"{vt.BEGIN_FRAME_UNAVAILABLE}: stand-in for the test")
+    monkeypatch.setattr(vt, "budget_mode_unusable", lambda _browser: None)
+
+
+def insert_gif(at_ms: int, remove_at_ms: int | None = None) -> str:
+    """Page script: an animated GIF <img> appended at page time ``at_ms`` (and removed at ``remove_at_ms``)."""
+    script = (f"setTimeout(() => {{ const i = new Image(); i.id = 'late'; i.alt = ''; i.src = 'anim.gif'; "
+              f"document.body.append(i); }}, {at_ms});")
+    if remove_at_ms is not None:
+        script += f"setTimeout(() => document.getElementById('late').remove(), {remove_at_ms});"
+    return script
+
+
+@pytest.mark.browser
+@pytest.mark.usefixtures("budget_only_b")
+@pytest.mark.parametrize("remove_at_ms", [None, 1700], ids=["gif stays", "gif gone before B's frame 0"])
+def test_gif_inserted_after_1_5_s_never_ends_in_a_deterministic_capture(
+    tmp_path: Path, browser: Browser, remove_at_ms: int | None
+) -> None:
+    """A finds the GIF at frame 90 and steps aside. B's frames start at page time 2 s (its pre-roll), so its
+    scan before frame 0 sees the GIF only while it stays; what A found is carried into B's scan either way,
+    so a budget-only B steps aside too and C, which is never deterministic, is used."""
+    page = write_page(tmp_path, page_html('<div id="box"></div>', insert_gif(1500, remove_at_ms)), ("anim.gif",))
+    meta = run(page, tmp_path / "out", browser, 2).meta
+    assert meta.deterministic is False
+    assert meta.strategy == "realtime" and meta.frame_count == 120
+    note_matching(meta.notes, r"^strategy chain: waapi_step \(failed\) -> virtual_time \(skipped\) -> realtime \(used\)$")
+    note_matching(meta.notes, r"^waapi_step failed: uncontrollable content appeared after the first scan, at frame 9[01]: animated-gif: ")
+    note_matching(meta.notes, r"^virtual_time skipped: uncontrollable content: animated-gif: ")
+    assert any(entry.startswith("animated-gif: ") for entry in meta.uncontrollable), meta.uncontrollable
+
+
+@pytest.mark.browser
+@pytest.mark.usefixtures("budget_only_b")
+@pytest.mark.parametrize("mode", ["forced", "auto, B first"])
+def test_budget_only_b_looks_again_at_its_checkpoints(tmp_path: Path, browser: Browser, monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
+    """B's frame 0 is at page time 2 s, so a GIF inserted at 2.5 s appears at its frame 30; the checkpoint of
+    frame 60 (the first frame of the second captured second) finds it. Forced, B keeps its frames and says
+    deterministic=false; in auto it steps aside for C. (In the usual order A, whose frames cover page time
+    0 to 1.5 s, never sees this GIF and rightly stands behind its frames, so B is put first here.)"""
+    from capture import capturer
+
+    page = write_page(tmp_path, page_html('<div id="box"></div>', insert_gif(2500)), ("anim.gif",))
+    if mode == "forced":
+        meta = run(page, tmp_path / "out", browser, 1.5, strategy="virtual_time").meta
+        assert meta.strategy == "virtual_time" and meta.frame_count == 90
+        assert meta.deterministic is False
+        assert any(entry.startswith("animated-gif: ") for entry in meta.uncontrollable), meta.uncontrollable
+        note_matching(meta.notes, r"^uncontrollable content appeared after the first scan, at frame 60: animated-gif: ")
+        note_matching(meta.notes, r"^budget-only pictures: clock and double-shot checks at frame 0, every 60th frame")
+    else:
+        monkeypatch.setattr(capturer, "FALLBACK_ORDER", ("virtual_time", "realtime"))
+        meta = run(page, tmp_path / "out", browser, 1.5).meta
+        assert meta.strategy == "realtime" and meta.deterministic is False
+        note_matching(meta.notes, r"^strategy chain: virtual_time \(failed\) -> realtime \(used\)$")
+        reason = meta.fallback_reason or ""
+        assert re.search(r"uncontrollable content appeared after the first scan, at frame 60: animated-gif: ", reason), reason
+        assert any(entry.startswith("animated-gif: ") for entry in meta.uncontrollable), meta.uncontrollable

@@ -125,6 +125,21 @@ def test_strategy_a_checks_every_captured_second() -> None:
     assert [i for i in range(30) if is_checkpoint(i, 30, 60)] == [0, 29]
 
 
+def test_strategy_a_docstring_lists_the_per_frame_steps_in_the_spec_order() -> None:
+    """waapi_step.py's step 6 and SPEC 6.2 name the per-frame steps in one order: run_for, the
+    requestAnimationFrame flush and seek pass, screenshot."""
+    from capture.strategies import waapi_step
+
+    spec = (Path(__file__).resolve().parents[2] / "docs" / "SPEC.md").read_text(encoding="utf-8")
+    spec_a = spec[spec.index("* **A `waapi_step` (default).**") : spec.index("* **B `virtual_time`.**")]
+    doc = waapi_step.__doc__ or ""
+    step_6 = doc[doc.index("6. Per frame") : doc.index("7. Checks")]
+    for text in (spec_a[spec_a.index("Per frame") :], step_6):
+        positions = [text.index(word) for word in ("run_for", "requestAnimationFrame", "seek", "screenshot")]
+        assert positions == sorted(positions), text
+    assert "names only the first and last frames" not in doc
+
+
 def test_unknown_strategy_name_is_rejected_before_any_browser_work() -> None:
     with pytest.raises(ValueError):
         capture("ignored.html", strategy="no_such_strategy")
