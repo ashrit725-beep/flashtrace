@@ -24,3 +24,8 @@ web/test-results/
 .DS_Store
 .idea/
 .vscode/
+
+# local AI-tool configuration (not part of FlashTrace)
+.claude/
+.mcp.json
+skills-lock.json
