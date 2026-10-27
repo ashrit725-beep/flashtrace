@@ -29,3 +29,5 @@ web/test-results/
 .claude/
 .mcp.json
 skills-lock.json
+video/*.mp4
+video/*.webm
