@@ -172,26 +172,72 @@ class FrameSink:
         return digest
 
 
-def take_screenshot(page: Page) -> bytes:
+#: Real milliseconds one ``page.screenshot`` of strategy A may take (ADR-053). A picture normally takes tens
+#: of milliseconds. In the UI self-audit a request now and then got no answer within Playwright's 30 s
+#: default: Playwright's own wait for fonts had finished, and the browser's screenshot command then did not
+#: answer (cause not found). So the request is bounded and made once more. Strategy B has its own, shorter limit.
+SCREENSHOT_TIMEOUT_MS = 10_000
+#: Requests for one picture before the strategy gives up and raises (auto then falls through).
+SCREENSHOT_ATTEMPTS = 2
+#: Retries one capture may make in all, whichever pictures need them (ADR-053). Each retry follows a request
+#: that waited ``SCREENSHOT_TIMEOUT_MS``; without this limit a page that stalls on every frame would cost about
+#: 10 s per frame (a 600-frame capture, about 100 minutes) while reporting progress every frame, so the server's
+#: watchdog would never fire. With it, stalls cost a capture at most (limit + 1) x 10 s = 30 s of real time.
+SCREENSHOT_RETRIES_PER_CAPTURE = 2
+
+
+@dataclass
+class ScreenshotRetries:
+    """The stalled pictures one capture has requested again (``used``) and how many it may (ADR-053)."""
+
+    limit: int = SCREENSHOT_RETRIES_PER_CAPTURE
+    used: int = 0
+
+
+def take_screenshot(page: Page, retries: ScreenshotRetries | None = None) -> bytes:
     """Screenshot the viewport exactly as it is.
 
     ``animations="allow"`` tells Playwright not to touch CSS animations (its "disabled" mode would
     fast-forward them, destroying the state we seeked). The caret is hidden because a blinking text
     cursor would be a tiny flashing region. ``scale="css"`` gives one image pixel per CSS pixel.
+
+    A request that times out is made again, up to ``SCREENSHOT_ATTEMPTS`` in all, while the capture's
+    ``retries`` budget lasts; each retry is counted in ``retries.used`` (ADR-053). Virtual time has not
+    moved, so the retry pictures the same instant; the clock and double-shot checks still judge it.
+    Without a budget, once the budget is spent, or when the last attempt times out too, a ``TimeoutError``
+    propagates: strategy A's attempt errors and auto falls through.
     """
-    return page.screenshot(type="png", animations="allow", caret="hide", full_page=False, scale="css")
+    for _ in range(SCREENSHOT_ATTEMPTS - 1):
+        try:
+            return _screenshot(page)
+        except PlaywrightTimeoutError as exc:
+            if retries is None:
+                raise
+            if retries.used >= retries.limit:
+                raise PlaywrightTimeoutError(
+                    f"a screenshot request got no answer within {SCREENSHOT_TIMEOUT_MS / 1000:g} s of real time, and "
+                    f"this capture had already used its {retries.limit} screenshot retries (ADR-053)"
+                ) from exc
+            retries.used += 1
+    return _screenshot(page)
 
 
-def double_shot_matches(page: Page, reference_hash: str) -> bool:
+def _screenshot(page: Page) -> bytes:
+    return page.screenshot(type="png", animations="allow", caret="hide", full_page=False, scale="css",
+                           timeout=SCREENSHOT_TIMEOUT_MS)
+
+
+def double_shot_matches(page: Page, reference_hash: str, retries: ScreenshotRetries | None = None) -> bool:
     """Wait ``DOUBLE_SHOT_REAL_GAP_MS`` of real time, take a second screenshot and report whether it is
     pixel-identical to ``reference_hash``.
 
     SPEC 6.2 double-shot check: nothing on the page may change between two screenshots taken at the
     same virtual time. If something does, it is animating on a clock the strategy does not control.
     ``page.wait_for_timeout`` waits in the Playwright driver, not with the page's (frozen) timers.
+    ``retries`` (the capture's budget, shared with its frames) is passed to ``take_screenshot``.
     """
     page.wait_for_timeout(DOUBLE_SHOT_REAL_GAP_MS)
-    return FrameSink.hash_png(take_screenshot(page)) == reference_hash
+    return FrameSink.hash_png(take_screenshot(page, retries)) == reference_hash
 
 
 # The interaction script is user-supplied JS source. Running it as the body of an async function
@@ -223,7 +269,7 @@ class CaptureStrategy(ABC):
     #: True when the strategy's pictures come from ``page.screenshot``, which waits for
     #: ``document.fonts.ready`` before every picture (Playwright 1.63, ``Screenshotter._preparePageForScreenshot``).
     #: Such a strategy cannot capture a page whose web font is still loading after ``FONT_WAIT_MS``: each
-    #: picture would wait for its 30 s timeout. ``capturer`` then gives the attempt up.
+    #: picture would wait until its timeout. ``capturer`` then gives the attempt up.
     pictures_wait_for_fonts: ClassVar[bool] = False
 
     def __init__(self) -> None:

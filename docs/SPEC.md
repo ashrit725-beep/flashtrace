@@ -451,15 +451,25 @@ independent of the PNG encoder). `hash = sha256(concatenation of all frameHashes
   `page.clock` at virtual time 0 (controls `Date`, timers, `requestAnimationFrame`, `performance.now`). Pause
   every animation from `document.getAnimations()` (including same-origin frames). Per frame `i`, in this order:
   (1) advance `page.clock` with one `clock.run_for(round(t_i) − round(t_{i−1}))`, whole milliseconds (frame 0 runs
-  `round(t_0)`, a quarter-frame, ADR-029), so timers and JS animations advance;
+  `round(t_0)`, a quarter-frame, ADR-029), so timers and JS animations advance; the IntersectionObserver callbacks
+  that step 4 of the previous frame queued run at the start of this step, after any 0 ms timers the page set
+  during that same pass (the clock fires timers due at the same time in the order they were set), as the browser
+  runs them in a task after a frame;
   (2) run the page's queued `requestAnimationFrame` callbacks once at that clock time, as a browser does once per
-  drawn frame (ADR-029); (3) seek each animation to `currentTime = phase + playbackRate × (t_i − startOffset)`,
-  honouring the phase and rate the page gave it (ADR-022, ADR-029), and seek each `<video>` like an animation
-  (below), waiting for `seeked`; (4) screenshot (`animations="allow"`). Steps 2 and 3 are one pass in the page. The
-  clock moves first so that an animation a timer or callback creates in that step is seeked before the picture,
-  not one frame later. Animations discovered after frame 0 are treated as starting at the frame in which they
-  first appear. Animations inside shadow roots (open or closed, recorded by an init script that wraps
-  `attachShadow`) are driven the same way; SVG SMIL timelines are paused and set with `setCurrentTime`; an
+  drawn frame (ADR-029); (3) seek each animation to
+  `currentTime = phase + playbackRate × (t_i − startOffset)`, honouring the phase and rate the page gave it
+  (ADR-022, ADR-029), and seek each `<video>` like an animation (below), waiting for `seeked`; (4) evaluate every
+  IntersectionObserver once, on the layout just seeked (the layout of the picture), as a browser does once per
+  rendering update, and queue its callbacks as a 0 ms task on the page clock (ADR-052); (5) screenshot
+  (`animations="allow"`). Steps 2 to 4 are one pass in the page; the network is waited for before and after it.
+  The clock moves first so that an animation a timer or callback creates in that step is seeked before the
+  picture, not one frame later. Animations discovered after frame 0 are treated as starting at the frame in which
+  they first appear. Other work the page starts and the browser finishes on the real clock is not waited for
+  (§10). A screenshot request may take 10 s of real time; one that times out is made once more at the same
+  virtual time, with a note (the clock and double-shot checks still apply), and if that one times out too the
+  attempt fails and auto falls through (ADR-053). One capture retries at most 2 pictures in all; the next picture
+  that times out fails the attempt the same way, so stalls cost a capture at most 30 s of real time. Animations inside shadow roots (open or closed, recorded by an
+  init script that wraps `attachShadow`) are driven the same way; SVG SMIL timelines are paused and set with `setCurrentTime`; an
   animation the page resumes later is re-adopted; `Math.random` is replaced by a fixed-seed generator (ADR-022).
   **`<video>` (ADR-045):** each video is muted, paused and seeked per frame to media time
   `phase + playbackRate × (t_i − start)`, wrapped when it loops and held at its end otherwise. `start` is the
@@ -631,6 +641,18 @@ written. Field list in the build brief; additions: `settings.redRule`, `settings
   PASS becomes INCONCLUSIVE.
 * Under realtime capture (strategy C) a measured rate can be one flash per second higher or lower than the page's,
   because a compositor frame drawn late or dropped moves a transition by one frame.
+* Under strategy A, work that the page starts and the browser finishes on the real clock is not waited for
+  (ADR-052): React scheduler tasks (MessageChannel messages), the page's handling of `fetch` and `XMLHttpRequest`
+  answers, history traversals (`history.back()`, `forward()`, `go()`), script, style and image load events,
+  `window.postMessage`, WebSocket and EventSource messages, storage callbacks and Navigation API traversals. A page
+  that changes what it shows on such an event can show that change one frame earlier or later in another capture
+  (several frames when the page also holds the change behind a gate on its own timers), although both captures are
+  reported as deterministic.
+* Under strategy A, IntersectionObserver is FlashTrace's own implementation (ADR-052). It clips a target by its
+  ancestors' overflow along an approximated containing-block chain and ignores transforms, `clip-path`, `clip`,
+  `border-radius`, `overflow-clip-margin` and `scrollMargin`, so a reveal that depends on those can start at a
+  different scroll position than in a browser; `isVisible` (`trackVisibility`) equals `isIntersecting`, without an
+  occlusion test.
 * The fine-pattern exception (T6) and spatial-pattern hazards are not evaluated.
 * Only the captured viewport and duration are analysed; content revealed by scrolling or interaction is
   analysed only if an interaction script drives it.

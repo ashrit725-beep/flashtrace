@@ -96,3 +96,29 @@ student. No AI/LLM is used *inside* FlashTrace; the product is fully offline and
   produce, so it is not a figure of record (ADR-041). The count before the fix is the Determinism line of the M3
   docs/RESULTS.md (commit 0761f45). The determinism figure of record is the Determinism line of the current
   docs/RESULTS.md. That entry stays as written because this file is append-only.
+
+## 2026-10-25 – 2026-10-26 — Final review, last fixes, final benchmark (M9)
+
+* **Final review.** Five AI reviewers checked the whole repository against the build brief (compliance, engine
+  edge cases, capture on realistic pages, documentation as a judge reads it, server security and safety). One AI
+  skeptic tried to refute each finding before anything was fixed. Confirmed findings were fixed by AI agents, each
+  in its own area, with tests: among them a smooth 2.8–3 Hz pulse that failed because a change still in progress at
+  the end of the recording was counted too early; red pulses fading to near-black that lost their red flashes;
+  area measured per whole cell instead of per pixel; a 404 page that was audited as if it were the page; a hung page
+  that could block the server for good. Each changed rule got an ADR (ADR-038 – ADR-052).
+* **Documentation check.** An AI agent wrote the pending ADRs and SPEC amendments; a second AI agent compared every
+  changed statement with the code and found mismatches (for example, a decision record that described the server
+  watchdog's timing wrongly), which were corrected.
+* **Determinism of scroll-triggered content.** The UI self-audit (FlashTrace measuring its own interface) showed a
+  scroll scenario that was not reproducible. An AI agent traced it to IntersectionObserver callbacks running on
+  Chromium's real clock, made capture deliver them once per frame for every page, and an AI reviewer compared the
+  result with Chrome's own behaviour and found a precision difference, which was then fixed (ADR-052). A second
+  part of that change, which waited for other real-clock page work by hooking private internals of Playwright's
+  clock, was removed by the orchestrating AI after a full test run showed rare 30 s screenshot stalls with it in
+  place; the remaining limitation is documented (ADR-052, ADR-053).
+* **Final benchmark.** The orchestrating AI ran `flashtrace bench` from a clean git worktree of commit 6a838cc and
+  copied the generated docs/RESULTS.md and docs/RESULTS.json into the repository unchanged. No figure in either
+  file was typed by hand.
+* **The student's part.** The build brief, the request for motion and look-and-feel, and the final say on every
+  trade-off recorded in docs/DECISIONS.md. Before presenting, the student should be able to explain every engine
+  module using docs/ENGINE.md.

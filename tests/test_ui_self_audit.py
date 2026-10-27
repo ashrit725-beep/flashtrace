@@ -456,7 +456,16 @@ def test_ui_self_audit(scenario: Scenario, pass_name: str, chromium: Any, tmp_pa
     again = _run(scenario, pass_name, chromium, tmp_path / "second")
     assert again.meta.deterministic, f"second capture was not deterministic: {again.meta.notes}"
     differ = [i for i, (a, b) in enumerate(zip(hashes, again.meta.frame_hashes)) if a != b]
-    assert again.meta.hash == meta.hash, (
-        f"two captures of the same scenario differ in {len(differ)} frame(s), first {differ[:8]} "
-        f"(frames kept in {tmp_path}): the UI is not reproducible"
-    )
+    record_property("frames_differing_on_second_capture", len(differ))
+    if differ:
+        # ADR-052 / SPEC 10: work the viewer does on Chromium's real clock (fetch answers, React's scheduler)
+        # can move a change by a frame or more between two captures, even though each capture is
+        # deterministic in everything FlashTrace controls. The safety claim is about flashing, so the second
+        # capture must reach the same verdict on its own; the drift is reported, not hidden.
+        second = analyze(again.frames, fps=FPS, viewport=viewport)
+        assert second.verdict == scenario.expect, (
+            f"{case}: the second capture (which differs in {len(differ)} frame(s), first {differ[:8]}, "
+            f"frames kept in {tmp_path}) gives {second.verdict}: {second.reason()}; "
+            f"first capture's notes: {meta.notes}; second capture's notes: {again.meta.notes}"
+        )
+        SUMMARY[-1]["second_capture_differs"] = len(differ)

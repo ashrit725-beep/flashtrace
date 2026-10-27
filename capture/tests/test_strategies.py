@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 from playwright.sync_api import Browser
 from playwright.sync_api import Error as PlaywrightError
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 from capture import CaptureResult, capture
 from capture.strategies import network_wait
@@ -193,6 +194,77 @@ def test_network_wait_gives_up_on_a_request_that_never_finishes(monkeypatch: pyt
     assert tracker.in_flight == 0
     assert tracker.take_abandoned() == ["http://127.0.0.1/stream"]
     assert tracker.take_abandoned() == []  # each request is reported once
+
+
+# ------------------------------------------------------------------------------- pure: screenshot retry (strategy A)
+class _StandInShotPage:
+    """Answers each screenshot() with the next outcome: bytes, or an exception to raise."""
+
+    def __init__(self, *outcomes: bytes | Exception) -> None:
+        self.outcomes = list(outcomes)
+        self.calls: list[dict[str, object]] = []
+
+    def screenshot(self, **options: object) -> bytes:
+        self.calls.append(options)
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+def test_a_stalled_screenshot_is_requested_again_and_noted() -> None:
+    """ADR-053: the first request times out, the second answers; the retry is a note, not an uncertainty."""
+    from capture.strategies.base import SCREENSHOT_TIMEOUT_MS, take_screenshot
+    from capture.strategies.waapi_step import _Tally
+
+    page = _StandInShotPage(PlaywrightTimeoutError("Timeout 10000ms exceeded."), b"png")
+    tally = _Tally()
+    assert take_screenshot(page, tally.screenshot_retries) == b"png"
+    assert [call["timeout"] for call in page.calls] == [SCREENSHOT_TIMEOUT_MS, SCREENSHOT_TIMEOUT_MS] == [10_000, 10_000]
+    assert tally.screenshot_retries.used == 1
+    assert any(note.startswith("screenshot retried 1 time(s): ") for note in tally.notes()), tally.notes()
+    assert tally.uncertainties() == []
+
+
+def test_a_screenshot_that_stalls_every_time_raises() -> None:
+    """Every attempt times out: the TimeoutError propagates (strategy A errors and auto falls through)."""
+    from capture.strategies.base import SCREENSHOT_ATTEMPTS, ScreenshotRetries, take_screenshot
+
+    retries = ScreenshotRetries()
+    page = _StandInShotPage(*(PlaywrightTimeoutError("Timeout 10000ms exceeded.") for _ in range(SCREENSHOT_ATTEMPTS)))
+    with pytest.raises(PlaywrightTimeoutError):
+        take_screenshot(page, retries)
+    assert len(page.calls) == SCREENSHOT_ATTEMPTS == 2
+    assert retries.used == SCREENSHOT_ATTEMPTS - 1
+
+
+def test_screenshot_retries_are_capped_per_capture() -> None:
+    """ADR-053: one capture retries at most SCREENSHOT_RETRIES_PER_CAPTURE stalled pictures in all; the next
+    stalled picture raises at once, without a retry, so a page that stalls on every frame cannot cost 10 s per
+    frame. Frames and double-shot pictures share the budget."""
+    from capture.frames import rgb_to_png
+    from capture.strategies.base import (
+        SCREENSHOT_RETRIES_PER_CAPTURE,
+        FrameSink,
+        double_shot_matches,
+        take_screenshot,
+    )
+    from capture.strategies.waapi_step import _Tally
+
+    stall = PlaywrightTimeoutError("Timeout 10000ms exceeded.")
+    second = rgb_to_png(np.zeros((4, 4, 3), dtype=np.uint8))
+    tally = _Tally()
+    assert SCREENSHOT_RETRIES_PER_CAPTURE == 2
+    page = _StandInShotPage(stall, b"frame0", stall, second, stall, b"never asked")
+    page.wait_for_timeout = lambda ms: None  # the double-shot's real-time gap
+    assert take_screenshot(page, tally.screenshot_retries) == b"frame0"
+    assert double_shot_matches(page, FrameSink.hash_png(second), tally.screenshot_retries)
+    with pytest.raises(PlaywrightTimeoutError, match="already used its 2 screenshot retries"):
+        take_screenshot(page, tally.screenshot_retries)
+    assert len(page.calls) == 5  # stall, retry, stall, retry, stall: no third retry
+    assert page.outcomes == [b"never asked"]
+    assert tally.screenshot_retries.used == 2
+    assert any(note.startswith("screenshot retried 2 time(s): ") and "once" not in note for note in tally.notes())
 
 
 # ------------------------------------------------------------------------------- pure: BeginFrameControl probe

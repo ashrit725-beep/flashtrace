@@ -124,11 +124,12 @@ In words:
    fast the computer is. Pages whose animation cannot be controlled (animated GIFs, WebGL, cross-origin frames) are
    recorded in real time instead, and then a PASS is reported as INCONCLUSIVE.
 2. **Measure** (`engine/`). Each frame is split into 4 × 4 px cells. For each cell FlashTrace computes relative
-   luminance with the WCAG formula and checks for saturated red.
+   luminance with the WCAG formula and checks for saturated red. The cells show *when* brightness changes; the
+   rules below are then checked for every pixel inside a changing cell, so partly covered cells are measured exactly.
 3. **Transitions and flashes.** A transition is a rise or fall between a peak and a valley of a cell's brightness
    that changes luminance by 0.10 or more while the darker state is below 0.80. Two opposite transitions make one
    flash. Red flashes use the WCAG 2.2 saturated-red rule.
-4. **Area.** A moment counts only if the cells flashing together cover more than 25% of some 341 × 256 px rectangle
+4. **Area.** A moment counts only if the pixels flashing together cover more than 25% of some 341 × 256 px rectangle
    (WCAG's stand-in for 10° of your vision at 1024 × 768).
 5. **Rate.** More than 3 such flashes of one type inside any one-second window is a **FAIL**.
 6. **Attribution** (`capture/attribute.py`). FlashTrace lists the page elements under the failing area and ranks
@@ -180,7 +181,16 @@ These are also listed inside every report:
 * Headless sRGB rendering is not a physical display; brightness, gamma and viewing distance differ per user.
 * Canvas and WebGL attribution is element-level only: FlashTrace can name the canvas, not what is drawn in it.
 * Cross-origin iframes cannot be inspected or clock-controlled; they are reported as unattributable regions.
-* Animated GIF, WebP and APNG images force real-time capture, so a PASS becomes INCONCLUSIVE.
+* Animated GIF, WebP, APNG and SVG images, and Web Workers, force real-time capture, so a PASS becomes INCONCLUSIVE.
+  Under real-time capture a measured rate can be one flash per second off.
+* Work a page finishes on the browser's own clock (data arriving from the network, React's scheduler, history
+  navigation, messages) is not controlled; a change triggered by it can land a frame earlier or later in another
+  capture, although both captures report deterministic.
+* FlashTrace drives IntersectionObserver itself, frame by frame; it ignores transforms, `clip-path` and rounded
+  corners when deciding what is in view, so a reveal that depends on those can start at a slightly different scroll
+  position than in a browser.
+* The 341 × 256 px window slides in 4 px steps, so an area larger than the window can be under-measured by up to
+  3 px along an edge.
 * The fine-pattern exception and spatial-pattern hazards are not evaluated.
 * Only the captured viewport and duration are analysed; content shown by scrolling or clicking is analysed only if a
   `--script` drives it.

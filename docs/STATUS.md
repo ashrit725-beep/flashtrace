@@ -121,7 +121,23 @@ on a clean worktree of commit 808cd30, which contains all five milestones. That 
 * Open: a fix can only be verified under a deterministic capture. On this Mac, strategy B is never deterministic
   (ADR-023), so a page that needs B or C cannot get a verified fix here. Area fixes are never applied (by design).
 
-## M7 — local server and `flashtrace serve` (2026-10-25, commit 29c5743)
+## M7 — CLI polish, HTML report, GitHub Action (2026-10-25)
+
+* Passed:
+  * `flashtrace audit` prints progress for capture, analysis and attribution, and exits 0 on PASS, 1 on FAIL,
+    1 on INCONCLUSIVE (0 with `--no-fail`) and 2 on error; `--attribute` defaults to bbox (ADR-033).
+  * Every `flashtrace` invocation ends its human output with the disclaimer, including error exits and `--help`
+    (ADR-050).
+  * The HTML export is one self-contained file: static timeline and heatmap drawings, still evidence frames with
+    manual previous/next only, culprits and fixes, limitations, the disclaimer twice, every string escaped (ADR-034).
+  * `action/action.yml` wraps `flashtrace audit` for GitHub Actions, and cli/tests/test_action.py checks that every
+    flag it passes exists in `flashtrace audit --help`. `.github/workflows/ci.yml` runs the Python suites and the
+    web build with the axe test.
+* Measured: no figures.
+* Open: the Action and the CI workflow have not run on GitHub's runners yet (the repository has no remote), so
+  strategy B's BeginFrameControl path (Linux only) has not been exercised.
+
+## M8, server half — local server and `flashtrace serve` (2026-10-25, commit 29c5743)
 
 * Passed:
   * the FastAPI app of docs/API.md, serving the API and the static UI from one loopback origin;
@@ -135,21 +151,26 @@ on a clean worktree of commit 808cd30, which contains all five milestones. That 
 * Measured: no figures.
 * Open: none blocking.
 
-## M8 — web viewer (2026-10-24, commit 044830e; motion: 49ccb74, 0b35e5b)
+## M8, web half — web viewer and axe test (2026-10-24, commit 044830e; motion: 49ccb74, 0b35e5b)
 
 * Passed (as committed): the four screens (new audit, running, report, history); a static export served by
   `flashtrace serve`; frame stepping by hand only (previous/next); the disclaimer in a persistent footer. Motion
   follows ADR-024 and its amendment, and tests/test_ui_self_audit.py audits the UI with FlashTrace's own capture and
   engine.
-* Not re-run for this note:
-  * the web Playwright + axe suite (web/tests, run through npm);
-  * the UI self-audit, which needs the built web/out.
+* Re-run on 2026-10-25 after the motion pass landed: the web Playwright + axe suite (`npm run test:a11y`) passed
+  with 18 screenshot-only tests skipped by design, and axe reported 0 violations on every screen and state in light
+  and dark. The heatmap now outlines the worst violation (highest rate), as the reason sentence and the HTML export
+  do; a new test pins it.
+* Found by the UI self-audit: the report-scroll scenario was not reproducible between two captures. The viewer
+  reveals some content when it scrolls into view, and Chromium delivers IntersectionObserver callbacks on the real
+  clock. Fixed in capture for every page, not only FlashTrace's own (ADR-052): strategy A evaluates
+  IntersectionObserver once per captured frame. An earlier version also waited for other page work on the real clock
+  by hooking the fake clock's internals; it was removed because it was implicated in rare 30 s screenshot stalls and
+  was hard to explain (ADR-052, ADR-053). Such work can still move a change by a frame between two captures, so the
+  self-audit now requires the second capture to reach the same verdict rather than identical frames (ADR-024).
+* Open: none blocking. What capture still cannot control is listed in SPEC section 10 and in every report.
 
-  A separate pass on web/ was in progress on 2026-10-25, and web/out must not be rebuilt during it. The clean
-  808cd30 worktree has no web/out, so tests/test_ui_self_audit.py skipped there with "web/out is missing".
-* Open: run the web suite and the self-audit once the web pass lands, and record their counts here.
-
-## Benchmark re-run and suite check at commit 808cd30 (2026-10-25; the re-run planned for M9)
+### Superseded by M9: benchmark re-run and suite check at commit 808cd30 (2026-10-25)
 
 * Ran in a clean `git worktree` of 808cd30 (no uncommitted changes; the commit in the Run table has no `-dirty`):
   `flashtrace bench --n 200 --seed 1 --duration 10 --fps 60 --workers 4 --determinism-sample 20 --attribute bbox
@@ -173,3 +194,30 @@ on a clean worktree of commit 808cd30, which contains all five milestones. That 
     after this run. Once they are committed, the benchmark must be run again from a clean worktree of that commit,
     and docs/RESULTS.md and docs/RESULTS.json replaced together. Until then, RESULTS.md describes 808cd30.
   * Strategy B on Linux, where BeginFrameControl exists (from M2).
+
+## M9 — README, demo site, final benchmark (2026-10-26)
+
+* Passed:
+  * README.md: what FlashTrace is, install, quick start with the demo, every command, how it works with a pipeline
+    diagram, where accuracy figures live, the GitHub Action, limitations, project layout, AI disclosure, and the
+    disclaimer.
+  * demo/: the warning page at `/`, the deliberately flashing "Courtside Live" page at `/site/` (a strobing loader
+    that fails, a small pulsing red LIVE badge that does not qualify by area, a slow fade that passes), served on
+    127.0.0.1 only by `flashtrace demo`. FlashTrace's own audit of it fails with `#loader` as the minimal culprit
+    set, and the proposed rate fix verifies by re-capture (capture/tests and cli/tests pin this).
+  * Final benchmark, the record in docs/RESULTS.md and docs/RESULTS.json: run from a clean `git worktree` of commit
+    6a838cc with `flashtrace bench --n 200 --seed 1 --duration 10 --fps 60 --workers 4 --determinism-sample 20
+    --attribute bbox --ablate-sample 20 --ablate-duration 4 --out docs/RESULTS.md`. It covers verdict accuracy on
+    clear and boundary cases, violation types, advisories, bbox top-1 attribution on every FAIL page, top-1 and
+    minimal-set accuracy on the ablation sample, determinism on 20 re-run pages, and runtime. Every figure is in
+    docs/RESULTS.md (ADR-041). While it ran, the machine was also running another FlashTrace job, so the runtime
+    table describes a loaded machine.
+* Ordering note: ADR-052 (per-frame IntersectionObserver) and ADR-053 (bounded screenshot retry) were committed
+  after 6a838cc. No benchmark page
+  or demo file uses IntersectionObserver, scrolling, history navigation or fetch, so that change cannot alter the
+  benchmark's verdicts, attributions or frame hashes; the benchmark was not re-run for it.
+* Suites at the final commit: the Python suite (engine, capture, cli, bench, server, repository rules and the UI
+  self-audit) and the web suite; results in the M9 commit message and below once the run completes.
+* Open:
+  * Strategy B on Linux, where BeginFrameControl exists; the GitHub Action and CI have not run on GitHub's runners.
+  * The limitations in SPEC section 10.

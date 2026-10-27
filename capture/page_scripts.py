@@ -17,6 +17,11 @@ Two kinds of script live here.
   - ``ANIMATION_RECORDER_JS`` (strategy A only) records what the page itself asks of its animations, SVG
     timelines and media elements (pause, play, a new current time), so strategy A can honour it while it
     drives them.
+  - ``RAF_SYNC_JS`` (strategy A only) queues ``requestAnimationFrame`` callbacks so strategy A runs them
+    once per captured frame (ADR-029).
+  - ``IO_SYNC_JS`` (strategy A only) replaces ``IntersectionObserver`` with one that strategy A evaluates
+    once per captured frame, on that frame's layout, and whose callbacks run in a task on the page clock
+    (ADR-052).
 
 * **Page helpers.** ``PAGE_HELPERS_JS`` is a block of small JavaScript functions that is pasted at the
   top of every function FlashTrace evaluates in the page (strategy A's per-frame seek, detection's scan
@@ -159,6 +164,434 @@ RAF_SYNC_JS = r"""
 
 #: Note added by strategy A, which installs ``RAF_SYNC_JS``.
 RAF_SYNC_NOTE = "requestAnimationFrame callbacks run once per captured frame, at that frame's clock time"
+
+# ADR-052: Chromium computes IntersectionObserver entries in its own rendering updates, which follow the
+# real clock, and delivers them in a task after that update. Under strategy A a reveal-on-scroll therefore
+# started one frame earlier or later between two captures of the same page (the UI self-audit's E5 differed
+# in 23 frames). This init script replaces IntersectionObserver (and IntersectionObserverEntry, so instanceof
+# and feature checks keep working) with an implementation that the seek pass evaluates once per captured
+# frame, on the layout of that frame's picture (after the animations are seeked), exactly as a browser
+# evaluates once per rendering update. The entries are delivered as a browser does, in a task after the
+# picture: a 0 ms timer on the page clock (the fake setTimeout, saved here), which fires at the start of the
+# next clock step, after any 0 ms timers the page set during that same pass (the fake clock fires timers due
+# at the same time in the order they were set).
+#
+# What is implemented: the constructor (callback, {root, rootMargin, threshold, scrollMargin, delay,
+# trackVisibility}) with Chromium's validation and error texts, observe / unobserve / disconnect /
+# takeRecords, the root, rootMargin, scrollMargin, thresholds, delay and trackVisibility attributes, and
+# entries with time (performance.now(), the page clock), rootBounds, boundingClientRect, intersectionRect,
+# isIntersecting, isVisible, intersectionRatio and target. The root is an element, or the viewport of a
+# document (an explicit Document, or the top-level document for root null). rootMargin is one to four
+# lengths in px or % (top right bottom left; % of the root's height for top and bottom, of its width for
+# left and right). thresholds is a number or a list (default [0]), stored as float32 and sorted, as Chromium
+# does, and intersectionRatio is computed in float32 as Chromium computes it (areas and quotient), so a ratio
+# exactly on a threshold such as 0.1 reaches it, as in Chrome. An entry is queued for each target at the first evaluation after observe(), then whenever the
+# crossed-threshold index changes (how many thresholds the ratio has reached; 0 when the boxes do not even
+# touch). As Chromium does (measured against its own observer), isIntersecting is "the index is above 0":
+# under threshold 0.5 a target 40 % in view reports isIntersecting false with its ratio and intersectionRect,
+# and one that enters to 20 % gets no entry. The specification's isIntersecting is the bare geometric test and
+# also queues an entry when only that changes; this follows the browser being captured. A target without a box
+# (not connected, display: none or contents), or outside an explicit root's document or containing block
+# chain, does not intersect and has empty rectangles, rootBounds included (measured). Entries of different
+# observers are delivered in the order the observers were created; Chromium's own order follows an internal
+# hash set (measured: neither creation order nor its reverse), so no page can rely on it.
+#
+# Simplifications (geometry from getBoundingClientRect): the target's box is clipped by the overflow clip
+# (overflow other than visible on that axis, or contain: paint) of each ancestor in its containing block
+# chain, approximated from the flat tree and CSS position (an absolutely positioned element skips static
+# ancestors, a fixed one every ancestor without a transform, filter or containment), using each ancestor's
+# padding box as getBoundingClientRect, borders and scrollbars give it. Transforms, clip-path, clip,
+# border-radius, overflow-clip-margin and scrollMargin are not applied; isVisible (trackVisibility) is
+# isIntersecting rather than an occlusion test. Same-origin frames get their own copy, and their targets are
+# clipped by their frame's viewport and mapped through the frame element's content box on the way to the
+# implicit root. A frame whose top-level document is cross-origin keeps the browser's own observer: strategy
+# A cannot reach it (such frames are uncontrollable content anyway). Callbacks are invoked with (entries,
+# observer) and observer as this; an error a callback throws is reported like RAF_SYNC_JS reports it and the
+# other callbacks still run.
+IO_SYNC_JS = r"""
+(() => {
+  if (window.__ftIo || typeof window.IntersectionObserver !== 'function') return;
+  try { void window.top.document; } catch (e) { return; }  // the top-level document is cross-origin
+  const queueTask = window.setTimeout;  // the page clock's setTimeout: the fake clock is installed first
+  const Rect = window.DOMRectReadOnly;
+  const report = (error) => { if (typeof reportError === 'function') reportError(error); else console.error(error); };
+  const internals = new WeakMap();  // observer -> its state
+  const entryData = new WeakMap();  // entry -> its fields
+  const active = new Set();         // observers that observe at least one target
+  let nextId = 1;
+  let taskQueued = false;
+
+  const isElement = (v) => v !== null && typeof v === 'object' && v.nodeType === 1 && typeof v.getBoundingClientRect === 'function';
+  const isDocument = (v) => v !== null && typeof v === 'object' && v.nodeType === 9 && typeof v.createElement === 'function';
+  const fail = (what, message) => `Failed to ${what}: ${message}`;
+  const CONSTRUCT = "construct 'IntersectionObserver'";
+
+  // rootMargin and scrollMargin: one to four lengths in px or %, top right bottom left as in CSS margins.
+  // As in Chromium (measured), px lengths are floored to whole pixels when parsed ('10.7px' reads back as
+  // '10px', '-3.6px' as '-4px'), and a percentage is kept as given and resolved later, truncated toward 0.
+  // The value is CSS, so comments separate lengths like white space ('10px/**/20px' is two lengths); one
+  // left open runs to the end, as in the CSS tokenizer.
+  const parseMargin = (value, name) => {
+    const text = String(value).replace(/\/\*[\s\S]*?(?:\*\/|$)/g, ' ').trim();
+    const tokens = text === '' ? [] : text.split(/\s+/);
+    if (tokens.length > 4) throw new DOMException(fail(CONSTRUCT, `Extra text found at the end of ${name}.`), 'SyntaxError');
+    const parts = tokens.map((token) => {
+      const match = /^([+-]?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?)(px|%)$/i.exec(token);
+      if (!match) throw new DOMException(fail(CONSTRUCT, `${name} must be specified in pixels or percent.`), 'SyntaxError');
+      const percent = match[2] === '%';
+      return { value: percent ? Number(match[1]) : Math.floor(Number(match[1])), unit: percent ? '%' : 'px' };
+    });
+    if (!parts.length) parts.push({ value: 0, unit: 'px' });
+    const [top, right = top, bottom = top, left = right] = parts;
+    return [top, right, bottom, left];
+  };
+  const marginText = (margin) => margin.map((part) => `${part.value}${part.unit}`).join(' ');
+
+  // threshold: a number or a list of numbers in [0, 1]; float32 like Chromium's, sorted, [0] when empty.
+  const parseThresholds = (value) => {
+    let list = [0];
+    if (value !== undefined) {
+      list = value !== null && typeof value === 'object' && typeof value[Symbol.iterator] === 'function' ? Array.from(value) : [value];
+    }
+    const thresholds = list.map((item) => {
+      const number = Number(item);
+      if (!Number.isFinite(number)) {
+        throw new TypeError(fail(CONSTRUCT, "Failed to read the 'threshold' property from 'IntersectionObserverInit': The provided double value is non-finite."));
+      }
+      if (number < 0 || number > 1) throw new RangeError(fail(CONSTRUCT, 'Threshold values must be numbers between 0 and 1'));
+      return Math.fround(number);
+    });
+    if (!thresholds.length) thresholds.push(0);
+    return thresholds.sort((a, b) => a - b);
+  };
+
+  const state = (observer) => {
+    const found = internals.get(observer);
+    if (!found) throw new TypeError('Illegal invocation');
+    return found;
+  };
+
+  // Queued entries live with each observed target, as in Chromium: unobserve() and disconnect() drop them.
+  const takeQueued = (observerState) => {
+    const records = [];
+    for (const registration of observerState.targets) records.push(...registration.queued.splice(0));
+    return records;
+  };
+
+  class IntersectionObserverEntry {
+    constructor() { throw new TypeError(fail("construct 'IntersectionObserverEntry'", 'Illegal constructor')); }
+  }
+  for (const name of ['time', 'rootBounds', 'boundingClientRect', 'intersectionRect', 'isIntersecting', 'isVisible',
+                      'intersectionRatio', 'target']) {
+    Object.defineProperty(IntersectionObserverEntry.prototype, name, { enumerable: true, configurable: true, get() {
+      const data = entryData.get(this);
+      if (!data) throw new TypeError('Illegal invocation');
+      return data[name];
+    } });
+  }
+
+  // A function rather than a class, so a call without new throws Chromium's error rather than V8's.
+  function IntersectionObserver(callback, options) {
+    if (!new.target) {
+      throw new TypeError(fail(CONSTRUCT, "Please use the 'new' operator, this DOM object constructor cannot be called as a function."));
+    }
+    if (typeof callback !== 'function') throw new TypeError(fail(CONSTRUCT, 'parameter 1 is not of type \'Function\'.'));
+    if (options !== undefined && options !== null && typeof options !== 'object' && typeof options !== 'function') {
+      throw new TypeError(fail(CONSTRUCT, "The provided value is not of type 'IntersectionObserverInit'."));
+    }
+    const init = options || {};
+    // Dictionary members are read in alphabetical order, as WebIDL does.
+    const delayValue = init.delay;
+    const rootValue = init.root;
+    const rootMarginValue = init.rootMargin;
+    const scrollMarginValue = init.scrollMargin;
+    const thresholdValue = init.threshold;
+    const trackVisibility = Boolean(init.trackVisibility);
+    const root = rootValue === undefined ? null : rootValue;
+    if (root !== null && !isElement(root) && !isDocument(root)) {
+      throw new TypeError(fail(CONSTRUCT, "Failed to read the 'root' property from 'IntersectionObserverInit': The provided value is not of type '(Document or Element)'."));
+    }
+    const delay = delayValue === undefined ? 0 : Number(delayValue);
+    if (!Number.isFinite(delay)) {
+      throw new TypeError(fail(CONSTRUCT, "Failed to read the 'delay' property from 'IntersectionObserverInit': The provided double value is non-finite."));
+    }
+    const rootMargin = parseMargin(rootMarginValue === undefined ? '0px' : rootMarginValue, 'rootMargin');
+    const scrollMargin = parseMargin(scrollMarginValue === undefined ? '0px' : scrollMarginValue, 'scrollMargin');
+    const thresholds = parseThresholds(thresholdValue);
+    if (trackVisibility && delay < 100) {
+      throw new DOMException(fail(CONSTRUCT, "To enable the 'trackVisibility' option, you must also use a 'delay' option with a value of at least 100. Visibility is more expensive to compute than the basic intersection; enabling this option may negatively affect your page's performance. Please make sure you *really* need visibility tracking before enabling the 'trackVisibility' option."), 'NotSupportedError');
+    }
+    // The delay attribute reads back as Chromium reports it: whole milliseconds, truncated toward zero, a
+    // negative delay included (measured: -5 reads -5, 150.7 reads 150). Throttling treats a negative delay as none.
+    internals.set(this, { id: nextId++, callback, root, rootMargin, scrollMargin, thresholds,
+                          delayAttribute: Math.trunc(delay) || 0, delay: Math.max(0, delay), trackVisibility,
+                          targets: [], lastRun: null });
+  }
+  // The prototype's members, defined as a class would define them (methods are not constructors).
+  const members = {
+    get root() { return state(this).root; },
+    get rootMargin() { return marginText(state(this).rootMargin); },
+    get scrollMargin() { return marginText(state(this).scrollMargin); },
+    get thresholds() { return Object.freeze(state(this).thresholds.slice()); },  // a new frozen array each time, as Chromium
+    get delay() { return state(this).delayAttribute; },
+    get trackVisibility() { return state(this).trackVisibility; },
+    // Operations in alphabetical order, as Chromium enumerates them.
+    disconnect() {
+      state(this).targets = [];
+      active.delete(this);
+    },
+    observe(target) {
+      const own = state(this);
+      if (!isElement(target)) throw new TypeError(fail("execute 'observe' on 'IntersectionObserver'", "parameter 1 is not of type 'Element'."));
+      if (own.targets.some((registration) => registration.target === target)) return;
+      // previousThresholdIndex -1: the first evaluation always queues an entry.
+      own.targets.push({ target, previousThresholdIndex: -1, previousIsVisible: false, queued: [] });
+      active.add(this);
+    },
+    takeRecords() { return takeQueued(state(this)); },
+    unobserve(target) {
+      const own = state(this);
+      if (!isElement(target)) throw new TypeError(fail("execute 'unobserve' on 'IntersectionObserver'", "parameter 1 is not of type 'Element'."));
+      own.targets = own.targets.filter((registration) => registration.target !== target);
+      if (!own.targets.length) active.delete(this);
+    },
+  };
+  Object.defineProperties(IntersectionObserver.prototype, Object.getOwnPropertyDescriptors(members));
+  Object.defineProperty(IntersectionObserver, 'prototype', { writable: false });  // as an interface object's
+  // WebIDL members are enumerable; IntersectionObserver takes one required argument, IntersectionObserverEntry none.
+  for (const proto of [IntersectionObserver.prototype, IntersectionObserverEntry.prototype]) {
+    for (const name of Object.getOwnPropertyNames(proto)) {
+      if (name !== 'constructor') Object.defineProperty(proto, name, { enumerable: true });
+    }
+  }
+  Object.defineProperty(IntersectionObserver.prototype, Symbol.toStringTag, { value: 'IntersectionObserver', configurable: true });
+  Object.defineProperty(IntersectionObserverEntry.prototype, Symbol.toStringTag, { value: 'IntersectionObserverEntry', configurable: true });
+  Object.defineProperty(IntersectionObserver, 'length', { value: 1 });
+  Object.defineProperty(IntersectionObserverEntry, 'length', { value: 0 });
+
+  // ---- Geometry. A box is { l, t, r, b } in the viewport coordinates of one document. ----
+  const box = (rect) => ({ l: rect.left, t: rect.top, r: rect.right, b: rect.bottom });
+  // An area as Chromium computes it (gfx::SizeF::GetArea): width and height as float32, their product in float32.
+  const area32 = (b) => (b ? Math.fround(Math.fround(Math.max(0, b.r - b.l)) * Math.fround(Math.max(0, b.b - b.t))) : 0);
+  const shift = (b, dx, dy) => (b ? { l: b.l + dx, t: b.t + dy, r: b.r + dx, b: b.b + dy } : null);
+  // Edge-inclusive intersection on the chosen axes: boxes that only touch still intersect (zero area).
+  const clip = (b, by, x = true, y = true) => {
+    if (!b) return null;
+    const out = { l: x ? Math.max(b.l, by.l) : b.l, t: y ? Math.max(b.t, by.t) : b.t,
+                  r: x ? Math.min(b.r, by.r) : b.r, b: y ? Math.min(b.b, by.b) : b.b };
+    return out.r < out.l || out.b < out.t ? null : out;
+  };
+  const toRect = (b) => (b ? new Rect(b.l, b.t, b.r - b.l, b.b - b.t) : new Rect(0, 0, 0, 0));
+  const px = (value) => parseFloat(value) || 0;
+
+  // One evaluation reads each element's computed style and padding box once.
+  const newCache = () => ({ styles: new Map(), paddings: new Map() });
+  const styleOf = (el, cache) => {
+    let style = cache.styles.get(el);
+    if (!style) { style = el.ownerDocument.defaultView.getComputedStyle(el); cache.styles.set(el, style); }
+    return style;
+  };
+  // The padding box: the border box less borders and scrollbars (the area an overflow clip keeps).
+  const paddingBox = (el, cache) => {
+    let found = cache.paddings.get(el);
+    if (found) return found;
+    const s = styleOf(el, cache);
+    const outer = box(el.getBoundingClientRect());
+    const bl = px(s.borderLeftWidth), br = px(s.borderRightWidth), bt = px(s.borderTopWidth), bb = px(s.borderBottomWidth);
+    const barY = typeof el.offsetWidth === 'number' ? Math.max(0, el.offsetWidth - el.clientWidth - Math.round(bl) - Math.round(br)) : 0;
+    const barX = typeof el.offsetHeight === 'number' ? Math.max(0, el.offsetHeight - el.clientHeight - Math.round(bt) - Math.round(bb)) : 0;
+    found = { l: outer.l + bl, t: outer.t + bt, r: Math.max(outer.l + bl, outer.r - br - barY), b: Math.max(outer.t + bt, outer.b - bb - barX) };
+    cache.paddings.set(el, found);
+    return found;
+  };
+  const paintContained = (s) => /paint|strict|content/.test(s.contain || '');
+  // Whether el clips its overflow on each axis. The root element's overflow, and the body's when the root
+  // element's is visible, belong to the viewport.
+  const overflowClip = (el, cache) => {
+    const doc = el.ownerDocument;
+    if (el === doc.documentElement) return null;
+    const s = styleOf(el, cache);
+    if (el === doc.body && doc.documentElement) {
+      const rootStyle = styleOf(doc.documentElement, cache);
+      if (rootStyle.overflowX === 'visible' && rootStyle.overflowY === 'visible') return null;
+    }
+    if (s.display === 'contents' || s.display === 'inline') return null;
+    const paint = paintContained(s);
+    const x = paint || s.overflowX !== 'visible';
+    const y = paint || s.overflowY !== 'visible';
+    return x || y ? { x, y } : null;
+  };
+  const none = (value) => !value || value === 'none' || value === 'normal' || value === 'auto';
+  // An ancestor that contains position: fixed descendants (a transform, filter or containment).
+  const containsFixed = (s) => !none(s.transform) || !none(s.perspective) || !none(s.filter) || !none(s.backdropFilter)
+    || !none(s.translate) || !none(s.rotate) || !none(s.scale) || /paint|layout|strict|content/.test(s.contain || '')
+    || /transform|perspective|filter/.test(s.willChange || '') || (s.containerType && s.containerType !== 'normal');
+  const modeOf = (s) => (s.position === 'fixed' ? 'fixed' : s.position === 'absolute' ? 'absolute' : 'flow');
+  // The parent in the flat tree: a slotted element's slot, a shadow root's host.
+  const parentOf = (node) => node.assignedSlot || node.parentElement || (node.parentNode && node.parentNode.host) || null;
+
+  // Clips b by the overflow clip of every ancestor of el in its containing block chain inside el's document,
+  // up to stop (not included). Returns { b, reached }: reached tells whether stop is in that chain.
+  const clipByAncestors = (el, b, stop, cache) => {
+    let mode = modeOf(styleOf(el, cache));
+    for (let a = parentOf(el); a && a.nodeType === 1; a = parentOf(a)) {
+      const s = styleOf(a, cache);
+      const contains = mode === 'flow' || containsFixed(s) || (mode === 'absolute' && s.position !== 'static');
+      if (a === stop) return { b, reached: contains };
+      if (!contains) continue;
+      const axes = overflowClip(a, cache);
+      if (axes) b = clip(b, paddingBox(a, cache), axes.x, axes.y);
+      mode = modeOf(s);
+    }
+    return { b, reached: false };
+  };
+
+  const viewportOf = (doc) => {
+    const win = doc.defaultView;
+    const standards = doc.compatMode === 'CSS1Compat' && doc.documentElement;
+    return { l: 0, t: 0, r: standards ? doc.documentElement.clientWidth : win.innerWidth,
+             b: standards ? doc.documentElement.clientHeight : win.innerHeight };
+  };
+  // The root intersection rectangle grown by rootMargin (% of its height for top and bottom, of its width
+  // for left and right, in whole pixels), in the root document's viewport coordinates.
+  const rootRect = (own, rootDoc, cache) => {
+    const root = own.root;
+    let b;
+    if (isElement(root)) b = overflowClip(root, cache) || paintContained(styleOf(root, cache)) ? paddingBox(root, cache) : box(root.getBoundingClientRect());
+    else b = viewportOf(rootDoc);
+    const [top, right, bottom, left] = own.rootMargin;
+    const width = b.r - b.l, height = b.b - b.t;
+    const length = (part, base) => (part.unit === '%' ? Math.trunc((part.value * base) / 100) : part.value);
+    return { l: b.l - length(left, width), t: b.t - length(top, height), r: b.r + length(right, width), b: b.b + length(bottom, height) };
+  };
+
+  // The intersection of target with the observer's root (SPEC 'compute the intersection', simplified as the
+  // comment above this script says).
+  const geometry = (target, own, cache) => {
+    const empty = { rootBounds: new Rect(0, 0, 0, 0), target: null, inter: null, intersects: false };
+    const doc = target.ownerDocument;
+    if (!target.isConnected || !doc || !doc.defaultView || target.getClientRects().length === 0) return empty;
+    const root = own.root;
+    if (isElement(root) && (!root.isConnected || root.getClientRects().length === 0)) return empty;
+    const targetBox = box(target.getBoundingClientRect());
+    const outcome = (rootBounds, inter, intersecting) => ({ rootBounds: toRect(rootBounds), target: targetBox,
+                                                           inter: intersecting ? inter : null, intersects: intersecting });
+    if (root !== null) {
+      // An explicit root: a target outside its document or its containing block chain does not intersect,
+      // with every rectangle empty (measured).
+      const rootDoc = isDocument(root) ? root : root.ownerDocument;
+      if (rootDoc !== doc) return empty;
+      const walked = clipByAncestors(target, targetBox, isElement(root) ? root : null, cache);
+      if (isElement(root) && !walked.reached) return empty;
+      const bounds = rootRect(own, rootDoc, cache);
+      const inter = clip(walked.b, bounds);
+      return outcome(bounds, inter, Boolean(inter));
+    }
+    // The implicit root: the top-level viewport, reached through the same-origin frames around the target.
+    let b = targetBox;
+    let el = target;
+    let dx = 0, dy = 0;  // from the target's viewport coordinates to the current document's
+    for (;;) {
+      const here = el.ownerDocument;
+      b = clipByAncestors(el, b, null, cache).b;
+      const frame = here.defaultView.frameElement;
+      if (!frame) {
+        const bounds = rootRect(own, here, cache);
+        const inter = clip(b, bounds);
+        return outcome(bounds, shift(inter, -dx, -dy), Boolean(inter));
+      }
+      b = clip(b, viewportOf(here));
+      const s = styleOf(frame, cache);
+      const outer = frame.getBoundingClientRect();
+      const ox = outer.left + px(s.borderLeftWidth) + px(s.paddingLeft);
+      const oy = outer.top + px(s.borderTopWidth) + px(s.paddingTop);
+      b = shift(b, ox, oy);
+      dx += ox; dy += oy;
+      el = frame;
+    }
+  };
+
+  // Chromium's threshold index: how many thresholds the ratio has reached; 0 when not intersecting.
+  const thresholdIndex = (thresholds, ratio) => {
+    let index = 0;
+    while (index < thresholds.length && thresholds[index] <= ratio) index++;
+    return index;
+  };
+
+  // intersectionRatio: the share of the target's area that intersects; a target of zero area that
+  // intersects has 1. Chromium computes both areas and their quotient in float32 and exposes that float32
+  // value, so a ratio exactly on a threshold such as 0.1 (whose float32 lies above the decimal) reaches it:
+  // 10 px of a 100 px target in view gives 0.10000000149011612, as in Chromium, not 0.1.
+  const ratioOf = (g) => {
+    if (!g.intersects) return 0;
+    const targetArea = area32(g.target);
+    return targetArea > 0 ? Math.min(1, Math.fround(area32(g.inter) / targetArea)) : 1;
+  };
+
+  const makeEntry = (time, g, ratio, isIntersecting, isVisible, target) => {
+    const entry = Object.create(IntersectionObserverEntry.prototype);
+    entryData.set(entry, { time, rootBounds: g.rootBounds, boundingClientRect: toRect(g.target), intersectionRect: toRect(g.inter),
+                           isIntersecting, isVisible, intersectionRatio: ratio, target });
+    return entry;
+  };
+
+  const byId = (a, b) => internals.get(a).id - internals.get(b).id;
+
+  // The intersection observer task: every observer with queued entries, in creation order, gets its callback.
+  const notify = () => {
+    taskQueued = false;
+    for (const observer of Array.from(active).sort(byId)) {
+      const own = internals.get(observer);
+      const records = takeQueued(own);
+      if (!records.length) continue;
+      try { own.callback.call(observer, records, observer); } catch (error) { report(error); }
+    }
+  };
+
+  // Run by strategy A's seek pass once per pass, on the seeked layout. Returns the number of entries queued.
+  const evaluate = () => {
+    if (!active.size) return 0;
+    const time = window.performance.now();
+    const cache = newCache();
+    let queued = 0;
+    for (const observer of Array.from(active).sort(byId)) {
+      const own = internals.get(observer);
+      if (own.delay > 0 && own.lastRun !== null && time - own.lastRun < own.delay) continue;
+      own.lastRun = time;
+      for (const registration of own.targets) {
+        const g = geometry(registration.target, own, cache);
+        const ratio = ratioOf(g);
+        const index = g.intersects ? thresholdIndex(own.thresholds, ratio) : 0;
+        // Chromium reports isIntersecting as 'a threshold is reached' (measured: a ratio of 0.4 under
+        // threshold 0.5 is not intersecting, with its intersectionRect and ratio still given).
+        const isIntersecting = index > 0;
+        const visible = own.trackVisibility && isIntersecting;
+        if (index === registration.previousThresholdIndex && visible === registration.previousIsVisible) continue;
+        registration.previousThresholdIndex = index;
+        registration.previousIsVisible = visible;
+        registration.queued.push(makeEntry(time, g, ratio, isIntersecting, visible, registration.target));
+        queued++;
+      }
+    }
+    if (queued && !taskQueued) {
+      taskQueued = true;
+      queueTask(notify, 0);
+    }
+    return queued;
+  };
+
+  const install = (name, value) => Object.defineProperty(window, name, { value, writable: true, configurable: true, enumerable: false });
+  install('IntersectionObserver', IntersectionObserver);
+  install('IntersectionObserverEntry', IntersectionObserverEntry);
+  Object.defineProperty(window, '__ftIo', { value: Object.freeze({ evaluate }), configurable: true });
+})();
+"""
+
+#: Note added by strategy A, which installs ``IO_SYNC_JS``.
+IO_SYNC_NOTE = (
+    "IntersectionObserver entries computed once per captured frame on that frame's layout and delivered in a "
+    "task on the page clock (ADR-052)"
+)
 
 # Strategy A pauses every animation, SVG timeline and <video> and seeks it per frame, so the browser's own
 # record of what the page asked for is lost: a page's pause() on an animation we already paused changes

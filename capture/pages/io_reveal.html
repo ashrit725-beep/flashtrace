@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>FlashTrace test page: reveal on scroll with IntersectionObserver</title>
+<style>
+  /* ADR-052. Captured at 1024 x 768 with the interaction script in capture/tests/test_intersection_observer.py,
+     which scrolls 300 px every 200 ms of virtual time, to 3000 px at 2 s. Black boxes on white; nothing
+     flashes. Every reveal is a 300 ms CSS transition that an IntersectionObserver callback starts by adding a
+     class, so the frame in which it starts depends only on when the observer reports. */
+  html { scroll-behavior: auto; }
+  html, body { margin: 0; background: #fff; }
+  body { height: 4200px; position: relative; }
+  .reveal { position: absolute; left: 100px; width: 300px; height: 200px; background: #000; opacity: 0;
+            transform: translateY(40px); transition: opacity 300ms linear, transform 300ms linear; }
+  .reveal.in { opacity: 1; transform: none; }
+  /* Revealed by an observer whose rootMargin shrinks the viewport by 200 px at the top and bottom. */
+  #inset { position: absolute; left: 600px; top: 3100px; width: 300px; height: 150px; background: #000; opacity: 0;
+           transition: opacity 300ms linear; }
+  #inset.in { opacity: 1; }
+  /* A bar that grows with the share of #meter in view, in steps: one per threshold of [0, 0.25, 0.5, 0.75, 1]. */
+  #meter { position: absolute; left: 600px; top: 3400px; width: 300px; height: 200px; outline: 1px solid #000; }
+  #meter > i { display: block; height: 100%; width: 0; background: #000; transition: width 300ms linear; }
+</style>
+</head>
+<body>
+<div class="reveal" style="top: 900px"></div>
+<div class="reveal" style="top: 1500px"></div>
+<div class="reveal" style="top: 2100px"></div>
+<div class="reveal" style="top: 2700px"></div>
+<div class="reveal" style="top: 3300px"></div>
+<div id="inset"></div>
+<div id="meter"><i></i></div>
+<script>
+  // Reveal once: the box gets its class and is no longer observed.
+  const reveal = new IntersectionObserver((entries, observer) => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue;
+      entry.target.classList.add('in');
+      observer.unobserve(entry.target);
+    }
+  });
+  document.querySelectorAll('.reveal').forEach((box) => reveal.observe(box));
+
+  const inset = new IntersectionObserver((entries) => {
+    for (const entry of entries) entry.target.classList.toggle('in', entry.isIntersecting);
+  }, { rootMargin: '-200px 0px -200px 0px' });
+  inset.observe(document.getElementById('inset'));
+
+  const thresholds = [0, 0.25, 0.5, 0.75, 1];
+  const meter = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      const reached = entry.isIntersecting ? thresholds.filter((t) => entry.intersectionRatio >= t).length : 0;
+      entry.target.firstElementChild.style.width = `${reached * 20}%`;
+    }
+  }, { threshold: thresholds });
+  meter.observe(document.getElementById('meter'));
+</script>
+</body>
+</html>

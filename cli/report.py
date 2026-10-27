@@ -59,6 +59,18 @@ SPEC_LIMITATIONS: tuple[str, ...] = (
     "and a PASS becomes INCONCLUSIVE.",
     "Under realtime capture (strategy C) a measured rate can be one flash per second higher or lower than the "
     "page's, because a compositor frame drawn late or dropped moves a transition by one frame.",
+    "Under strategy A, work that the page starts and the browser finishes on the real clock is not waited for "
+    "(ADR-052): React scheduler tasks (MessageChannel messages), the page's handling of `fetch` and `XMLHttpRequest` "
+    "answers, history traversals (`history.back()`, `forward()`, `go()`), script, style and image load events, "
+    "`window.postMessage`, WebSocket and EventSource messages, storage callbacks and Navigation API traversals. A page "
+    "that changes what it shows on such an event can show that change one frame earlier or later in another capture "
+    "(several frames when the page also holds the change behind a gate on its own timers), although both captures are "
+    "reported as deterministic.",
+    "Under strategy A, IntersectionObserver is FlashTrace's own implementation (ADR-052). It clips a target by its "
+    "ancestors' overflow along an approximated containing-block chain and ignores transforms, `clip-path`, `clip`, "
+    "`border-radius`, `overflow-clip-margin` and `scrollMargin`, so a reveal that depends on those can start at a "
+    "different scroll position than in a browser; `isVisible` (`trackVisibility`) equals `isIntersecting`, without an "
+    "occlusion test.",
     "The fine-pattern exception (T6) and spatial-pattern hazards are not evaluated.",
     "Only the captured viewport and duration are analysed; content revealed by scrolling or interaction is "
     "analysed only if an interaction script drives it.",

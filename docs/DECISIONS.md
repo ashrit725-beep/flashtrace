@@ -432,6 +432,13 @@ FAIL; all pass, also with four concurrent processes. The worst measured case is 
 two steps, close) at 3 per second, which is within WCAG's "no more than three"; four in one second is impossible by
 the gate arithmetic.
 
+**ADR-024 second amendment (2026-10-26).** The self-audit captures every scenario twice. The viewer fetches data and
+React schedules work on Chromium's real clock, which capture does not control (ADR-052, SPEC section 10), so two
+captures can differ by a frame or more even though each one is deterministic in everything FlashTrace controls.
+The test therefore no longer requires the two captures to be frame-identical. When they differ, it runs the engine
+on the second capture as well and requires the same verdict, and it records how many frames differed. Both captures
+must still be deterministic (no fall-back to real-time capture), so a flashing UI cannot hide behind the drift.
+
 ## ADR-038 — Event counting by claims, and stamps that sub-tolerance noise cannot move (2026-10-25)
 
 **Context.** The M1/M2 review fixes (commit 8674c95) changed two engine rules without an ADR: SPEC §5.4/§5.6 and
@@ -846,3 +853,128 @@ bench/tests/test_run.py pins `test_summary_names_files_by_repository_path`,
 `test_per_page_rows_name_the_job_folder_by_repository_path`,
 `test_record_warnings_name_out_outside_repo_and_uncommitted_changes` and
 `test_uncommitted_paths_leave_out_this_runs_own_outputs`.
+
+## ADR-052 — Strategy A evaluates IntersectionObserver once per frame (2026-10-25, amended 2026-10-26)
+
+**Context.** Two reproducibility failures of the UI self-audit (ADR-024) were traced to work that Chromium does on
+the real clock, outside strategy A's fake clock. (1) E5-report-scroll-1280-light: two captures differed in 23 frames
+(first frames 2 to 9). The report's in-view groups start from an IntersectionObserver report, and Chromium computes
+intersections in its own rendering updates and runs the callbacks in a task after them, both on the real clock, so
+a reveal started one frame earlier or later. Measured with a reveal-on-scroll page (capture/pages/io_reveal.html)
+captured four times at once with the browser's own observer: the captures differed in 49 to 173 of 180 frames, and
+some reported `deterministic=false`. Real pages use the observer widely (reveal on scroll, lazy loading; Next.js
+`<Link>` prefetches when a link scrolls into view). (2) F6 (route mash) and F10b (history traversal) were reported
+to differ by one frame under heavy load. A probe recorded page work started before a seek pass that finished after
+it: in every F6 and F10b capture 7 to 14 MessageChannel messages (React's scheduler renders and commits in such a
+task) and 2 to 6 `fetch` answers crossed a pass, and every `popstate` after `history.back()` or `forward()` arrived
+after its clock step had ended. Nothing waits for such work; under load it lands after the picture, or after the
+next clock step, where a route that mounts reads a later `performance.now()`.
+**Decision.**
+* **IntersectionObserver.** An init script, `IO_SYNC_JS` (capture/page_scripts.py), installed by strategy A after
+  its clock scripts, replaces `IntersectionObserver` and `IntersectionObserverEntry` (so `'IntersectionObserver' in
+  window`, `instanceof` and the entry-prototype feature checks keep working) with an implementation that the seek
+  pass evaluates once per pass, in every same-origin frame, on the layout of the picture: after the animations are
+  seeked and style and layout are flushed, as a browser evaluates once per rendering update on the updated layout.
+  Entries are delivered as a browser delivers them, in a task after the frame: a 0 ms timer on the page clock, which
+  fires at the start of the next clock step, after any 0 ms timers the page set during that same pass (Playwright's
+  clock fires timers due at the same time in the order they were set). The constructor, `observe`, `unobserve`,
+  `disconnect`, `takeRecords`, the attributes and Chromium's validation and error texts are implemented; rootMargin
+  is one to four lengths in px (floored when parsed) or % (of the root's height for top and bottom, of its width for
+  left and right, truncated to whole pixels); thresholds are float32, sorted, `[0]` by default.
+* **Change detection as measured in Chromium.** An entry at the first evaluation after `observe()`, then whenever
+  the number of thresholds reached changes, and `isIntersecting` means "a threshold is reached" (under threshold 0.5
+  a target 40 % in view reports `false` with its ratio, and one entering to 20 % gets no entry). The specification's
+  rule, which also queues an entry when only the geometric `isIntersecting` changes, would reveal such pages earlier
+  than Chrome does.
+* **float32 ratios.** `intersectionRatio` is computed in float32, as Chromium computes the areas and their quotient,
+  so a ratio exactly on a threshold such as 0.1 reaches it (10 px of a 100 px target gives 0.10000000149011612).
+* **Geometry.** A target without a box, or outside an explicit root's document or containing-block chain, does not
+  intersect and has empty rectangles, `rootBounds` included (measured). Geometry comes from `getBoundingClientRect`:
+  the target is clipped by each ancestor's overflow clip (padding box) along a containing-block chain approximated
+  from the flat tree and CSS `position`, and by same-origin frames' viewports on the way to the top-level viewport;
+  transforms, `clip-path`, `clip`, `border-radius`, `overflow-clip-margin` and `scrollMargin` are not applied, and
+  `isVisible` is `isIntersecting` (SPEC §10). Entries of different observers are delivered in creation order;
+  Chromium's order follows an internal hash set (measured: neither creation order nor its reverse).
+* **Evaluation after the seek, not before it.** The request was to evaluate right after the animation-frame
+  callbacks and before the animations are seeked. Before the seek, an animation started in this clock step still
+  runs on the browser's animation clock until strategy A pauses it, so the geometry of a target it moves would
+  depend on real time; after the seek the geometry is exactly the picture's. Because the callbacks run in the next
+  step's task, nothing they start has to be seeked in this pass.
+* **Real-clock page work is not waited for.** Strategy A waits, as before, for network requests
+  (`network_wait.py`), loading media, video seeks, animation readiness and finish handlers (SPEC §6.2), and for no
+  other work that the browser finishes on the real clock.
+**Consequences.**
+* io_reveal.html captured four times at once gives identical frames with the reveals shown;
+  capture/tests/test_intersection_observer.py pins that
+  (`test_concurrent_captures_of_reveals_on_scroll_are_identical`, four processes, as in ADR-025) and the entry
+  semantics: first delivery, threshold crossings, float32 ratios on a threshold, unobserve, disconnect,
+  takeRecords, rootMargin, element roots, a same-origin frame, constructor errors, attributes read back as in
+  Chromium (delay, a call without `new`, CSS comments in rootMargin) and a callback that throws. Two scenario pages
+  compared against Chromium's own observer (73 and 56 entries: viewport, rootMargin in px and %, element roots with
+  borders and padding, nested scrollers, clipping ancestors, absolutely and fixed positioned descendants, shadow DOM
+  and slots, same-origin frames, threshold lists, unobserve) gave the same entries apart from the order between
+  observers.
+* **Page work on the real clock is NOT waited for**, so it can move a change by one frame between two captures
+  (by several when the page also holds the change behind a gate on its own timers, such as the UI's 350 ms rate
+  gates) while each capture reports `deterministic=true`: React's scheduler tasks (MessageChannel messages, where it
+  renders and commits), the page's handling of `fetch` and `XMLHttpRequest` answers (the network wait covers the
+  request, not the script that reads the answer), history traversals (`history.back()`, `forward()`, `go()` and
+  their `popstate`), script, style and image load events, `window.postMessage`, WebSocket and EventSource
+  messages, storage callbacks and Navigation API traversals. The F6 and F10b one-frame differences under heavy load
+  are therefore not addressed. SPEC §10 lists this limitation, and the second one: the observer's geometry is
+  approximated.
+* **F3c can fail the self-audit's reproducibility check (seen once, cause not established).** In one full-suite run
+  with ADR-053 in place, F3c (report round-robin) gave two different captures at 390-light and at 1280-dark: in the
+  kept frames the "Heatmap overlay" toggle was already applied in one capture and still pending (greyed button, old
+  heatmap) in the other for 7 to 10 consecutive frames (frames 1 to 7 at 1280-dark, 109 to 118 at 390-light). F3c
+  passed in 5 reruns on the same tree (1 alone, 4 at the same time), so the failure is intermittent. Two causes fit
+  and were not told apart: the real-clock page work above, which F3c's shared large-area gate can turn into a shift
+  of several frames, or real-clock work that landed during a 10 s screenshot retry (ADR-053). The self-audit now
+  puts both captures' notes in its reproducibility failure message, so a "screenshot retried" note shows which.
+* An earlier version of this decision also waited for some of that work (MessageChannel messages, history
+  traversals, `fetch` and `XMLHttpRequest` answers): a second init script counted it and, by hooking the private
+  internals of Playwright's fake clock (`_embedder`), made the clock wait for it in real time after every timer, and
+  each seek pass waited for it too. It was removed on 2026-10-26. In one full-suite run three UI self-audit captures
+  failed because strategy A's `page.screenshot` timed out after 30 s (auto then fell back to realtime); with that
+  script left out, one stall was seen in about 12 scenario runs and none in about 27 concurrent ones, so it was
+  implicated, although the cause of the stall was not identified. It also relied on Playwright internals that may
+  change, and at some 230 lines of JavaScript it was hard to explain. The remaining stalls are handled by ADR-053.
+* Frame hashes of pages that use IntersectionObserver change once (expected). Cost: one evaluation per pass (a few
+  milliseconds for pages with many targets).
+
+## ADR-053 — Strategy A requests a stalled screenshot once more, with a bounded wait (2026-10-26)
+
+**Context.** In one full-suite run three UI self-audit captures failed because strategy A's `page.screenshot`
+did not return within Playwright's 30 s default; the attempt raised and auto fell back to realtime (C), so those
+scenarios were judged on a non-deterministic capture. The one call log recorded of such a stall (by a temporary
+wrapper that logged the error to a scratch file during the investigation, now removed) ends "taking page screenshot",
+"waiting for fonts to load...", "fonts loaded": Playwright's own wait before the picture finished, and the browser's
+screenshot command (in Playwright 1.63, `Page.getLayoutMetrics` or `Page.captureScreenshot`) then did not answer.
+Taking ADR-052's page-work script out made the stalls rarer (one in about 12 scenario runs, then none in about 27
+concurrent ones) but did not explain them, and the cause is still unknown.
+**Decision.** `take_screenshot` (capture/strategies/base.py) passes `timeout=SCREENSHOT_TIMEOUT_MS` (10 000 ms) to
+`page.screenshot` and makes up to `SCREENSHOT_ATTEMPTS` (2) requests for one picture. A request that times out is
+made again at once, at the same virtual time: the fake clock has not moved and every animation, SVG timeline and
+video is still seeked, so the retry pictures the same virtual instant. One capture may retry at most
+`SCREENSHOT_RETRIES_PER_CAPTURE` (2) stalled pictures in all, frames and double-shot pictures together: the budget is
+a `ScreenshotRetries` object in strategy A's tally, passed to `take_screenshot`, which counts each retry in it. The
+capture notes say "screenshot retried N time(s): a picture request got no answer within 10 s of real time; each
+retry pictured the same virtual instant (ADR-053)". A retry does not change `deterministic` by itself: the clock
+check and the double-shot check still judge the frames at their checkpoints, and content that animates on the real
+clock is still caught by them and by the content watch. A picture whose retry times out too, and the first stalled
+picture after the budget is spent, raise a `TimeoutError` as before: strategy A's attempt errors and auto falls
+through to the next strategy, which is the safe direction (a forced A reports the error). Only strategy A's
+pictures (frames and the double-shot's second picture) use `take_screenshot`; inspection takes no pictures, and
+strategy B keeps its own 2 s limit.
+**Consequences.** A stalled picture costs 10 s of real time before the retry instead of 30 s before an error, and
+a picture that stalls twice gives up after 20 s instead of 30 s. The per-capture limit bounds the total: stalls cost
+one capture at most (2 + 1) × 10 s = 30 s of real time, as one stalled picture did before this decision. Without it,
+a page that stalled on every frame would cost about 10 s per frame (a 600-frame capture, about 100 minutes), and
+the server's watchdog would not stop it, because progress is reported after every frame. Real-clock page work
+(ADR-052) has those seconds to land before the retried picture, the same exposure as any slow picture. Ten seconds
+is far above a normal picture (tens of milliseconds) even with several captures and a benchmark running at once.
+capture/tests/test_strategies.py pins it with stand-in pages: a first request that raises Playwright's
+`TimeoutError` and a second that answers give the second answer, both with the 10 s timeout, and one retry note
+that is not an uncertainty; two requests that both time out raise after exactly two requests; and a capture whose
+frame and double-shot picture each stall once raises at its third stalled picture without requesting it again.
+Whether one retry per picture is enough is measured by the UI self-audit; the stall itself remains open.

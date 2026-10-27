@@ -30,11 +30,18 @@ How it works, in plain words:
    virtual time they therefore arrive at the frame in which the page asked for them. A wait that runs
    out marks the capture ``deterministic=False``.
 6. Per frame ``i``, in the order SPEC 6.2 lists: (1) advance the fake clock to ``round(t_i)`` with one
-   ``run_for`` call, so timers fire, and wait for the network; (2) and (3), one ``evaluate`` pass: run
-   the page's queued ``requestAnimationFrame`` callbacks once at that clock time (``RAF_SYNC_JS``,
-   ADR-029), then seek every animation, SVG timeline and video and force a style flush; wait for the
-   network again; (4) screenshot. The clock is advanced first so that an animation created by a timer or
-   rAF callback during that step is found and seeked before the picture instead of one frame later.
+   ``run_for`` call, so timers fire (the IntersectionObserver callbacks the previous frame queued fire at
+   the step's start, after any 0 ms timers the page set during that same pass, since the fake clock fires
+   timers due at the same time in the order they were set), and wait for the network; (2) to (4), one ``evaluate``
+   pass: run the page's queued ``requestAnimationFrame`` callbacks once at that clock time
+   (``RAF_SYNC_JS``, ADR-029), seek every animation, SVG timeline and video, force a style flush, then
+   evaluate every IntersectionObserver on that layout (``IO_SYNC_JS``, ADR-052); wait for the network
+   again; (5) screenshot, requested once more at the same virtual time if the browser gives no picture
+   within 10 s of real time, with at most 2 such retries per capture (ADR-053).
+   The clock is advanced first so that an animation created by a timer or rAF callback during that step
+   is found and seeked before the picture instead of one frame later. Work the page started that the
+   browser finishes on the real clock (a MessageChannel task, the reading of a fetch answer, a history
+   traversal, a load event) is not waited for, so it can land one frame early or late (SPEC 10).
 7. Checks at frame 0, at the first frame of every captured second and at the last frame
    (``is_checkpoint``): the page clock must read the virtual time, and a second screenshot 100 ms of real
    time later, at the same virtual time, must be identical (double-shot), otherwise something animates
@@ -79,6 +86,8 @@ from playwright.sync_api import BrowserContext, Page
 
 from capture.page_scripts import (
     ANIMATION_RECORDER_JS,
+    IO_SYNC_JS,
+    IO_SYNC_NOTE,
     PAGE_HELPERS_JS,
     RAF_SYNC_JS,
     RAF_SYNC_NOTE,
@@ -91,10 +100,12 @@ from capture.strategies import network_wait
 from capture.strategies.base import (
     DOUBLE_SHOT_REAL_GAP_MS,
     SAMPLE_PHASE,
+    SCREENSHOT_TIMEOUT_MS,
     CaptureSettings,
     CaptureStrategy,
     FrameSink,
     ProgressCallback,
+    ScreenshotRetries,
     StrategyOutcome,
     double_shot_matches,
     is_checkpoint,  # frame 0, every fps-th frame and the last frame (module docstring, step 7)
@@ -173,7 +184,7 @@ _SEEK_FRAME_BODY = r"""
                   svgResumed: 0, videos: 0, videosNotReady: 0, videosResumed: 0, videoSeeks: 0,
                   videosPagePaused: 0, videosStarted: 0, videosHeld: 0, videoPageSeeks: 0, videoRateChanges: 0,
                   videoSeekTimeouts: 0, videoWaitSkipped: 0, mediaWaits: 0, mediaTimeouts: 0, perfNow: 0,
-                  rebase: W.__ftClockRebase || 'missing' };
+                  ioEntries: 0, rebase: W.__ftClockRebase || 'missing' };
   const late = stage === 'later';  // after frame 0
 
   // ADR-029: animation-frame callbacks run now, once per pass, at this pass's clock time, before any
@@ -566,6 +577,20 @@ _SEEK_FRAME_BODY = r"""
     return pending;
   };
 
+  // ADR-052: IntersectionObserver, evaluated once per pass on the layout of this pass's picture (after the
+  // seek and the flush below), as a browser evaluates it once per rendering update on the updated layout.
+  // IO_SYNC_JS queues the callbacks as a 0 ms task on the page clock, so they run at the start of the next
+  // clock step (after any 0 ms timers the page set earlier in this pass), as a browser runs them in a task
+  // after the frame. Same-origin frames evaluate theirs too.
+  const evaluateIntersections = (win) => {
+    let queued = 0;
+    try { if (win.__ftIo) queued += win.__ftIo.evaluate(); } catch (e) { /* cross-origin */ }
+    for (let k = 0; k < win.frames.length; k++) {
+      try { queued += evaluateIntersections(win.frames[k]); } catch (e) { /* cross-origin frame */ }
+    }
+    return queued;
+  };
+
   await waitForMedia();
   await driveAnimations();
   seekSvgTimelines();
@@ -575,6 +600,7 @@ _SEEK_FRAME_BODY = r"""
   for (const { root } of scopes) {
     if (root.nodeType === 9) { try { void root.documentElement.offsetHeight; } catch (e) {} }  // 9: a document
   }
+  stats.ioEntries = evaluateIntersections(W);
   stats.perfNow = W.performance.now();
 
   if (pendingSeeks.length === 0) return stats;
@@ -636,7 +662,7 @@ def _uncertainty_texts() -> dict[str, str]:
 
 # Counters summed over every frame, and counters for which the frames where they were non-zero are kept.
 _SUMMED = ("newAnimations", "unseekable", "suppressedCancelled", "svgResumed", "videosResumed", "finished", "pageSeeks",
-           "videosStarted", "videoPageSeeks", "videoRateChanges")
+           "videosStarted", "videoPageSeeks", "videoRateChanges", "ioEntries")
 _PER_FRAME = ("readopted", "pageHeld", "svgHeld", "videosHeld")
 
 
@@ -649,6 +675,8 @@ class _Tally:
     frames: dict[str, list[int]] = field(default_factory=dict)  # counter -> frames where it was non-zero
     preroll: list[str] = field(default_factory=list)  # uncertainty counters non-zero during the pre-roll
     abandoned: list[tuple[str, str]] = field(default_factory=list)  # (where, URL) of requests given up on
+    # Stalled pictures requested again, and the capture's limit on them (ADR-053); passed to take_screenshot.
+    screenshot_retries: ScreenshotRetries = field(default_factory=ScreenshotRetries)
 
     def add(self, index: int, stats: dict[str, Any], abandoned: list[str]) -> None:
         """Fold in the counters of frame ``index`` and the requests given up on before its picture."""
@@ -709,10 +737,14 @@ class _Tally:
             (sums.get("videoPageSeeks"), f"{sums.get('videoPageSeeks')} video current time(s) assigned by the page were applied"),
             (sums.get("videoRateChanges"), f"{sums.get('videoRateChanges')} video playbackRate change(s) by the page were applied"),
             (sums.get("finished"), f"{sums.get('finished')} animation(s) reached their end and were finished, so the page's finish handlers ran"),
+            (sums.get("ioEntries"), f"{sums.get('ioEntries')} IntersectionObserver entr(y/ies) queued during the frames, on the frame's layout"),
             (sums.get("svgResumed"), f"{sums.get('svgResumed')} SVG timeline un-pause(s) by the page were undone"),
             (sums.get("videosResumed"), f"{sums.get('videosResumed')} video play() call(s) by the page were undone (paused again before seeking)"),
             (sums.get("suppressedCancelled"), f"{sums.get('suppressedCancelled')} animation(s) created after frame 0 on suppressed elements were cancelled"),
             (sums.get("unseekable"), f"{sums.get('unseekable')} animation seek(s) were rejected by the browser (for example scroll-driven timelines)"),
+            (self.screenshot_retries.used, f"screenshot retried {self.screenshot_retries.used} time(s): a picture request got no "
+                                           f"answer within {SCREENSHOT_TIMEOUT_MS / 1000:g} s of real time; each retry pictured "
+                                           "the same virtual instant (ADR-053)"),
         ]
 
     def notes(self) -> list[str]:
@@ -759,7 +791,8 @@ class WaapiStepStrategy(CaptureStrategy):
         self._settings = settings
         context.clock.install(time=0)
         context.clock.pause_at(0)
-        for script in (CLOCK_REBASE_JS, SEEDED_RANDOM_JS, TIMELINE_CLOCK_JS, RAF_SYNC_JS, ANIMATION_RECORDER_JS):
+        # IO_SYNC_JS saves the page clock's setTimeout, so it comes after the clock scripts (ADR-052).
+        for script in (CLOCK_REBASE_JS, SEEDED_RANDOM_JS, TIMELINE_CLOCK_JS, RAF_SYNC_JS, ANIMATION_RECORDER_JS, IO_SYNC_JS):
             context.add_init_script(script)
 
     def prepare_page(self, page: Page, settings: CaptureSettings) -> None:
@@ -880,8 +913,8 @@ class WaapiStepStrategy(CaptureStrategy):
             checked = is_checkpoint(index, total, settings.fps)
             if checked:
                 failures.extend(self._clock_failure(stats, index, target_ms))
-            digest = sink.add(take_screenshot(page))
-            if checked and not double_shot_matches(page, digest):
+            digest = sink.add(take_screenshot(page, self._tally.screenshot_retries))
+            if checked and not double_shot_matches(page, digest, self._tally.screenshot_retries):
                 failures.append(
                     f"double-shot check failed at frame {index}: two screenshots at the same virtual time, "
                     f"{DOUBLE_SHOT_REAL_GAP_MS} ms of real time apart, differ"
@@ -920,6 +953,7 @@ class WaapiStepStrategy(CaptureStrategy):
             SEEDED_RANDOM_NOTE,
             TIMELINE_CLOCK_NOTE,
             RAF_SYNC_NOTE,
+            IO_SYNC_NOTE,
             f"fake clock stepped in whole ms: frame i sits at round((i + {SAMPLE_PHASE})*1000/{fps}) ms, "
             "animations seeked to the exact time (ADR-029)",
         ]
