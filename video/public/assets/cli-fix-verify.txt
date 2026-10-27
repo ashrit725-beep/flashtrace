@@ -1,0 +1,9 @@
+$ /Users/ashrittalluri/my-new-project/.venv/bin/flashtrace fix /Users/ashrittalluri/my-new-project/video/public/assets/demo-report.json --apply 1 --verify --work-dir /private/tmp/claude-501/-Users-ashrittalluri-my-new-project/770b568b-56bd-49be-84a6-40989ae6934b/scratchpad/video-work
+fix 1 (rate) for culprit 1: #loader { animation-duration: 400ms !important; }
+verifying
+frames 360/360
+before: FAIL, general 5/s, red 0/s, qualifying general 29, red 0, deterministic yes
+after: PASS, general 3/s, red 0/s, qualifying general 14, red 0, deterministic yes
+verified: yes: PASS under deterministic capture
+report: /private/tmp/claude-501/-Users-ashrittalluri-my-new-project/770b568b-56bd-49be-84a6-40989ae6934b/scratchpad/video-work/jobs/20261027-010042-38e8ed/report.json
+Analysis aid, not a compliance certification.

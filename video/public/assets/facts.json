@@ -1,0 +1,364 @@
+{
+  "generatedAt": "2026-10-26 (local), from real runs in this session",
+  "disclaimer": "Analysis aid, not a compliance certification.",
+  "benchmark": {
+    "source": "docs/RESULTS.md (written by flashtrace bench; copied verbatim)",
+    "dateUtc": "2026-10-26 03:02:35 UTC",
+    "commit": "6a838cc",
+    "command": "flashtrace bench --n 200 --seed 1 --duration 10 --fps 60 --workers 4 --determinism-sample 20 --attribute bbox --ablate-sample 20 --ablate-duration 4 --out docs/RESULTS.md --work-dir .flashtrace/bench --quiet",
+    "pages": "200 (audited 200, skipped 0, errors 0)",
+    "clearCaseAccuracy": "122/122 (100.0%)",
+    "clearCaseAccuracyLine": "**Accuracy: 122/122 (100.0%)** (0 errors left out)",
+    "clearCases": {
+      "expectedPASS_gotPASS": 83,
+      "expectedFAIL_gotFAIL": 39
+    },
+    "boundaryMatching": "78/78 (100.0%)",
+    "violationTypeAgreement": "56/56 (100.0%)",
+    "advisoryAgreement": "83/83 (100.0%) (clear pages expected to PASS only)",
+    "top1AttributionMainPass": "56/56 (100.0%)",
+    "top1AttributionMainPassScope": "Main pass, attribution mode bbox, scored on the 56 pages expected to FAIL that FlashTrace also failed.",
+    "ablationSampleLine": "Ablation sample: the first 20 pages that FAILed in the main pass were audited again with attribute ablate at 4 s per capture. Sampled 20; scored 20 (the ones that FAILed again at that duration; 0 did not). This is a small sample, not the whole benchmark.",
+    "ablationSampleTop1": "20/20 (100.0%)",
+    "ablationSampleMinimalSetCorrect": "20/20 (100.0%)",
+    "determinism": "20/20 compared pages identical on a second run (frame hashes 20/20, report fingerprints 20/20; a fingerprint is the sha256 of the report without capturedAt).",
+    "mismatches": "None.",
+    "machine": "macOS-26.5.1-arm64-arm-64bit-Mach-O; Python 3.14.0; Chromium 153.0.8010.12; 11 CPUs"
+  },
+  "demoAudit": {
+    "source": "video/public/assets/demo-report.json (CLI run; values below are from the copy taken before fix verify)",
+    "url": "http://127.0.0.1:8765/site/",
+    "verdict": "FAIL",
+    "reason": "General flashes reached 5 per second in a 341x256 px window at frames 0-359; WCAG 2.3.1 allows at most 3.",
+    "engineVersion": "1.1.0",
+    "settings": {
+      "attribute": "ablate",
+      "cellPx": 4,
+      "duration": 6.0,
+      "fps": 60,
+      "redRule": "wcag22",
+      "viewport": {
+        "height": 768,
+        "width": 1024
+      },
+      "windowPx": {
+        "height": 256,
+        "width": 341
+      }
+    },
+    "capture": {
+      "strategy": "waapi_step",
+      "deterministic": true,
+      "frameCount": 360
+    },
+    "violations": [
+      {
+        "type": "general",
+        "maxRatePerSec": 5,
+        "start": 0,
+        "end": 359,
+        "window": {
+          "h": 256.0,
+          "w": 340.0,
+          "x": 28.0,
+          "y": 288.0
+        },
+        "qualifyingFlashes": 29
+      }
+    ],
+    "timeline": [
+      {
+        "generalFlashes": 4,
+        "redFlashes": 0,
+        "t": 0.0
+      },
+      {
+        "generalFlashes": 5,
+        "redFlashes": 0,
+        "t": 1.0
+      },
+      {
+        "generalFlashes": 5,
+        "redFlashes": 0,
+        "t": 2.0
+      },
+      {
+        "generalFlashes": 5,
+        "redFlashes": 0,
+        "t": 3.0
+      },
+      {
+        "generalFlashes": 5,
+        "redFlashes": 0,
+        "t": 4.0
+      },
+      {
+        "generalFlashes": 5,
+        "redFlashes": 0,
+        "t": 5.0
+      }
+    ],
+    "evidenceFrames": [
+      {
+        "index": 0,
+        "label": "frame 0 (t = 0.000 s) - baseline"
+      },
+      {
+        "index": 11,
+        "label": "frame 11 (t = 0.183 s) - just before"
+      },
+      {
+        "index": 12,
+        "label": "frame 12 (t = 0.200 s) - first qualifying general flash"
+      }
+    ],
+    "culpritCount": 10,
+    "culprits": [
+      {
+        "rank": 1,
+        "selector": "#loader",
+        "nodeType": "div",
+        "overlap": 0.9173,
+        "ablationDelta": 29,
+        "inMinimalSet": true,
+        "animation": {
+          "name": "strobe",
+          "durationMs": 200
+        }
+      },
+      {
+        "rank": 2,
+        "selector": "#main > article > div > section > svg",
+        "nodeType": "svg",
+        "overlap": 0.9173,
+        "ablationDelta": 0,
+        "inMinimalSet": false,
+        "animation": null
+      },
+      {
+        "rank": 3,
+        "selector": "#main > article > div > section",
+        "nodeType": "section",
+        "overlap": 0.9173,
+        "ablationDelta": 0,
+        "inMinimalSet": false,
+        "animation": null
+      },
+      {
+        "rank": 4,
+        "selector": "#main > article > div",
+        "nodeType": "div",
+        "overlap": 0.6131,
+        "ablationDelta": 0,
+        "inMinimalSet": false,
+        "animation": null
+      },
+      {
+        "rank": 5,
+        "selector": "#main > article > div > section > svg > path",
+        "nodeType": "path",
+        "overlap": 0.5314,
+        "ablationDelta": 0,
+        "inMinimalSet": false,
+        "animation": null
+      },
+      {
+        "rank": 6,
+        "selector": "#main > article",
+        "nodeType": "article",
+        "overlap": 0.2886,
+        "ablationDelta": 0,
+        "inMinimalSet": false,
+        "animation": null
+      },
+      {
+        "rank": 7,
+        "selector": "#main",
+        "nodeType": "main",
+        "overlap": 0.1756,
+        "ablationDelta": null,
+        "inMinimalSet": false,
+        "animation": null
+      },
+      {
+        "rank": 8,
+        "selector": "#live-badge",
+        "nodeType": "p",
+        "overlap": 0.0275,
+        "ablationDelta": null,
+        "inMinimalSet": false,
+        "animation": {
+          "name": "live-pulse",
+          "durationMs": 250
+        }
+      },
+      {
+        "rank": 9,
+        "selector": "#loader > span",
+        "nodeType": "span",
+        "overlap": 0.0179,
+        "ablationDelta": null,
+        "inMinimalSet": false,
+        "animation": null
+      },
+      {
+        "rank": 10,
+        "selector": "#next-up",
+        "nodeType": "section",
+        "overlap": 0.0001,
+        "ablationDelta": null,
+        "inMinimalSet": false,
+        "animation": {
+          "name": "slow-fade",
+          "durationMs": 2000
+        }
+      }
+    ],
+    "minimalSet": [
+      "#loader"
+    ],
+    "fixCount": 3,
+    "fixes": [
+      {
+        "kind": "rate",
+        "culprit": 1,
+        "css": "#loader { animation-duration: 400ms !important; }",
+        "verified": false,
+        "before": {
+          "deterministic": true,
+          "generalMaxRatePerSec": 5,
+          "qualifyingGeneral": 29,
+          "qualifyingRed": 0,
+          "redMaxRatePerSec": 0,
+          "verdict": "FAIL"
+        },
+        "after": null
+      },
+      {
+        "kind": "luminance",
+        "culprit": 1,
+        "css": "@keyframes ft-fix-1-lum { 0% { background-color: #575757; animation-timing-function: steps(1); } 50% { background-color: rgb(20, 20, 20); animation-timing-function: steps(1); } 100% { background-color: #575757; animation-timing-function: steps(1); } } #loader { animation-name: ft-fix-1-lum !important; }",
+        "verified": false,
+        "before": {
+          "deterministic": true,
+          "generalMaxRatePerSec": 5,
+          "qualifyingGeneral": 29,
+          "qualifyingRed": 0,
+          "redMaxRatePerSec": 0,
+          "verdict": "FAIL"
+        },
+        "after": null
+      },
+      {
+        "kind": "area",
+        "culprit": 1,
+        "css": "/* not auto-applied: changes layout */ #loader { transform: scale(0.402); transform-origin: top left; }",
+        "verified": false,
+        "before": {
+          "deterministic": true,
+          "generalMaxRatePerSec": 5,
+          "qualifyingGeneral": 29,
+          "qualifyingRed": 0,
+          "redMaxRatePerSec": 0,
+          "verdict": "FAIL"
+        },
+        "after": null
+      }
+    ],
+    "heatmapMaxFlashesPerCell": 46,
+    "heatmapFlashingCells": 8533,
+    "heatmapNote": "decoded from report.heatmap.data (little-endian uint16 per 4x4 px cell, 256x192 cells); the UI legend shows the same max",
+    "disclaimer": "Analysis aid, not a compliance certification."
+  },
+  "cli": {
+    "auditExitCode": 1,
+    "auditExitMeaning": "1 = FAIL (audit exit codes: 0 PASS, 1 FAIL, 2 error)",
+    "fixListExitCode": 0,
+    "fixVerifyExitCode": 0,
+    "fixVerifyExitMeaning": "0 = verified (fix exit codes: 0 verified, 1 not, 2 error)",
+    "fixVerified": {
+      "number": 1,
+      "kind": "rate",
+      "css": "#loader { animation-duration: 400ms !important; }",
+      "verified": true,
+      "before": {
+        "deterministic": true,
+        "generalMaxRatePerSec": 5,
+        "qualifyingGeneral": 29,
+        "qualifyingRed": 0,
+        "redMaxRatePerSec": 0,
+        "verdict": "FAIL"
+      },
+      "after": {
+        "deterministic": true,
+        "generalMaxRatePerSec": 3,
+        "qualifyingGeneral": 14,
+        "qualifyingRed": 0,
+        "redMaxRatePerSec": 0,
+        "verdict": "PASS"
+      }
+    },
+    "wallSecondsMeasuredByWrapper": {
+      "audit": 198,
+      "fixVerify": 29,
+      "note": "wall-clock seconds of each command on this Mac, measured around the process, not printed by FlashTrace"
+    },
+    "files": [
+      "cli-audit.txt",
+      "cli-fix-list.txt",
+      "cli-fix-verify.txt"
+    ]
+  },
+  "ui": {
+    "server": "flashtrace serve --port 8011 (real API and web viewer, web/out static export)",
+    "mainJob": {
+      "id": "20261027-010527-38e8ed",
+      "createdVia": "POST /jobs {url, duration: 6, attribute: ablate}",
+      "verdict": "FAIL",
+      "reason": "General flashes reached 5 per second in a 341x256 px window at frames 0-359; WCAG 2.3.1 allows at most 3.",
+      "minimalSet": [
+        "#loader"
+      ],
+      "culpritCount": 10,
+      "fixCount": 3
+    },
+    "secondJob": {
+      "id": "20261027-010910-38e8ed",
+      "createdVia": "New audit form in the UI (same URL, 6 s, Ablation); used for ui-running.png",
+      "runningScreenProgress": "frames 121/360 at the moment of the screenshot"
+    },
+    "verifyThroughUI": {
+      "fixNumber": 1,
+      "kind": "rate",
+      "verified": true,
+      "before": {
+        "deterministic": true,
+        "generalMaxRatePerSec": 5,
+        "qualifyingGeneral": 29,
+        "qualifyingRed": 0,
+        "redMaxRatePerSec": 0,
+        "verdict": "FAIL"
+      },
+      "after": {
+        "deterministic": true,
+        "generalMaxRatePerSec": 3,
+        "qualifyingGeneral": 14,
+        "qualifyingRed": 0,
+        "redMaxRatePerSec": 0,
+        "verdict": "PASS"
+      }
+    },
+    "frameDialogFrame": "Enlarge: frame 0 (t = 0.000 s) - baseline frame 0 · t = 0.000 s",
+    "sameResultAsCli": true
+  },
+  "selfAudit": {
+    "scenarios": 63,
+    "command": "/Users/ashrittalluri/my-new-project/.venv/bin/python -m pytest tests/test_ui_self_audit.py --collect-only -q -p no:cacheprovider",
+    "output": "tests/test_ui_self_audit.py: 63",
+    "meaning": "number of collected self-audit test scenarios in which FlashTrace audits its own web viewer"
+  },
+  "notes": [
+    "demo-report.json was updated in place by 'flashtrace fix --apply 1 --verify' (fixes[0].after and verified are now set); demo-report.html is the export from the audit itself, before the verify.",
+    "Every number here was read from a file written by FlashTrace or by pytest; none is typed by hand."
+  ]
+}

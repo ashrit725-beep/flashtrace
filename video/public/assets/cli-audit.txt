@@ -1,0 +1,14 @@
+$ /Users/ashrittalluri/my-new-project/.venv/bin/flashtrace audit http://127.0.0.1:8765/site/ --attribute ablate --duration 6 --out /Users/ashrittalluri/my-new-project/video/public/assets/demo-report.json --html /Users/ashrittalluri/my-new-project/video/public/assets/demo-report.html --work-dir /private/tmp/claude-501/-Users-ashrittalluri-my-new-project/770b568b-56bd-49be-84a6-40989ae6934b/scratchpad/video-work
+frames 360/360
+attributing (ablate)
+attributing 6/6
+proposing fixes
+FAIL: General flashes reached 5 per second in a 341x256 px window at frames 0-359; WCAG 2.3.1 allows at most 3.
+capture: strategy waapi_step, deterministic yes, 360 frames
+job: /private/tmp/claude-501/-Users-ashrittalluri-my-new-project/770b568b-56bd-49be-84a6-40989ae6934b/scratchpad/video-work/jobs/20261027-010042-38e8ed
+report: /private/tmp/claude-501/-Users-ashrittalluri-my-new-project/770b568b-56bd-49be-84a6-40989ae6934b/scratchpad/video-work/jobs/20261027-010042-38e8ed/report.json
+html: /private/tmp/claude-501/-Users-ashrittalluri-my-new-project/770b568b-56bd-49be-84a6-40989ae6934b/scratchpad/video-work/jobs/20261027-010042-38e8ed/report.html
+report copy: /Users/ashrittalluri/my-new-project/video/public/assets/demo-report.json
+html copy: /Users/ashrittalluri/my-new-project/video/public/assets/demo-report.html
+culprits: 10, fixes: 3 (list them: flashtrace fix /private/tmp/claude-501/-Users-ashrittalluri-my-new-project/770b568b-56bd-49be-84a6-40989ae6934b/scratchpad/video-work/jobs/20261027-010042-38e8ed/report.json)
+Analysis aid, not a compliance certification.

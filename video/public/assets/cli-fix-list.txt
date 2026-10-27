@@ -1,0 +1,5 @@
+$ /Users/ashrittalluri/my-new-project/.venv/bin/flashtrace fix /Users/ashrittalluri/my-new-project/video/public/assets/demo-report.json --work-dir /private/tmp/claude-501/-Users-ashrittalluri-my-new-project/770b568b-56bd-49be-84a6-40989ae6934b/scratchpad/video-work
+1. culprit 1, rate (not tried): #loader { animation-duration: 400ms !important; }
+2. culprit 1, luminance (not tried): @keyframes ft-fix-1-lum { 0% { background-color: #575757; animation-timing-function: steps(1); } 50% { background-color: rgb(20, 20, 20); animation-timing-function: steps(1); } 100% { background-color: #575757; animation-timing-function: steps(1); } } #loader { animation-name: ft-fix-1-lum !important; }
+3. culprit 1, area (not auto-applied): /* not auto-applied: changes layout */ #loader { transform: scale(0.402); transform-origin: top left; }
+Analysis aid, not a compliance certification.
